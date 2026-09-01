@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Mini Search - Crawler Engine
+Mini Search - Crawler Engine v3.0
 Optimized for Ubuntu 26.04 ARM64 + Termux environment
+Lightweight version with fallback vector search backends
 
 Core crawling and indexing functionality with:
 - Two-phase crawling (Discovery + Indexing)
-- ChromaDB vector storage
+- Multiple vector search backends (ChromaDB or SQLite+hnswlib)
 - Sentence-transformers embeddings
 - Ethical crawling with robots.txt respect
 - Parallel workers for concurrent processing
@@ -21,6 +22,8 @@ import json
 import threading
 import signal
 import atexit
+import pickle
+import numpy as np
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -36,6 +39,7 @@ MIN_DELAY = 1.0  # Minimum delay between requests in seconds
 MAX_RETRIES = 3  # Maximum retry attempts
 REQUEST_TIMEOUT = 30  # Request timeout in seconds
 CHROMA_DB_PATH = "chroma_db"
+VECTOR_DB_PATH = "vector_db"
 MODEL_PATH = "models/paraphrase-multilingual-MiniLM-L12-v2"
 
 # Global state
@@ -45,64 +49,381 @@ last_request_time = 0.0
 
 # Global references for cleanup
 embedding_model = None
-chroma_client = None
-pages_collection = None
+vector_db = None
+VECTOR_BACKEND = "sqlite"  # Default to lightweight backend
 CHROMA_AVAILABLE = False
+HNSWLIB_AVAILABLE = False
 
 
-def init_chroma():
-    """Initialize ChromaDB client and embedding model"""
-    global embedding_model, chroma_client, pages_collection, CHROMA_AVAILABLE
+class VectorSearchBackend:
+    """Abstract base class for vector search backends"""
     
-    try:
-        import chromadb
-        from chromadb.config import Settings
-        from sentence_transformers import SentenceTransformer
+    def __init__(self):
+        self.index = None
+        self.metadata = {}
+        self.ids = []
+    
+    def initialize(self):
+        raise NotImplementedError
+    
+    def upsert(self, ids, embeddings, metadatas):
+        raise NotImplementedError
+    
+    def query(self, query_embeddings, n_results=10, where=None):
+        raise NotImplementedError
+    
+    def delete(self, ids):
+        raise NotImplementedError
+    
+    def persist(self):
+        raise NotImplementedError
+    
+    def get_by_id(self, id):
+        raise NotImplementedError
+
+
+class SQLiteHNSWBackend(VectorSearchBackend):
+    """Lightweight vector search using SQLite + hnswlib"""
+    
+    def __init__(self, db_path="vector_db"):
+        super().__init__()
+        self.db_path = db_path
+        self.index = None
+        self.dim = 384  # Dimension for paraphrase-multilingual-MiniLM-L12-v2
+        self.conn = None
+        self._initialize_db()
+        self._load_index()
+    
+    def _initialize_db(self):
+        """Initialize SQLite database for metadata"""
+        os.makedirs(self.db_path, exist_ok=True)
+        self.conn = sqlite3.connect(os.path.join(self.db_path, "vectors.db"))
+        cursor = self.conn.cursor()
         
-        # Load embedding model
+        # Create tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vectors (
+                id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                metadata TEXT NOT NULL
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_vectors_id ON vectors(id)')
+        
+        self.conn.commit()
+    
+    def _load_index(self):
+        """Load or create hnswlib index"""
+        try:
+            import hnswlib
+            index_path = os.path.join(self.db_path, "index.bin")
+            
+            if os.path.exists(index_path):
+                # Load existing index
+                self.index = hnswlib.Index(space='cosine', dim=self.dim)
+                self.index.load_index(index_path, max_elements=100000)
+                print("✅ hnswlib index načten")
+            else:
+                # Create new index
+                self.index = hnswlib.Index(space='cosine', dim=self.dim)
+                self.index.init_index(max_elements=100000, ef_construction=200, M=16)
+                print("✅ Nový hnswlib index vytvořen")
+            
+            self._load_existing_vectors()
+            HNSWLIB_AVAILABLE = True
+            
+        except ImportError:
+            print("⚠️  hnswlib není dostupný, používám pouze SQLite")
+            HNSWLIB_AVAILABLE = False
+            self._load_existing_vectors()
+    
+    def _load_existing_vectors(self):
+        """Load existing vectors from SQLite"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, embedding, metadata FROM vectors")
+        
+        for row in cursor.fetchall():
+            id, embedding_blob, metadata_str = row
+            self.ids.append(id)
+            self.metadata[id] = json.loads(metadata_str)
+            
+            # Store embedding for similarity search
+            embedding = pickle.loads(embedding_blob)
+            if self.index is not None:
+                try:
+                    self.index.add_items(embedding, [len(self.ids) - 1])
+                except:
+                    pass  # Index not ready yet
+        
+        print(f"✅ Načteno {len(self.ids)} existujících vektorů")
+    
+    def initialize(self):
+        """Initialize the backend"""
+        print("✅ SQLite+hnswlib backend inicializován")
+        return True
+    
+    def upsert(self, ids, embeddings, metadatas):
+        """Upsert vectors into the index"""
+        cursor = self.conn.cursor()
+        
+        for i, (id, embedding, metadata) in enumerate(zip(ids, embeddings, metadatas)):
+            # Store in SQLite
+            embedding_blob = pickle.dumps(embedding)
+            metadata_str = json.dumps(metadata)
+            
+            cursor.execute(
+                "INSERT OR REPLACE INTO vectors (id, embedding, metadata) VALUES (?, ?, ?)",
+                (id, embedding_blob, metadata_str)
+            )
+            
+            # Update in-memory structures
+            if id not in self.ids:
+                self.ids.append(id)
+            self.metadata[id] = metadata
+            
+            # Add to hnswlib index if available
+            if self.index is not None and HNSWLIB_AVAILABLE:
+                try:
+                    idx = self.ids.index(id) if id in self.ids else len(self.ids) - 1
+                    self.index.add_items(np.array([embedding]), [idx])
+                except Exception as e:
+                    print(f"⚠️  Chyba při přidávání do hnswlib indexu: {e}")
+        
+        self.conn.commit()
+        self.persist()
+    
+    def query(self, query_embeddings, n_results=10, where=None):
+        """Query the index"""
+        results = {
+            'ids': [[]],
+            'distances': [[]],
+            'metadatas': [[]]
+        }
+        
+        if not self.ids:
+            return results
+        
+        # Convert query to numpy array
+        query_array = np.array(query_embeddings)
+        
+        if self.index is not None and HNSWLIB_AVAILABLE and len(self.ids) > 0:
+            # Use hnswlib for fast similarity search
+            labels, distances = self.index.knn_query(query_array, k=min(n_results, len(self.ids)))
+            
+            for i, (label, distance) in enumerate(zip(labels[0], distances[0])):
+                if label < len(self.ids):
+                    id = self.ids[label]
+                    results['ids'][0].append(id)
+                    results['distances'][0].append(float(distance))
+                    results['metadatas'][0].append(self.metadata.get(id, {}))
+        else:
+            # Fallback to brute-force search with SQLite
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, embedding, metadata FROM vectors")
+            
+            all_data = cursor.fetchall()
+            
+            # Calculate cosine similarity for each vector
+            similarities = []
+            for row in all_data:
+                id, embedding_blob, metadata_str = row
+                embedding = pickle.loads(embedding_blob)
+                
+                # Cosine similarity
+                dot_product = np.dot(query_array[0], embedding)
+                norm_a = np.linalg.norm(query_array[0])
+                norm_b = np.linalg.norm(embedding)
+                similarity = dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
+                
+                # Convert similarity to distance (1 - similarity)
+                distance = 1.0 - similarity
+                
+                similarities.append((id, distance, json.loads(metadata_str)))
+            
+            # Sort by distance (ascending)
+            similarities.sort(key=lambda x: x[1])
+            
+            # Get top n_results
+            for id, distance, metadata in similarities[:n_results]:
+                results['ids'][0].append(id)
+                results['distances'][0].append(distance)
+                results['metadatas'][0].append(metadata)
+        
+        return results
+    
+    def delete(self, ids):
+        """Delete vectors from the index"""
+        cursor = self.conn.cursor()
+        
+        for id in ids:
+            if id in self.ids:
+                self.ids.remove(id)
+            if id in self.metadata:
+                del self.metadata[id]
+            
+            cursor.execute("DELETE FROM vectors WHERE id = ?", (id,))
+        
+        self.conn.commit()
+        
+        # Rebuild hnswlib index
+        if self.index is not None and HNSWLIB_AVAILABLE:
+            self.index = None
+            self._load_index()
+    
+    def persist(self):
+        """Persist the index to disk"""
+        if self.index is not None and HNSWLIB_AVAILABLE:
+            try:
+                index_path = os.path.join(self.db_path, "index.bin")
+                self.index.save_index(index_path)
+            except Exception as e:
+                print(f"⚠️  Chyba při ukládání indexu: {e}")
+        
+        if self.conn:
+            self.conn.commit()
+    
+    def get_by_id(self, id):
+        """Get vector by ID"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT embedding, metadata FROM vectors WHERE id = ?", (id,))
+        row = cursor.fetchone()
+        
+        if row:
+            embedding = pickle.loads(row[0])
+            metadata = json.loads(row[1])
+            return {'embedding': embedding, 'metadata': metadata}
+        return None
+
+
+class ChromaDBBackend(VectorSearchBackend):
+    """ChromaDB vector search backend"""
+    
+    def __init__(self, db_path="chroma_db"):
+        super().__init__()
+        self.db_path = db_path
+        self.client = None
+        self.collection = None
+    
+    def initialize(self):
+        """Initialize ChromaDB backend"""
+        try:
+            import chromadb
+            from chromadb.config import Settings
+            
+            os.makedirs(self.db_path, exist_ok=True)
+            
+            self.client = chromadb.Client(
+                Settings(
+                    chroma_db_impl="duckdb+parquet",
+                    persist_directory=self.db_path
+                )
+            )
+            
+            self.collection = self.client.get_or_create_collection(name="pages")
+            CHROMA_AVAILABLE = True
+            print("✅ ChromaDB backend inicializován")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  ChromaDB se nepodařilo inicializovat: {e}")
+            print("💡  Budu používat SQLite+hnswlib backend")
+            CHROMA_AVAILABLE = False
+            return False
+    
+    def upsert(self, ids, embeddings, metadatas):
+        """Upsert vectors into ChromaDB"""
+        if self.collection:
+            self.collection.upsert(
+                ids=ids,
+                documents=["" for _ in ids],  # Dummy documents
+                embeddings=embeddings,
+                metadatas=metadatas
+            )
+            self.client.persist()
+    
+    def query(self, query_embeddings, n_results=10, where=None):
+        """Query ChromaDB"""
+        if self.collection:
+            return self.collection.query(
+                query_embeddings=query_embeddings,
+                n_results=n_results,
+                where=where,
+                include=["metadatas", "distances"]
+            )
+        return {'ids': [[]], 'distances': [[]], 'metadatas': [[]]}
+    
+    def delete(self, ids):
+        """Delete vectors from ChromaDB"""
+        if self.collection:
+            self.collection.delete(ids=ids)
+            self.client.persist()
+    
+    def persist(self):
+        """Persist ChromaDB to disk"""
+        if self.client:
+            self.client.persist()
+    
+    def get_by_id(self, id):
+        """Get vector by ID from ChromaDB"""
+        if self.collection:
+            result = self.collection.get(ids=[id], include=["metadatas", "embeddings"])
+            if result.get('ids') and id in result['ids'][0]:
+                idx = result['ids'][0].index(id)
+                return {
+                    'embedding': result['embeddings'][0][idx] if result.get('embeddings') else None,
+                    'metadata': result['metadatas'][0][idx] if result.get('metadatas') else {}
+                }
+        return None
+
+
+def init_vector_backend():
+    """Initialize the appropriate vector search backend"""
+    global vector_db, VECTOR_BACKEND, embedding_model
+    
+    # Try to load embedding model first
+    try:
+        from sentence_transformers import SentenceTransformer
         os.makedirs("models", exist_ok=True)
         embedding_model = SentenceTransformer(MODEL_PATH, cache_folder="models")
-        
-        # Initialize ChromaDB with DuckDB for better ARM64 compatibility
-        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-        chroma_client = chromadb.Client(
-            Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory=CHROMA_DB_PATH
-            )
-        )
-        
-        # Create or get pages collection
-        pages_collection = chroma_client.get_or_create_collection(
-            name="pages",
-            embedding_function=lambda texts: embedding_model.encode(texts).tolist()
-        )
-        
-        CHROMA_AVAILABLE = True
-        print("✅ ChromaDB a embedding model inicializovány")
-        
-    except ImportError as e:
-        print(f"⚠️  ChromaDB nebo sentence-transformers nejsou dostupné: {e}")
-        print("💡  Nainstalujte: pip install chromadb sentence-transformers")
-        CHROMA_AVAILABLE = False
+        print("✅ Embedding model načten")
     except Exception as e:
-        print(f"⚠️  Chyba při inicializaci ChromaDB: {e}")
-        CHROMA_AVAILABLE = False
+        print(f"⚠️  Embedding model se nepodařilo načíst: {e}")
+        print("💡  Nainstalujte: pip install torch --index-url https://download.pytorch.org/whl/cpu")
+        print("   Pak: pip install sentence-transformers==2.2.2")
+        return False
+    
+    # Try ChromaDB first
+    chroma_backend = ChromaDBBackend(CHROMA_DB_PATH)
+    if chroma_backend.initialize():
+        vector_db = chroma_backend
+        VECTOR_BACKEND = "chromadb"
+        print("✅ Používám ChromaDB backend")
+        return True
+    
+    # Fallback to SQLite+hnswlib
+    print("⚠️  ChromaDB není dostupný, používám SQLite+hnswlib backend")
+    sqlite_backend = SQLiteHNSWBackend(VECTOR_DB_PATH)
+    sqlite_backend.initialize()
+    vector_db = sqlite_backend
+    VECTOR_BACKEND = "sqlite"
+    print("✅ Používám SQLite+hnswlib backend")
+    return True
 
 
 def cleanup():
     """Cleanup resources on shutdown"""
-    global chroma_client, shutdown_flag
+    global vector_db, shutdown_flag
     shutdown_flag = True
     
     print("\n🔄 Ukončování crawler engine...")
     
-    if chroma_client:
+    if vector_db:
         try:
-            chroma_client.persist()
-            print("✅ ChromaDB data uložena")
+            vector_db.persist()
+            print("✅ Vector database uložena")
         except Exception as e:
-            print(f"⚠️  Chyba při ukládání ChromaDB: {e}")
+            print(f"⚠️  Chyba při ukládání vector database: {e}")
     
     print("✅ Crawler engine ukončen")
 
@@ -728,7 +1049,7 @@ def phase_1_discovery(site_url, max_pages=500):
 
 
 def process_url(url, site_id, max_pages):
-    """Process a single URL: extract content, generate embeddings, store in ChromaDB"""
+    """Process a single URL: extract content, generate embeddings, store in vector DB"""
     if shutdown_flag:
         return None, "Shutdown in progress"
     
@@ -810,15 +1131,23 @@ def process_url(url, site_id, max_pages):
         # Generate document ID
         doc_id = generate_doc_id(url)
         
-        # Prepare document for ChromaDB
-        if CHROMA_AVAILABLE and body_text.strip():
-            # Embed title + body text
-            text_to_embed = f"{title} {body_text}"
-            
-            # Store in ChromaDB with metadata
+        # Generate embedding
+        if embedding_model:
+            try:
+                embedding = embedding_model.encode(f"{title} {body_text}").tolist()[0]
+            except Exception as e:
+                print(f"⚠️  Chyba při generování embeddingu: {e}")
+                embedding = None
+        else:
+            embedding = None
+        
+        # Prepare document for vector DB
+        if vector_db and embedding:
+            # Store in vector database with metadata
             metadata = {
                 "url": url,
                 "title": title,
+                "text": body_text,
                 "image": image_url,
                 "audio_url": audio_url,
                 "has_audio": str(bool(audio_url)).lower(),
@@ -830,14 +1159,13 @@ def process_url(url, site_id, max_pages):
             }
             
             try:
-                pages_collection.upsert(
+                vector_db.upsert(
                     ids=[doc_id],
-                    documents=[text_to_embed],
+                    embeddings=[embedding],
                     metadatas=[metadata]
                 )
-                chroma_client.persist()
             except Exception as e:
-                print(f"⚠️  Chyba při ukládání do ChromaDB: {e}")
+                print(f"⚠️  Chyba při ukládání do vector DB: {e}")
         
         return {
             "id": doc_id,
@@ -1089,21 +1417,21 @@ def delete_site(site_id):
         conn.close()
         return False
     
-    # Delete from ChromaDB
-    if CHROMA_AVAILABLE:
+    # Delete from vector DB
+    if vector_db:
         try:
             # Get all documents for this site
-            results = pages_collection.get(
-                where={"site_id": str(site_id)},
-                include=["ids"]
-            )
+            all_ids = []
+            for id in vector_db.ids:
+                metadata = vector_db.metadata.get(id, {})
+                if metadata.get('site_id') == str(site_id):
+                    all_ids.append(id)
             
-            if results.get("ids"):
-                pages_collection.delete(ids=results["ids"])
-                chroma_client.persist()
-                print(f"✅ Smazáno {len(results['ids'])} dokumentů z ChromaDB")
+            if all_ids:
+                vector_db.delete(all_ids)
+                print(f"✅ Smazáno {len(all_ids)} dokumentů z vector DB")
         except Exception as e:
-            print(f"⚠️  Chyba při mazání z ChromaDB: {e}")
+            print(f"⚠️  Chyba při mazání z vector DB: {e}")
     
     # Delete from SQLite
     cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
@@ -1139,19 +1467,20 @@ def recrawl_site(site_id):
     cursor.execute("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,))
     cursor.execute("DELETE FROM sitemaps_feeds WHERE site_id = ?", (site_id,))
     
-    # Delete existing ChromaDB documents for this site
-    if CHROMA_AVAILABLE:
+    # Delete existing vector DB documents for this site
+    if vector_db:
         try:
-            results = pages_collection.get(
-                where={"site_id": str(site_id)},
-                include=["ids"]
-            )
-            if results.get("ids"):
-                pages_collection.delete(ids=results["ids"])
-                chroma_client.persist()
-                print(f"✅ Smazáno {len(results['ids'])} dokumentů z ChromaDB")
+            all_ids = []
+            for id in vector_db.ids:
+                metadata = vector_db.metadata.get(id, {})
+                if metadata.get('site_id') == str(site_id):
+                    all_ids.append(id)
+            
+            if all_ids:
+                vector_db.delete(all_ids)
+                print(f"✅ Smazáno {len(all_ids)} dokumentů z vector DB")
         except Exception as e:
-            print(f"⚠️  Chyba při mazání z ChromaDB: {e}")
+            print(f"⚠️  Chyba při mazání z vector DB: {e}")
     
     conn.commit()
     conn.close()
@@ -1217,8 +1546,8 @@ def get_crawl_stats(site_id=None):
 
 
 if __name__ == "__main__":
-    # Initialize ChromaDB
-    init_chroma()
+    # Initialize vector backend
+    init_vector_backend()
     
     # Initialize database
     init_db()
@@ -1227,7 +1556,8 @@ if __name__ == "__main__":
     start_workers()
     
     print("=" * 70)
-    print("Mini Search - Crawler Engine v2.0")
+    print("Mini Search - Crawler Engine v3.0")
+    print(f"Vector backend: {VECTOR_BACKEND}")
     print("=" * 70)
     print("Pro spuštění crawlu: crawl_site(url, max_pages)")
     print("Pro ukončení: Ctrl+C")

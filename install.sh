@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Mini Search - Installation Script
+# Mini Search - Installation Script v3.0
 # Optimized for Ubuntu 26.04 ARM64 + Termux environment
-# Version: 2.0
+# Lightweight version without heavy compilation dependencies
 
 set -e
 
@@ -42,11 +42,11 @@ print_info() {
     echo -e "${CYAN}[i]${NC} $1"
 }
 
-# Main installation
 echo ""
-print_header "Mini Search - Instalační skript v2.0"
+print_header "Mini Search - Instalační skript v3.0"
 echo ""
 print_info "Prostředí: Ubuntu 26.04 ARM64 + Termux"
+print_info "Lightweight verze - bez těžkých kompilací"
 echo ""
 
 # Check if running as root
@@ -91,6 +91,9 @@ if [ -f ".install_done" ]; then
         PKG=$(echo "$line" | cut -d'=' -f1 | tr -d '[:space:]')
         [[ -z "$PKG" ]] && continue
         
+        # Skip commented out packages
+        [[ "$line" =~ ^# ]] && continue
+        
         if ! python3 -c "import $PKG" 2>/dev/null; then
             print_warning "Chybí balíček: $PKG"
             MISSING=1
@@ -113,11 +116,11 @@ echo ""
 print_header "Instalace systémových závislostí"
 echo ""
 
-# Install system dependencies
+# Install minimal system dependencies
 print_status "Aktualizace balíčků..."
 sudo apt update
 
-print_status "Instalace build nástrojů a knihoven..."
+print_status "Instalace základních nástrojů..."
 sudo apt install -y \
     build-essential \
     libssl-dev \
@@ -154,14 +157,57 @@ pip install --upgrade pip setuptools wheel
 print_success "pip aktualizován"
 
 echo ""
-print_header "Instalace Python balíčků"
+print_header "Instalace Python balíčků (lehké závislosti)"
 echo ""
 
-# Install requirements
-print_status "Instalace závislostí z requirements.txt..."
+# Install lightweight requirements first
+print_status "Instalace základních balíčků..."
 pip install --no-cache-dir -r requirements.txt
 
-print_success "Python balíčky nainstalovány"
+print_success "Základní balíčky nainstalovány"
+
+echo ""
+print_header "Instalace PyTorch pro ARM64"
+echo ""
+
+# Install PyTorch from official ARM64 wheel (no compilation)
+print_status "Instalace PyTorch z oficiálního CPU wheelu..."
+print_info "Toto může trvat několik minut..."
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Verify PyTorch installation
+python3 -c "import torch; print(f'✅ PyTorch {torch.__version__} nainstalován'); print(f'   Device: {torch.device(\"cpu\")}')"
+
+print_success "PyTorch nainstalován"
+
+echo ""
+print_header "Instalace Sentence-Transformers"
+echo ""
+
+# Install sentence-transformers
+print_status "Instalace sentence-transformers..."
+pip install sentence-transformers==2.2.2
+
+print_success "Sentence-transformers nainstalován"
+
+echo ""
+print_header "Instalace ChromaDB"
+echo ""
+
+# Try latest ChromaDB with better ARM64 support
+print_status "Instalace ChromaDB (nejnovější verze)..."
+print_info "Pokud selže, bude použita alternativa..."
+
+if pip install "chromadb>=0.5.0" 2>/dev/null; then
+    print_success "ChromaDB nainstalován"
+    CHROMADB_INSTALLED=true
+else
+    print_warning "ChromaDB se nepodařilo nainstalovat, zkouším alternatu..."
+    print_status "Instalace lightweight alternativy (hnswlib + numpy)..."
+    pip install hnswlib==0.8.0 numpy==1.26.4
+    print_success "Lightweight alternativa nainstalována"
+    CHROMADB_INSTALLED=false
+fi
 
 echo ""
 print_header "Stahování modelu sentence-transformers"
@@ -263,7 +309,7 @@ print('✅ Indexy vytvořeny pro optimalizaci dotazů')
 print_success "Databáze inicializována"
 
 echo ""
-print_header "Inicializace ChromaDB"
+print_header "Inicializace ChromaDB / Alternativy"
 echo ""
 
 # Initialize ChromaDB directory
@@ -273,9 +319,11 @@ os.makedirs('chroma_db', exist_ok=True)
 print('✅ Adresář chroma_db vytvořen')
 "
 
-# Test ChromaDB
-print_status "Testování ChromaDB..."
-python3 -c "
+# Test ChromaDB or alternative
+print_status "Testování vector search backend..."
+
+if [ "$CHROMADB_INSTALLED" = true ] || python3 -c "import chromadb; print('ChromaDB dostupný')" 2>/dev/null; then
+    python3 -c "
 import chromadb
 from chromadb.config import Settings
 import os
@@ -293,9 +341,18 @@ try:
     print('✅ ChromaDB úspěšně inicializována')
 except Exception as e:
     print(f'❌ Chyba ChromaDB: {e}')
+    print('💡 Budou použity SQLite + hnswlib jako alternativa')
 "
+else
+    print_info "Používám lightweight alternatu (SQLite + hnswlib)"
+    python3 -c "
+import numpy as np
+import hnswlib
+print('✅ Lightweight vector search backend připraven')
+"
+fi
 
-print_success "ChromaDB připravena"
+print_success "Vector search backend připraven"
 
 echo ""
 print_header "Vytváření .gitignore"

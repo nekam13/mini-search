@@ -1,188 +1,84 @@
+#!/usr/bin/env python3
+"""
+Mini Search - Admin Console v3.0
+Optimized for Ubuntu 26.04 ARM64 + Termux environment
+Lightweight version with fallback vector search backends
+
+Flask-based admin interface for managing crawls and sites.
+Runs on port 5000.
+"""
+
 import sqlite3
 import time
 import json
-import requests
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 import crawler_engine
 import threading
+import signal
+import sys
 import os
 
 app = Flask(__name__)
+app.secret_key = 'mini-search-secret-key-change-in-production'
 
 # Initialize database
 crawler_engine.init_db()
 
+# Initialize vector backend
+crawler_engine.init_vector_backend()
+
 # Start workers
 worker_threads = crawler_engine.start_workers()
 
+# Global scheduler
+scheduler = BackgroundScheduler()
 
-def job_check_feeds():
-    """Every hour: check RSS/Atom feeds for new entries"""
+
+def auto_recrawl():
+    """Auto-recrawl all active sites every 12 hours"""
+    if crawler_engine.shutdown_flag:
+        return
+    
+    print("[Auto-recrawl] Spouštím automatické re-crawlování...")
+    
     conn = crawler_engine.get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, site_id, url, type FROM sitemaps_feeds WHERE type IN ('rss', 'atom')")
-    feeds = cursor.fetchall()
+    cursor.execute("SELECT id, canonical_url, max_pages FROM sites WHERE status = 'active'")
+    sites = cursor.fetchall()
     conn.close()
-    for feed_id, site_id, feed_url, feed_type in feeds:
-        try:
-            import feedparser
-            data = feedparser.parse(feed_url)
-            conn = crawler_engine.get_db()
-            cursor = conn.cursor()
-            for entry in data.entries:
-                if not hasattr(entry, 'link'):
-                    continue
-                url = crawler_engine.normalize_domain(entry.link)
-                pub = entry.get('published_parsed', None)
-                pub_ts = int(time.mktime(pub)) if pub else int(time.time())
-                # Only add if newer than last_checked of this feed
-                cursor.execute("SELECT last_checked FROM sitemaps_feeds WHERE id=?", (feed_id,))
-                row = cursor.fetchone()
-                last_checked = row[0] if row else 0
-                if pub_ts > last_checked:
-                    try:
-                        cursor.execute(
-                            "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', 1.0)",
-                            (site_id, url)
-                        )
-                    except sqlite3.IntegrityError:
-                        pass  # Already in queue
-            cursor.execute("UPDATE sitemaps_feeds SET last_checked=? WHERE id=?", (int(time.time()), feed_id))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Feed check error {feed_url}: {e}")
+    
+    for site_id, site_url, max_pages in sites:
+        print(f"[Auto-recrawl] Re-crawluji: {site_url}")
+        crawler_engine.recrawl_site(site_id)
+    
+    print("[Auto-recrawl] Dokončeno")
 
 
-def job_check_sitemaps():
-    """Every day: compare sitemaps with index, queue changed/new URLs"""
-    conn = crawler_engine.get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, site_id, url FROM sitemaps_feeds WHERE type = 'sitemap'")
-    sitemaps = cursor.fetchall()
-    conn.close()
-    for sm_id, site_id, sm_url in sitemaps:
-        try:
-            resp = requests.get(sm_url, headers=crawler_engine.HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, 'xml')
-            conn = crawler_engine.get_db()
-            cursor = conn.cursor()
-            sitemap_urls = set()
-            for url_tag in soup.find_all('url'):
-                loc = url_tag.find('loc')
-                lastmod_tag = url_tag.find('lastmod')
-                priority_tag = url_tag.find('priority')
-                if not loc or not loc.text:
-                    continue
-                url = crawler_engine.normalize_domain(loc.text.strip())
-                lastmod = lastmod_tag.text.strip() if lastmod_tag else ''
-                priority = float(priority_tag.text.strip()) if priority_tag else 0.5
-                sitemap_urls.add(url)
-                # Check if URL exists and if lastmod changed
-                cursor.execute("SELECT id, lastmod FROM crawl_queue WHERE url=? AND site_id=?", (url, site_id))
-                existing = cursor.fetchone()
-                if not existing:
-                    # New URL
-                    try:
-                        cursor.execute(
-                            "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', ?)",
-                            (site_id, url, priority)
-                        )
-                    except sqlite3.IntegrityError:
-                        pass
-                elif lastmod and existing[1] != lastmod:
-                    # lastmod changed — re-queue
-                    cursor.execute(
-                        "UPDATE crawl_queue SET status='pending', priority=? WHERE id=?",
-                        (priority, existing[0])
-                    )
-            # Mark URLs no longer in sitemap as stale -> archived
-            cursor.execute(
-                "SELECT id, url FROM crawl_queue WHERE site_id=? AND status NOT IN ('archived')",
-                (site_id,)
-            )
-            all_indexed = cursor.fetchall()
-            for row_id, row_url in all_indexed:
-                if row_url not in sitemap_urls:
-                    cursor.execute(
-                        "UPDATE crawl_queue SET status='archived', archived_at=? WHERE id=?",
-                        (int(time.time()), row_id)
-                    )
-            cursor.execute("UPDATE sitemaps_feeds SET last_checked=? WHERE id=?", (int(time.time()), sm_id))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Sitemap check error {sm_url}: {e}")
+# Schedule auto-recrawl every 12 hours
+scheduler.add_job(
+    func=auto_recrawl,
+    trigger=IntervalTrigger(hours=12),
+    id='auto_recrawl',
+    name='Automatické re-crawlování každých 12 hodin',
+    replace_existing=True
+)
+scheduler.start()
 
 
-def job_recrawl_by_priority():
-    """Every 2 days: re-queue active URLs with priority >= 0.8"""
-    conn = crawler_engine.get_db()
-    cursor = conn.cursor()
-    two_days_ago = int(time.time()) - (2 * 24 * 3600)
-    cursor.execute(
-        "UPDATE crawl_queue SET status='pending' WHERE priority >= 0.8 AND status='done' AND last_checked < ?",
-        (two_days_ago,)
-    )
-    conn.commit()
-    conn.close()
+def shutdown_handler():
+    """Handle application shutdown"""
+    crawler_engine.shutdown_flag = True
+    crawler_engine.cleanup()
+    scheduler.shutdown()
+    print("✅ Admin console ukončena")
 
 
-def job_recrawl_low_priority():
-    """Every 30 days: re-queue active URLs with priority <= 0.1"""
-    conn = crawler_engine.get_db()
-    cursor = conn.cursor()
-    thirty_days_ago = int(time.time()) - (30 * 24 * 3600)
-    cursor.execute(
-        "UPDATE crawl_queue SET status='pending' WHERE priority <= 0.1 AND status='done' AND last_checked < ?",
-        (thirty_days_ago,)
-    )
-    conn.commit()
-    conn.close()
-
-
-def job_cleanup_archived():
-    """Every week: delete archived pages older than 30 days with zero hits"""
-    thirty_days_ago = int(time.time()) - (30 * 24 * 3600)
-    conn = crawler_engine.get_db()
-    cursor = conn.cursor()
-    # Get IDs to delete
-    cursor.execute(
-        "SELECT id FROM crawl_queue WHERE status='archived' AND archived_at < ? AND hit_count = 0",
-        (thirty_days_ago,)
-    )
-    rows = cursor.fetchall()
-    ids_to_delete = [r[0] for r in rows]
-    if ids_to_delete and crawler_engine.CHROMA_AVAILABLE:
-        try:
-            # Delete from ChromaDB
-            urls_cursor = conn.cursor()
-            placeholders = ','.join('?' * len(ids_to_delete))
-            urls_cursor.execute(
-                f"SELECT url FROM crawl_queue WHERE id IN ({placeholders})",
-                ids_to_delete
-            )
-            urls = [r[0] for r in urls_cursor.fetchall()]
-            doc_ids = [crawler_engine.generate_doc_id(u) for u in urls]
-            if doc_ids:
-                crawler_engine.pages_collection.delete(ids=doc_ids)
-        except Exception as e:
-            print(f"Cleanup ChromaDB error: {e}")
-    # Delete from SQLite
-    if ids_to_delete:
-        placeholders = ','.join('?' * len(ids_to_delete))
-        cursor.execute(
-            f"DELETE FROM crawl_queue WHERE id IN ({placeholders})",
-            ids_to_delete
-        )
-    conn.commit()
-    conn.close()
-    print(f"[Cleanup] Smazáno {len(ids_to_delete)} archivovaných stránek")
+# Register shutdown handler
+import atexit
+atexit.register(shutdown_handler)
 
 
 def get_site_stats(site_id):
@@ -200,9 +96,12 @@ def get_site_stats(site_id):
     cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'error'", (site_id,))
     errors = cursor.fetchone()[0]
     
+    cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status IN ('pending', 'locked')", (site_id,))
+    pending = cursor.fetchone()[0]
+    
     conn.close()
     
-    return total, done, errors
+    return total, done, errors, pending
 
 
 def get_error_details(site_id):
@@ -255,6 +154,74 @@ def has_active_crawls():
     return count > 0
 
 
+def get_all_sites():
+    """Get all sites with their statistics"""
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    
+    # Get all sites
+    cursor.execute("""
+        SELECT id, canonical_url, aliases, status, error_count, last_crawled, max_pages 
+        FROM sites 
+        ORDER BY last_crawled DESC, id DESC
+    """)
+    raw_sites = cursor.fetchall()
+    
+    sites = []
+    for s in raw_sites:
+        site_id, canonical_url, aliases_str, status, error_count, last_crawled, max_pages = s
+        aliases = json.loads(aliases_str) if aliases_str else []
+        
+        # Get stats
+        total, done, errors, pending = get_site_stats(site_id)
+        
+        # Calculate progress
+        if total > 0:
+            progress_percent = min(100, (done / total) * 100)
+            progress_text = f"{done}/{total}"
+        else:
+            progress_percent = 0
+            progress_text = "0/0"
+        
+        # Format last crawled date
+        if last_crawled > 0:
+            last_crawled_str = datetime.fromtimestamp(last_crawled).strftime('%d.%m.%Y %H:%M')
+        else:
+            last_crawled_str = "Čeká na crawl"
+        
+        # Get sitemaps and feeds
+        sitemaps_feeds = get_sitemaps_feeds(site_id)
+        sitemaps_list = []
+        for sm_id, sm_url, sm_type, sm_last_checked in sitemaps_feeds:
+            sitemaps_list.append({
+                'id': sm_id,
+                'url': sm_url,
+                'type': sm_type,
+                'last_checked': datetime.fromtimestamp(sm_last_checked).strftime('%d.%m.%Y %H:%M') if sm_last_checked > 0 else "Nikdy"
+            })
+        
+        sites.append({
+            'id': site_id,
+            'canonical_url': canonical_url,
+            'aliases': aliases,
+            'status': status,
+            'error_count': error_count,
+            'last_crawled': last_crawled_str,
+            'max_pages': max_pages,
+            'progress_percent': progress_percent,
+            'progress_text': progress_text,
+            'total': total,
+            'done': done,
+            'errors': errors,
+            'pending': pending,
+            'sitemaps_feeds': sitemaps_list
+        })
+    
+    conn.close()
+    
+    return sites
+
+
 HTML_CONSOLE = '''
 <!DOCTYPE html>
 <html lang="cs">
@@ -262,22 +229,112 @@ HTML_CONSOLE = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="5" />
-    <title>Mini Search - Správcovská konzole</title>
+    <title>Mini Search - Správcovská konzole v3.0</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * { 
+            box-sizing: border-box; 
+            margin: 0; 
+            padding: 0; 
+        }
+        
         body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; 
             background: #f8f9fa; 
             color: #202124; 
             line-height: 1.6; 
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .header { background: white; padding: 20px 0; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .header-content { max-width: 1200px; margin: 0 auto; padding: 0 20px; display: flex; justify-content: space-between; align-items: center; }
-        .logo { font-size: 1.8rem; font-weight: 500; color: #1a73e8; text-decoration: none; }
-        .status-indicator { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
-        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #0f9d58; }
-        .status-dot.idle { background: #db4437; }
+        
+        .container { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px; 
+        }
+        
+        .header { 
+            background: white; 
+            padding: 20px 0; 
+            margin-bottom: 20px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+            position: sticky; 
+            top: 0; 
+            z-index: 100; 
+        }
+        
+        .header-content { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 0 20px; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            flex-wrap: wrap; 
+            gap: 15px; 
+        }
+        
+        .logo { 
+            font-size: 1.8rem; 
+            font-weight: 500; 
+            color: #1a73e8; 
+            text-decoration: none; 
+        }
+        
+        .status-bar { 
+            display: flex; 
+            gap: 20px; 
+            align-items: center; 
+            font-size: 0.9rem; 
+        }
+        
+        .status-indicator { 
+            display: flex; 
+            align-items: center; 
+            gap: 8px; 
+        }
+        
+        .status-dot { 
+            width: 10px; 
+            height: 10px; 
+            border-radius: 50%; 
+            background: #0f9d58; 
+            animation: pulse 2s infinite; 
+        }
+        
+        @keyframes pulse { 
+            0%, 100% { opacity: 1; } 
+            50% { opacity: 0.5; } 
+        }
+        
+        .status-dot.idle { 
+            background: #db4437; 
+            animation: none; 
+        }
+        
+        .stats-overview { 
+            display: flex; 
+            gap: 20px; 
+            flex-wrap: wrap; 
+        }
+        
+        .stat-card { 
+            background: white; 
+            padding: 15px 20px; 
+            border-radius: 8px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+            text-align: center; 
+            min-width: 120px; 
+        }
+        
+        .stat-value { 
+            font-size: 1.8rem; 
+            font-weight: 600; 
+            color: #1a73e8; 
+        }
+        
+        .stat-label { 
+            font-size: 0.85rem; 
+            color: #5f6368; 
+            margin-top: 5px; 
+        }
         
         .card { 
             background: white; 
@@ -287,10 +344,27 @@ HTML_CONSOLE = '''
             padding: 24px; 
         }
         
-        h1 { font-size: 1.5rem; font-weight: 500; margin-bottom: 20px; color: #202124; }
-        h2 { font-size: 1.2rem; font-weight: 500; margin-bottom: 16px; color: #202124; }
+        h1 { 
+            font-size: 1.5rem; 
+            font-weight: 500; 
+            margin-bottom: 20px; 
+            color: #202124; 
+        }
         
-        .form-group { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+        h2 { 
+            font-size: 1.2rem; 
+            font-weight: 500; 
+            margin-bottom: 16px; 
+            color: #202124; 
+        }
+        
+        .form-group { 
+            display: flex; 
+            gap: 12px; 
+            margin-bottom: 16px; 
+            flex-wrap: wrap; 
+        }
+        
         input[type="text"], input[type="number"] { 
             padding: 10px 14px; 
             border: 1px solid #dadce0; 
@@ -298,7 +372,9 @@ HTML_CONSOLE = '''
             font-size: 1rem; 
             flex: 1; 
             min-width: 250px; 
+            transition: all 0.2s; 
         }
+        
         input[type="text"]:focus, input[type="number"]:focus { 
             outline: none; 
             border-color: #1a73e8; 
@@ -315,32 +391,78 @@ HTML_CONSOLE = '''
             font-size: 0.95rem; 
             text-decoration: none; 
             display: inline-block; 
-            transition: background 0.2s; 
+            transition: all 0.2s; 
+            font-weight: 500; 
         }
-        .btn:hover { background: #1557b0; }
-        .btn:disabled { background: #9aa0a6; cursor: not-allowed; }
         
-        .btn-secondary { background: #f1f3f4; color: #3c4043; }
-        .btn-secondary:hover { background: #e8eaed; }
+        .btn:hover { 
+            background: #1557b0; 
+            transform: translateY(-1px); 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+        }
         
-        .btn-danger { background: #db4437; }
-        .btn-danger:hover { background: #c1351b; }
+        .btn:disabled { 
+            background: #9aa0a6; 
+            cursor: not-allowed; 
+            transform: none; 
+            box-shadow: none; 
+        }
         
-        .btn-success { background: #0f9d58; }
-        .btn-success:hover { background: #0b8043; }
+        .btn-secondary { 
+            background: #f1f3f4; 
+            color: #3c4043; 
+        }
         
-        .btn-sm { padding: 6px 12px; font-size: 0.85rem; }
+        .btn-secondary:hover { 
+            background: #e8eaed; 
+        }
         
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #e0e0e0; }
+        .btn-danger { 
+            background: #db4437; 
+        }
+        
+        .btn-danger:hover { 
+            background: #c1351b; 
+        }
+        
+        .btn-success { 
+            background: #0f9d58; 
+        }
+        
+        .btn-success:hover { 
+            background: #0b8043; 
+        }
+        
+        .btn-sm { 
+            padding: 6px 12px; 
+            font-size: 0.85rem; 
+        }
+        
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+        }
+        
+        th, td { 
+            text-align: left; 
+            padding: 12px 16px; 
+            border-bottom: 1px solid #e0e0e0; 
+        }
+        
         th { 
             background: #f1f3f4; 
             font-weight: 500; 
             font-size: 0.85rem; 
             text-transform: uppercase; 
             color: #5f6368; 
+            position: sticky; 
+            top: 0; 
+            z-index: 10; 
         }
-        tr:hover { background: #f8f9fa; }
+        
+        tr:hover { 
+            background: #f8f9fa; 
+        }
         
         .status-badge { 
             display: inline-block; 
@@ -348,11 +470,33 @@ HTML_CONSOLE = '''
             border-radius: 12px; 
             font-size: 0.8rem; 
             font-weight: 500; 
+            cursor: pointer; 
+            transition: all 0.2s; 
         }
-        .status-ok { background: #e6f4ea; color: #0f9d58; }
-        .status-warning { background: #fff1e6; color: #f4b400; }
-        .status-error { background: #ffebee; color: #db4437; }
-        .status-blocked { background: #f8f9fa; color: #9aa0a6; }
+        
+        .status-badge:hover { 
+            transform: scale(1.05); 
+        }
+        
+        .status-ok { 
+            background: #e6f4ea; 
+            color: #0f9d58; 
+        }
+        
+        .status-warning { 
+            background: #fff1e6; 
+            color: #f4b400; 
+        }
+        
+        .status-error { 
+            background: #ffebee; 
+            color: #db4437; 
+        }
+        
+        .status-blocked { 
+            background: #f8f9fa; 
+            color: #9aa0a6; 
+        }
         
         .progress-bar { 
             width: 150px; 
@@ -361,10 +505,11 @@ HTML_CONSOLE = '''
             border-radius: 10px; 
             overflow: hidden; 
         }
+        
         .progress-fill { 
             height: 100%; 
-            background: #1a73e8; 
-            transition: width 0.3s; 
+            background: linear-gradient(90deg, #1a73e8, #0f9d58); 
+            transition: width 0.3s ease; 
         }
         
         .aliases-list { 
@@ -372,40 +517,79 @@ HTML_CONSOLE = '''
             color: #5f6368; 
             max-width: 300px; 
         }
+        
         .aliases-list span { 
             display: inline-block; 
             margin-right: 4px; 
+            margin-bottom: 4px; 
             background: #f1f3f4; 
             padding: 2px 6px; 
             border-radius: 4px; 
         }
         
-        .action-buttons { display: flex; gap: 8px; }
+        .action-buttons { 
+            display: flex; 
+            gap: 8px; 
+        }
         
-        /* Sitemaps & Feeds */
-        .sitemaps-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e0e0e0; }
+        .sitemaps-section { 
+            margin-top: 20px; 
+            padding-top: 20px; 
+            border-top: 1px solid #e0e0e0; 
+        }
+        
         .sitemap-item { 
             display: flex; 
             align-items: center; 
             gap: 12px; 
             padding: 8px 0; 
             border-bottom: 1px solid #f1f3f4; 
+            flex-wrap: wrap; 
         }
-        .sitemap-item:last-child { border-bottom: none; }
+        
+        .sitemap-item:last-child { 
+            border-bottom: none; 
+        }
+        
         .type-badge { 
             padding: 2px 8px; 
             border-radius: 4px; 
             font-size: 0.75rem; 
             font-weight: 500; 
         }
-        .type-sitemap { background: #e8f0fe; color: #1a73e8; }
-        .type-rss { background: #ffe0b2; color: #e65100; }
-        .type-atom { background: #f3e5f5; color: #7b1fa2; }
-        .sitemap-link { color: #1a73e8; text-decoration: none; }
-        .sitemap-link:hover { text-decoration: underline; }
-        .sitemap-date { font-size: 0.8rem; color: #70757a; }
         
-        /* Error Modal */
+        .type-sitemap { 
+            background: #e8f0fe; 
+            color: #1a73e8; 
+        }
+        
+        .type-rss { 
+            background: #ffe0b2; 
+            color: #e65100; 
+        }
+        
+        .type-atom { 
+            background: #f3e5f5; 
+            color: #7b1fa2; 
+        }
+        
+        .sitemap-link { 
+            color: #1a73e8; 
+            text-decoration: none; 
+            flex: 1; 
+            min-width: 200px; 
+        }
+        
+        .sitemap-link:hover { 
+            text-decoration: underline; 
+        }
+        
+        .sitemap-date { 
+            font-size: 0.8rem; 
+            color: #70757a; 
+            white-space: nowrap; 
+        }
+        
         .modal { 
             display: none; 
             position: fixed; 
@@ -415,45 +599,108 @@ HTML_CONSOLE = '''
             width: 100%; 
             height: 100%; 
             background: rgba(0,0,0,0.5); 
+            animation: fadeIn 0.2s; 
         }
+        
+        @keyframes fadeIn { 
+            from { opacity: 0; } 
+            to { opacity: 1; } 
+        }
+        
         .modal-content { 
             background: white; 
-            margin: 10% auto; 
+            margin: 5% auto; 
             padding: 24px; 
             border-radius: 8px; 
-            max-width: 600px; 
+            max-width: 700px; 
             max-height: 80vh; 
             overflow-y: auto; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2); 
+            animation: slideIn 0.2s; 
         }
+        
+        @keyframes slideIn { 
+            from { 
+                transform: translateY(-20px); 
+                opacity: 0; 
+            } 
+            to { 
+                transform: translateY(0); 
+                opacity: 1; 
+            } 
+        }
+        
         .modal-header { 
             display: flex; 
             justify-content: space-between; 
             align-items: center; 
             margin-bottom: 16px; 
+            padding-bottom: 12px; 
+            border-bottom: 1px solid #e0e0e0; 
         }
-        .modal-title { font-size: 1.2rem; font-weight: 500; }
+        
+        .modal-title { 
+            font-size: 1.2rem; 
+            font-weight: 500; 
+        }
+        
         .close-btn { 
             background: none; 
             border: none; 
             font-size: 1.5rem; 
             cursor: pointer; 
             color: #70757a; 
+            transition: color 0.2s; 
         }
+        
+        .close-btn:hover { 
+            color: #202124; 
+        }
+        
         .error-item { 
             padding: 12px; 
             border-bottom: 1px solid #e0e0e0; 
         }
-        .error-item:last-child { border-bottom: none; }
-        .error-url { font-weight: 500; margin-bottom: 4px; }
-        .error-reason { font-size: 0.9rem; color: #db4437; }
         
-        /* Loading indicator */
-        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #f3f3f3; border-top: 2px solid #1a73e8; border-radius: 50%; animation: spin 1s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        .error-item:last-child { 
+            border-bottom: none; 
+        }
         
-        .discovering { color: #1a73e8; }
+        .error-url { 
+            font-weight: 500; 
+            margin-bottom: 4px; 
+            word-break: break-all; 
+        }
         
-        .no-results { text-align: center; padding: 40px; color: #70757a; }
+        .error-reason { 
+            font-size: 0.9rem; 
+            color: #db4437; 
+        }
+        
+        .loading { 
+            display: inline-block; 
+            width: 20px; 
+            height: 20px; 
+            border: 2px solid #f3f3f3; 
+            border-top: 2px solid #1a73e8; 
+            border-radius: 50%; 
+            animation: spin 1s linear infinite; 
+        }
+        
+        @keyframes spin { 
+            to { transform: rotate(360deg); } 
+        }
+        
+        .discovering { 
+            color: #1a73e8; 
+            animation: pulse 1s infinite; 
+        }
+        
+        .no-results { 
+            text-align: center; 
+            padding: 40px; 
+            color: #70757a; 
+        }
         
         .refresh-note { 
             font-size: 0.85rem; 
@@ -462,20 +709,94 @@ HTML_CONSOLE = '''
             margin-top: -15px; 
             margin-bottom: 10px; 
         }
+        
+        .backend-info { 
+            font-size: 0.85rem; 
+            color: #70757a; 
+            margin-top: 10px; 
+        }
+        
+        @media (max-width: 768px) { 
+            .header-content { 
+                flex-direction: column; 
+                text-align: center; 
+            }
+            
+            .status-bar { 
+                flex-direction: column; 
+                gap: 10px; 
+            }
+            
+            .stats-overview { 
+                justify-content: center; 
+            }
+            
+            .form-group { 
+                flex-direction: column; 
+            }
+            
+            input[type="text"], input[type="number"] { 
+                width: 100%; 
+            }
+            
+            th, td { 
+                padding: 8px 10px; 
+                font-size: 0.9rem; 
+            }
+            
+            .action-buttons { 
+                flex-direction: column; 
+            }
+            
+            .btn-sm { 
+                width: 100%; 
+                margin-bottom: 5px; 
+            }
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-content">
-            <a href="/" class="logo">🔍 Mini Search - Správcovská konzole</a>
-            <div class="status-indicator">
-                <span class="status-dot"></span>
-                <span>Systém je aktivní</span>
+            <a href="/" class="logo">🔍 Mini Search - Správcovská konzole v3.0</a>
+            <div class="status-bar">
+                <div class="status-indicator">
+                    <span class="status-dot"></span>
+                    <span>Systém je aktivní</span>
+                </div>
+                <div class="backend-info">Backend: {{ vector_backend|upper }}</div>
             </div>
         </div>
     </div>
 
     <div class="container">
+        <!-- Overview Stats -->
+        <div class="card">
+            <h2>Přehled systému</h2>
+            <div class="stats-overview">
+                <div class="stat-card">
+                    <div class="stat-value">{{ total_sites }}</div>
+                    <div class="stat-label">Celkem webů</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ total_urls }}</div>
+                    <div class="stat-label">Celkem URL</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ total_done }}</div>
+                    <div class="stat-label">Indexováno</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ total_pending }}</div>
+                    <div class="stat-label">Čeká na zpracování</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ total_errors }}</div>
+                    <div class="stat-label">Chyb</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Add Site Form -->
         <div class="card">
             <h2>Přidat nový web</h2>
@@ -491,7 +812,7 @@ HTML_CONSOLE = '''
 
         <!-- Sites Table -->
         <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
                 <h2>Seznam webů</h2>
                 <div class="refresh-note">
                     {% if has_active_crawls %}
@@ -509,7 +830,7 @@ HTML_CONSOLE = '''
                         <th>Kanonická URL</th>
                         <th>Alias</th>
                         <th>Max stránek</th>
-                        <th>Naposledy crawlováno</th>
+                        <th>Naposledy</th>
                         <th>Status</th>
                         <th>Pokrok</th>
                         <th>Akce</th>
@@ -533,7 +854,7 @@ HTML_CONSOLE = '''
                         <td>
                             {% if site.status == 'active' %}
                                 {% if site.error_count > 0 %}
-                                    <span class="status-badge status-warning" onclick="showErrors({{ site.id }})" style="cursor: pointer;">⚠️ {{ site.error_count }} chyb</span>
+                                    <span class="status-badge status-warning" onclick="showErrors({{ site.id }})">⚠️ {{ site.error_count }} chyb</span>
                                 {% else %}
                                     <span class="status-badge status-ok">✅ OK</span>
                                 {% endif %}
@@ -588,8 +909,7 @@ HTML_CONSOLE = '''
         <!-- Links to other interfaces -->
         <div class="card" style="text-align: center;">
             <a href="http://localhost:8095" target="_blank" class="btn" style="background: #34a853; margin-right: 12px;">🔍 Otevřít vyhledávání (port 8095)</a>
-            <span style="color: #70757a;">nebo</span>
-            <a href="/" class="btn btn-secondary" style="margin-left: 12px;">Obnovit konzoli</a>
+            <a href="/" class="btn btn-secondary" style="margin-left: 12px;">🔄 Obnovit konzoli</a>
         </div>
     </div>
 
@@ -639,19 +959,12 @@ HTML_CONSOLE = '''
             }
         }
 
-        // Auto-refresh if there are active crawls
-        function checkActiveCrawls() {
-            fetch('/has_active_crawls')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.active) {
-                        setTimeout(() => location.reload(), 5000);
-                    }
-                });
-        }
-
-        // Check every 30 seconds
-        setInterval(checkActiveCrawls, 30000);
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeModal();
+            }
+        });
     </script>
 </body>
 </html>
@@ -661,64 +974,14 @@ HTML_CONSOLE = '''
 @app.route('/')
 def index():
     """Main admin console page"""
-    conn = crawler_engine.get_db()
-    cursor = conn.cursor()
+    sites = get_all_sites()
     
-    # Get all sites
-    cursor.execute("""
-        SELECT id, canonical_url, aliases, status, error_count, last_crawled, max_pages 
-        FROM sites 
-        ORDER BY last_crawled DESC, id DESC
-    """)
-    raw_sites = cursor.fetchall()
-    
-    sites = []
-    for s in raw_sites:
-        site_id, canonical_url, aliases_str, status, error_count, last_crawled, max_pages = s
-        aliases = json.loads(aliases_str) if aliases_str else []
-        
-        # Get stats
-        total, done, errors = get_site_stats(site_id)
-        
-        # Calculate progress
-        if total > 0:
-            progress_percent = min(100, (done / total) * 100)
-            progress_text = f"{done}/{total}"
-        else:
-            progress_percent = 0
-            progress_text = "0/0"
-        
-        # Format last crawled date
-        if last_crawled > 0:
-            last_crawled_str = datetime.fromtimestamp(last_crawled).strftime('%d.%m.%Y %H:%M')
-        else:
-            last_crawled_str = "Čeká na crawl"
-        
-        # Get sitemaps and feeds
-        sitemaps_feeds = get_sitemaps_feeds(site_id)
-        sitemaps_list = []
-        for sm_id, sm_url, sm_type, sm_last_checked in sitemaps_feeds:
-            sitemaps_list.append({
-                'id': sm_id,
-                'url': sm_url,
-                'type': sm_type,
-                'last_checked': datetime.fromtimestamp(sm_last_checked).strftime('%d.%m.%Y %H:%M') if sm_last_checked > 0 else "Nikdy"
-            })
-        
-        sites.append({
-            'id': site_id,
-            'canonical_url': canonical_url,
-            'aliases': aliases,
-            'status': status,
-            'error_count': error_count,
-            'last_crawled': last_crawled_str,
-            'max_pages': max_pages,
-            'progress_percent': progress_percent,
-            'progress_text': progress_text,
-            'sitemaps_feeds': sitemaps_list
-        })
-    
-    conn.close()
+    # Calculate overview stats
+    total_sites = len(sites)
+    total_urls = sum(site['total'] for site in sites)
+    total_done = sum(site['done'] for site in sites)
+    total_pending = sum(site['pending'] for site in sites)
+    total_errors = sum(site['errors'] for site in sites)
     
     # Check for discovering site in session
     discovering_site = request.args.get('discovering', None)
@@ -727,7 +990,13 @@ def index():
         HTML_CONSOLE,
         sites=sites,
         has_active_crawls=has_active_crawls(),
-        discovering_site=discovering_site
+        discovering_site=discovering_site,
+        total_sites=total_sites,
+        total_urls=total_urls,
+        total_done=total_done,
+        total_pending=total_pending,
+        total_errors=total_errors,
+        vector_backend=crawler_engine.VECTOR_BACKEND
     )
 
 
@@ -739,9 +1008,11 @@ def add_site():
     
     # Add site and trigger discovery
     site_id = crawler_engine.add_site(url, max_pages)
-    crawler_engine.phase_1_discovery(url, max_pages)
-    
-    return redirect(f'/?discovering={url}')
+    if site_id:
+        crawler_engine.phase_1_discovery(url, max_pages)
+        return redirect(f'/?discovering={url}')
+    else:
+        return redirect('/?error=invalid_url')
 
 
 @app.route('/recrawl/<int:site_id>')
@@ -779,28 +1050,37 @@ def check_active_crawls():
     return jsonify({'active': has_active_crawls()})
 
 
-# Initialize scheduler with 5 jobs
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=job_check_feeds, trigger="interval", hours=1, id="check_feeds")
-scheduler.add_job(func=job_check_sitemaps, trigger="interval", hours=24, id="check_sitemaps")
-scheduler.add_job(func=job_recrawl_by_priority, trigger="interval", hours=48, id="recrawl_high")
-scheduler.add_job(func=job_recrawl_low_priority, trigger="interval", days=30, id="recrawl_low")
-scheduler.add_job(func=job_cleanup_archived, trigger="interval", days=7, id="cleanup")
-scheduler.start()
+@app.route('/stats')
+def get_stats():
+    """Get overall statistics"""
+    sites = get_all_sites()
+    total_sites = len(sites)
+    total_urls = sum(site['total'] for site in sites)
+    total_done = sum(site['done'] for site in sites)
+    total_pending = sum(site['pending'] for site in sites)
+    total_errors = sum(site['errors'] for site in sites)
+    
+    return jsonify({
+        'total_sites': total_sites,
+        'total_urls': total_urls,
+        'total_done': total_done,
+        'total_pending': total_pending,
+        'total_errors': total_errors,
+        'has_active_crawls': has_active_crawls(),
+        'vector_backend': crawler_engine.VECTOR_BACKEND
+    })
 
 
 if __name__ == '__main__':
-    # Make sure database is initialized
-    crawler_engine.init_db()
-    
-    # Start workers
-    worker_threads = crawler_engine.start_workers()
-    
-    print("=" * 60)
-    print("Mini Search - Správcovská konzole")
-    print("=" * 60)
+    print("=" * 70)
+    print("Mini Search - Správcovská konzole v3.0")
+    print(f"Vector backend: {crawler_engine.VECTOR_BACKEND}")
+    print("=" * 70)
     print(f"Spouštím na http://0.0.0.0:5000")
     print("Ctrl+C pro ukončení")
-    print("=" * 60)
+    print("=" * 70)
     
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    try:
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    except KeyboardInterrupt:
+        shutdown_handler()
