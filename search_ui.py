@@ -1,8 +1,185 @@
-import requests
+import sqlite3
+import json
+import time
+from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
+import crawler_engine
 
 app = Flask(__name__)
-MEILI_SEARCH_URL = "http://127.0.0.1:7700/indexes/pages/search"
+
+# Ensure ChromaDB is available
+if not crawler_engine.CHROMA_AVAILABLE:
+    print("Warning: ChromaDB is not available. Search will not work properly.")
+
+
+def get_chroma_results(query, limit=25, filters=None):
+    """Search ChromaDB with filters"""
+    if not crawler_engine.CHROMA_AVAILABLE:
+        return []
+    
+    try:
+        # Build filter query
+        chroma_filter = None
+        if filters:
+            filter_parts = []
+            if 'schema_type' in filters:
+                schema_types = filters['schema_type']
+                if isinstance(schema_types, list):
+                    filter_parts.append({
+                        "$or": [{"schema_type": st} for st in schema_types]
+                    })
+                else:
+                    filter_parts.append({"schema_type": schema_types})
+            if filters.get('has_audio'):
+                filter_parts.append({"has_audio": "True"})
+            if filters.get('has_price'):
+                # Check if schema_details contains price
+                filter_parts.append({
+                    "$where": "json_extract(metadata.schema_details, '$.price') != null"
+                })
+            
+            if filter_parts:
+                if len(filter_parts) == 1:
+                    chroma_filter = filter_parts[0]
+                else:
+                    chroma_filter = {"$and": filter_parts}
+        
+        # Search
+        results = crawler_engine.pages_collection.query(
+            query_texts=[query],
+            n_results=limit,
+            where=chroma_filter,
+            include=["metadatas", "documents", "distances"]
+        )
+        
+        # Process results
+        items = []
+        for i in range(len(results.get('ids', []))):
+            metadata = results['metadatas'][0][i] if results.get('metadatas') else {}
+            distance = results['distances'][0][i] if results.get('distances') else 0
+            
+            # Calculate relevance score
+            # Combine distance (lower is better) with recency and rich data bonus
+            relevance = calculate_relevance_score(metadata, distance)
+            
+            items.append({
+                'id': results['ids'][0][i],
+                'metadata': metadata,
+                'distance': distance,
+                'relevance': relevance
+            })
+        
+        # Sort by relevance
+        items.sort(key=lambda x: x['relevance'], reverse=True)
+        
+        return items
+        
+    except Exception as e:
+        print(f"Error searching ChromaDB: {e}")
+        return []
+
+
+def calculate_relevance_score(metadata, distance):
+    """Calculate relevance score combining multiple factors"""
+    # Base score from ChromaDB (convert distance to similarity)
+    # Distance is cosine distance, so similarity = 1 - distance
+    similarity_score = 1.0 - distance
+    
+    # Recency bonus (newer = higher)
+    published_timestamp = metadata.get('published_timestamp', 0)
+    if published_timestamp > 0:
+        age_hours = (time.time() - published_timestamp) / 3600
+        # Newer items get higher bonus (up to 0.3 for very recent)
+        recency_bonus = max(0, 0.3 * (1 - min(1, age_hours / 720)))  # 720 hours = 30 days
+    else:
+        recency_bonus = 0
+    
+    # Rich data bonus
+    rich_bonus = 0
+    schema_type = metadata.get('schema_type', '')
+    schema_details = metadata.get('schema_details', '')
+    
+    try:
+        details = json.loads(schema_details) if isinstance(schema_details, str) else schema_details
+        if isinstance(details, dict):
+            if details.get('rating'):
+                rich_bonus += 0.1
+            if details.get('price'):
+                rich_bonus += 0.1
+            if details.get('author'):
+                rich_bonus += 0.05
+    except:
+        pass
+    
+    # Schema type bonus
+    important_types = ['PodcastEpisode', 'Article', 'BlogPosting', 'NewsArticle']
+    if schema_type in important_types:
+        rich_bonus += 0.1
+    
+    # Has audio bonus
+    if metadata.get('has_audio', '') == 'True':
+        rich_bonus += 0.15
+    
+    # Combine all factors
+    total_score = similarity_score + recency_bonus + rich_bonus
+    
+    return total_score
+
+
+def deduplicate_results(results):
+    """Remove duplicates based on text similarity (>90%)"""
+    if not results or len(results) < 2:
+        return results
+    
+    # Simple deduplication by URL for now
+    # In a real implementation, you'd compare text content
+    seen_urls = set()
+    deduped = []
+    
+    for result in results:
+        url = result['metadata'].get('url', '')
+        if url not in seen_urls:
+            seen_urls.add(url)
+            deduped.append(result)
+    
+    return deduped
+
+
+def autocomplete_query(query):
+    """Autocomplete from SQLite titles"""
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    
+    # Search in ChromaDB metadata
+    if crawler_engine.CHROMA_AVAILABLE:
+        try:
+            results = crawler_engine.pages_collection.get(
+                where={
+                    "$or": [
+                        {"title": {"$contains": query}},
+                        {"url": {"$contains": query}}
+                    ]
+                },
+                limit=5,
+                include=["metadatas"]
+            )
+            
+            titles = []
+            for metadata in results.get('metadatas', []):
+                title = metadata.get('title', '')
+                if title and title not in titles:
+                    titles.append(title)
+            
+            conn.close()
+            return titles[:5]
+        except:
+            pass
+    
+    # Fallback to SQLite (if we were storing titles there)
+    # For now, return empty
+    conn.close()
+    return []
+
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -10,130 +187,365 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Moderní Sémantický Vyhledávač</title>
+    <title>Mini Search - Vyhledávání</title>
     <style>
         * { box-sizing: border-box; }
-        body { font-family: system-ui, -apple-system, sans-serif; background: #f8f9fa; margin: 0; padding: 0; color: #202124; }
-        .header { background: white; padding: 25px 5%; border-bottom: 1px solid #ebebeb; display: flex; flex-direction: column; align-items: center; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 5px rgba(0,0,0,0.03); }
-        .logo { font-size: 2.2rem; font-weight: 700; margin-bottom: 15px; color: #1a73e8; text-decoration: none; letter-spacing: -1px; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            background: #f8f9fa; 
+            margin: 0; 
+            padding: 0; 
+            color: #202124; 
+        }
         
-        .search-container { width: 100%; max-width: 650px; position: relative; }
-        .search-box { width: 100%; display: flex; gap: 10px; }
-        input[type="text"] { width: 100%; padding: 14px 20px; font-size: 1.05rem; border: 1px solid #dfe1e5; border-radius: 28px; outline: none; box-shadow: 0 1px 6px rgba(32,33,36,0.1); }
-        input[type="text"]:focus { border-color: #1a73e8; box-shadow: 0 1px 8px rgba(26,115,232,0.2); }
+        .header { 
+            background: white; 
+            padding: 25px 5%; 
+            border-bottom: 1px solid #ebebeb; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            position: sticky; 
+            top: 0; 
+            z-index: 100; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.03); 
+        }
+        .logo { 
+            font-size: 2.2rem; 
+            font-weight: 700; 
+            margin-bottom: 15px; 
+            color: #1a73e8; 
+            text-decoration: none; 
+            letter-spacing: -1px; 
+        }
         
-        /* Našeptávač */
-        .autocomplete-items { position: absolute; border: 1px solid #dfe1e5; border-top: none; z-index: 99; top: 100%; left: 20px; right: 20px; background: white; border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); overflow: hidden; }
-        .autocomplete-items div { padding: 10px 15px; cursor: pointer; border-bottom: 1px solid #f1f3f4; font-size: 0.95rem; color: #202124; }
-        .autocomplete-items div:hover { background-color: #f1f3f4; }
+        .search-container { 
+            width: 100%; 
+            max-width: 650px; 
+            position: relative; 
+        }
+        .search-box { 
+            width: 100%; 
+            display: flex; 
+            gap: 10px; 
+        }
+        input[type="text"] { 
+            width: 100%; 
+            padding: 14px 20px; 
+            font-size: 1.05rem; 
+            border: 1px solid #dfe1e5; 
+            border-radius: 28px; 
+            outline: none; 
+            box-shadow: 0 1px 6px rgba(32,33,36,0.1); 
+        }
+        input[type="text"]:focus { 
+            border-color: #1a73e8; 
+            box-shadow: 0 1px 8px rgba(26,115,232,0.2); 
+        }
+        
+        /* Autocomplete */
+        .autocomplete-items { 
+            position: absolute; 
+            border: 1px solid #dfe1e5; 
+            border-top: none; 
+            z-index: 99; 
+            top: 100%; 
+            left: 20px; 
+            right: 20px; 
+            background: white; 
+            border-bottom-left-radius: 12px; 
+            border-bottom-right-radius: 12px; 
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1); 
+            overflow: hidden; 
+        }
+        .autocomplete-items div { 
+            padding: 10px 15px; 
+            cursor: pointer; 
+            border-bottom: 1px solid #f1f3f4; 
+            font-size: 0.95rem; 
+            color: #202124; 
+        }
+        .autocomplete-items div:hover { 
+            background-color: #f1f3f4; 
+        }
 
-        /* Filtry */
-        .filters-bar { width: 100%; max-width: 850px; margin: 15px auto 0 auto; display: flex; gap: 10px; padding: 0 15px; flex-wrap: wrap; }
-        .filter-btn { background: white; border: 1px solid #dadce0; padding: 6px 14px; border-radius: 16px; font-size: 0.85rem; cursor: pointer; text-decoration: none; color: #5f6368; font-weight: 500; }
-        .filter-btn.active, .filter-btn:hover { background: #e8f0fe; color: #1a73e8; border-color: #d2e3fc; }
+        /* Filters */
+        .filters-bar { 
+            width: 100%; 
+            max-width: 850px; 
+            margin: 15px auto 0 auto; 
+            display: flex; 
+            gap: 10px; 
+            padding: 0 15px; 
+            flex-wrap: wrap; 
+        }
+        .filter-btn { 
+            background: white; 
+            border: 1px solid #dadce0; 
+            padding: 6px 14px; 
+            border-radius: 16px; 
+            font-size: 0.85rem; 
+            cursor: pointer; 
+            text-decoration: none; 
+            color: #5f6368; 
+            font-weight: 500; 
+            transition: all 0.2s; 
+        }
+        .filter-btn.active, .filter-btn:hover { 
+            background: #e8f0fe; 
+            color: #1a73e8; 
+            border-color: #d2e3fc; 
+        }
+        .filter-btn.active { 
+            background: #d2e3fc; 
+            border-color: #1a73e8; 
+        }
 
-        .container { max-width: 850px; margin: 20px auto; padding: 0 15px; }
-        .stats { color: #70757a; font-size: 0.85rem; margin-bottom: 20px; }
+        .container { 
+            max-width: 850px; 
+            margin: 20px auto; 
+            padding: 0 15px; 
+        }
+        .stats { 
+            color: #70757a; 
+            font-size: 0.85rem; 
+            margin-bottom: 20px; 
+        }
         
-        /* Výsledek */
-        .result-item { background: white; padding: 22px; margin-bottom: 18px; border-radius: 12px; border: 1px solid #e0e0e0; display: flex; gap: 18px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); transition: box-shadow 0.2s; }
-        .result-item:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
-        .result-content { flex: 1; }
+        /* Results */
+        .result-item { 
+            background: white; 
+            padding: 22px; 
+            margin-bottom: 18px; 
+            border-radius: 12px; 
+            border: 1px solid #e0e0e0; 
+            display: flex; 
+            gap: 18px; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02); 
+            transition: box-shadow 0.2s; 
+        }
+        .result-item:hover { 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.06); 
+        }
+        .result-content { 
+            flex: 1; 
+        }
         
-        .badge-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
-        .badge { background: #e8f0fe; color: #1a73e8; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
-        .date-badge { color: #70757a; font-size: 0.8rem; }
+        .badge-row { 
+            display: flex; 
+            gap: 8px; 
+            margin-bottom: 6px; 
+            align-items: center; 
+            flex-wrap: wrap; 
+        }
+        .badge { 
+            background: #e8f0fe; 
+            color: #1a73e8; 
+            padding: 3px 8px; 
+            border-radius: 4px; 
+            font-size: 0.75rem; 
+            font-weight: 600; 
+            text-transform: uppercase; 
+        }
+        .date-badge { 
+            color: #70757a; 
+            font-size: 0.8rem; 
+        }
         
-        .result-title { font-size: 1.25rem; margin: 0 0 6px 0; font-weight: 500; }
-        .result-title a { color: #1a0dab; text-decoration: none; }
-        .result-title a:hover { text-decoration: underline; }
-        .result-url { font-size: 0.85rem; color: #006621; margin-bottom: 8px; word-break: break-all; }
-        .result-snippet { font-size: 0.95rem; color: #4d5156; line-height: 1.6; }
+        .result-title { 
+            font-size: 1.25rem; 
+            margin: 0 0 6px 0; 
+            font-weight: 500; 
+        }
+        .result-title a { 
+            color: #1a0dab; 
+            text-decoration: none; 
+        }
+        .result-title a:hover { 
+            text-decoration: underline; 
+        }
+        .result-url { 
+            font-size: 0.85rem; 
+            color: #006621; 
+            margin-bottom: 8px; 
+            word-break: break-all; 
+        }
+        .result-snippet { 
+            font-size: 0.95rem; 
+            color: #4d5156; 
+            line-height: 1.6; 
+        }
         
         /* Rich Results & Audio */
-        .rich-data { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #eee; font-size: 0.85rem; color: #5f6368; display: flex; gap: 15px; flex-wrap: wrap; align-items: center; }
-        .rating { color: #f4b400; font-weight: bold; }
-        .price { color: #0f9d58; font-weight: bold; }
-        .audio-player { width: 100%; margin-top: 8px; height: 36px; }
+        .rich-data { 
+            margin-top: 12px; 
+            padding-top: 10px; 
+            border-top: 1px dashed #eee; 
+            font-size: 0.85rem; 
+            color: #5f6368; 
+            display: flex; 
+            gap: 15px; 
+            flex-wrap: wrap; 
+            align-items: center; 
+        }
+        .rating { 
+            color: #f4b400; 
+            font-weight: bold; 
+        }
+        .price { 
+            color: #0f9d58; 
+            font-weight: bold; 
+        }
+        .audio-player { 
+            width: 100%; 
+            margin-top: 8px; 
+            height: 36px; 
+        }
         
-        .result-img { width: 110px; height: 110px; object-fit: cover; border-radius: 8px; flex-shrink: 0; background: #f1f3f4; }
+        .result-img { 
+            width: 110px; 
+            height: 110px; 
+            object-fit: cover; 
+            border-radius: 8px; 
+            flex-shrink: 0; 
+            background: #f1f3f4; 
+        }
+        
+        /* No results */
+        .no-results { 
+            text-align: center; 
+            padding: 60px 20px; 
+            color: #70757a; 
+        }
+        .no-results-icon { 
+            font-size: 4rem; 
+            margin-bottom: 16px; 
+        }
+        
+        /* Loading */
+        .loading { 
+            text-align: center; 
+            padding: 40px; 
+            color: #70757a; 
+        }
+        .spinner { 
+            display: inline-block; 
+            width: 40px; 
+            height: 40px; 
+            border: 4px solid #f3f3f3; 
+            border-top: 4px solid #1a73e8; 
+            border-radius: 50%; 
+            animation: spin 1s linear infinite; 
+        }
+        @keyframes spin { 
+            to { transform: rotate(360deg); } 
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) { 
+            .result-item { 
+                flex-direction: column; 
+            }
+            .result-img { 
+                width: 100%; 
+                height: 200px; 
+            }
+            .filters-bar { 
+                justify-content: center; 
+            }
+        }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/" class="logo">🧠 SmartSearch AI</a>
+        <a href="/" class="logo">🔍 Mini Search AI</a>
         <div class="search-container">
             <form action="/" method="get" class="search-box">
-                <input type="text" id="searchInput" name="q" value="{{ query }}" placeholder="Zadejte hledaný výraz, téma nebo otázku..." autocomplete="off" autofocus required>
+                <input type="text" id="searchInput" name="q" value="{{ query }}" placeholder="Zadejte hledaný výraz, téma nebo otázku..." autocomplete="off" autofocus {{ 'required' if not query else '' }}>
             </form>
             <div id="autocompleteList" class="autocomplete-items"></div>
         </div>
     </div>
 
     <div class="filters-bar">
-        <a href="/?q={{ query }}" class="filter-btn {% if not f %}active{% endif %}">Vše</a>
+        <a href="/?q={{ query }}" class="filter-btn {% if not f and not audio and not price %}active{% endif %}">Vše</a>
         <a href="/?q={{ query }}&f=PodcastEpisode" class="filter-btn {% if f == 'PodcastEpisode' %}active{% endif %}">🎙️ Podcasty</a>
-        <a href="/?q={{ query }}&f=Article" class="filter-btn {% if f == 'Article' %}active{% endif %}">📰 Články</a>
-        <a href="/?q={{ query }}&audio=1" class="filter-btn {% if audio %}active{% endif %}">🔊 S audio přehrávačem</a>
+        <a href="/?q={{ query }}&f=Article,BlogPosting,NewsArticle" class="filter-btn {% if f in ['Article', 'BlogPosting', 'NewsArticle'] %}active{% endif %}">📰 Články</a>
+        <a href="/?q={{ query }}&audio=1" class="filter-btn {% if audio %}active{% endif %}">🎧 S audio přehrávačem</a>
+        <a href="/?q={{ query }}&price=1" class="filter-btn {% if price %}active{% endif %}">💰 S cenou</a>
     </div>
 
     <div class="container">
         {% if query %}
             <div class="stats">Nalezeno {{ total }} výsledků (za {{ processing_time }} ms)</div>
             
-            {% for item in results %}
-            <div class="result-item">
-                {% if item.image %}
-                    <img src="{{ item.image }}" class="result-img" onerror="this.style.display='none'">
-                {% endif %}
-                <div class="result-content">
-                    <div class="badge-row">
-                        {% if item.schema_type and item.schema_type != 'WebPage' %}
-                            <span class="badge">{{ item.schema_type }}</span>
-                        {% endif %}
-                        {% if item.published_date %}
-                            <span class="date-badge">📅 {{ item.published_date }}</span>
-                        {% endif %}
-                    </div>
-                    
-                    <div class="result-url">{{ item.url }}</div>
-                    <h3 class="result-title"><a href="{{ item.url }}" target="_blank">{{ item.title }}</a></h3>
-                    <div class="result-snippet">{{ item.text[:220] }}...</div>
-                    
-                    {% if item.has_audio and item.audio_url %}
-                        <audio controls class="audio-player">
-                            <source src="{{ item.audio_url }}" type="audio/mpeg">
-                            Váš prohlížeč nepodporuje audio element.
-                        </audio>
+            {% if results %}
+                {% for item in results %}
+                <div class="result-item">
+                    {% if item.metadata.image %}
+                        <img src="{{ item.metadata.image }}" class="result-img" onerror="this.style.display='none'">
                     {% endif %}
+                    <div class="result-content">
+                        <div class="badge-row">
+                            {% if item.metadata.schema_type and item.metadata.schema_type != 'WebPage' %}
+                                <span class="badge">{{ item.metadata.schema_type }}</span>
+                            {% endif %}
+                            {% if item.metadata.published_date %}
+                                <span class="date-badge">📅 {{ item.metadata.published_date }}</span>
+                            {% endif %}
+                        </div>
+                        
+                        <div class="result-url">{{ item.metadata.url }}</div>
+                        <h3 class="result-title"><a href="{{ item.metadata.url }}" target="_blank">{{ item.metadata.title }}</a></h3>
+                        <div class="result-snippet">{{ item.metadata.text[:220] }}...</div>
+                        
+                        {% if item.metadata.has_audio == 'True' and item.metadata.audio_url %}
+                            <audio controls class="audio-player">
+                                <source src="{{ item.metadata.audio_url }}" type="audio/mpeg">
+                                Váš prohlížeč nepodporuje audio element.
+                            </audio>
+                        {% endif %}
 
-                    {% if item.schema_details %}
-                    <div class="rich-data">
-                        {% if item.schema_details.rating %}
-                            <span class="rating">★ {{ item.schema_details.rating }} / 5 ({{ item.schema_details.reviews or 0 }} recenzí)</span>
-                        {% endif %}
-                        {% if item.schema_details.price %}
-                            <span class="price">Cena: {{ item.schema_details.price }} {{ item.schema_details.currency or 'Kč' }}</span>
-                        {% endif %}
-                        {% if item.schema_details.author %}
-                            <span>✍️ Autor: {{ item.schema_details.author }}</span>
+                        {% if item.metadata.schema_details %}
+                        <div class="rich-data">
+                            {% set schema_details = item.metadata.schema_details|from_json if item.metadata.schema_details else {} %}
+                            {% if schema_details.rating %}
+                                <span class="rating">⭐ {{ schema_details.rating }} / 5 ({{ schema_details.reviews or 0 }} recenzí)</span>
+                            {% endif %}
+                            {% if schema_details.price %}
+                                <span class="price">Cena: {{ schema_details.price }} {{ schema_details.currency or 'Kč' }}</span>
+                            {% endif %}
+                            {% if schema_details.author %}
+                                <span>✍️ Autor: {{ schema_details.author }}</span>
+                            {% endif %}
+                        </div>
                         {% endif %}
                     </div>
-                    {% endif %}
                 </div>
-            </div>
-            {% endfor %}
-
-            {% if not results %}
-                <p style="text-align: center; color: #70757a; margin-top: 40px;">Pro výraz <b>"{{ query }}"</b> nebyly nalezeny žádné výsledky.</p>
+                {% endfor %}
+            {% else %}
+                <div class="no-results">
+                    <div class="no-results-icon">🔍</div>
+                    <p>Pro výraz <b>"{{ query }}"</b> nebyly nalezeny žádné výsledky.</p>
+                    <p style="margin-top: 10px; font-size: 0.9rem; color: #9aa0a6;">Zkuste jiný výraz nebo zkontrolujte, zda byly stránky správně naindexovány.</p>
+                </div>
             {% endif %}
         {% else %}
-            <p style="text-align: center; color: #70757a; margin-top: 60px;">Vyhledávací index 500 nejnovějších položek je připraven.</p>
+            <div class="no-results">
+                <div class="no-results-icon">👋</div>
+                <p>Vítejte v Mini Search!</p>
+                <p style="margin-top: 10px; font-size: 0.9rem; color: #9aa0a6;">
+                    Vyhledávací index je připraven. Přidejte weby prostřednictvím správcovské konzole na portu 5000.
+                </p>
+                <p style="margin-top: 20px;">
+                    <a href="http://localhost:5000" target="_blank" class="filter-btn" style="padding: 10px 20px;">🔧 Otevřít správcovskou konzoli</a>
+                </p>
+            </div>
         {% endif %}
     </div>
 
     <script>
-        // Živý našeptávač (Autocomplete)
+        // Autocomplete functionality
         const input = document.getElementById("searchInput");
         const list = document.getElementById("autocompleteList");
 
@@ -146,81 +558,142 @@ HTML_TEMPLATE = '''
                 const res = await fetch(`/autocomplete?q=${encodeURIComponent(val)}`);
                 const data = await res.json();
                 
-                data.forEach(title => {
-                    const item = document.createElement("div");
-                    item.innerHTML = `<strong>${title.substr(0, val.length)}</strong>${title.substr(val.length)}`;
-                    item.addEventListener("click", function() {
-                        input.value = title;
-                        list.innerHTML = "";
-                        input.form.submit();
+                if (data && data.length > 0) {
+                    data.forEach(title => {
+                        const item = document.createElement("div");
+                        const matchIndex = title.toLowerCase().indexOf(val.toLowerCase());
+                        if (matchIndex !== -1) {
+                            const before = title.substring(0, matchIndex);
+                            const match = title.substring(matchIndex, matchIndex + val.length);
+                            const after = title.substring(matchIndex + val.length);
+                            item.innerHTML = `${before}<strong>${match}</strong>${after}`;
+                        } else {
+                            item.textContent = title;
+                        }
+                        item.addEventListener("click", function() {
+                            input.value = title;
+                            list.innerHTML = "";
+                            input.form.submit();
+                        });
+                        list.appendChild(item);
                     });
-                    list.appendChild(item);
-                });
-            } catch(e) {}
+                }
+            } catch(e) {
+                console.error("Autocomplete error:", e);
+            }
         });
 
+        // Close autocomplete when clicking outside
         document.addEventListener("click", function(e) {
-            if (e.target !== input) { list.innerHTML = ""; }
+            if (e.target !== input) { 
+                list.innerHTML = ""; 
+            }
+        });
+
+        // Submit form on Enter key
+        input.addEventListener("keydown", function(e) {
+            if (e.key === "Enter" && list.children.length > 0) {
+                // If autocomplete is open, select first item on Enter
+                const firstItem = list.children[0];
+                if (firstItem) {
+                    input.value = firstItem.textContent || firstItem.innerText;
+                    list.innerHTML = "";
+                    input.form.submit();
+                    e.preventDefault();
+                }
+            }
         });
     </script>
 </body>
 </html>
 '''
 
+
 @app.route('/')
 def search():
-    query = request.args.get('q', '')
+    """Main search page"""
+    query = request.args.get('q', '').strip()
     f_filter = request.args.get('f', '')
     audio_filter = request.args.get('audio', '')
+    price_filter = request.args.get('price', '')
     
     results = []
     total = 0
     processing_time = 0
-
+    
     if query:
-        filters = []
+        start_time = time.time()
+        
+        # Build filters
+        filters = {}
         if f_filter:
-            filters.append(f"schema_type = '{f_filter}'")
+            filter_types = f_filter.split(',')
+            filters['schema_type'] = filter_types
         if audio_filter:
-            filters.append("has_audio = true")
-
-        payload = {
-            "q": query,
-            "limit": 25,
-            "sort": ["published_timestamp:desc"]
-        }
-        if filters:
-            payload["filter"] = " AND ".join(filters)
-
-        try:
-            res = requests.post(MEILI_SEARCH_URL, json=payload).json()
-            results = res.get('hits', [])
-            total = res.get('estimatedTotalHits', len(results))
-            processing_time = res.get('processingTimeMs', 0)
-        except Exception:
-            pass
-
+            filters['has_audio'] = True
+        if price_filter:
+            filters['has_price'] = True
+        
+        # Search ChromaDB
+        raw_results = get_chroma_results(query, limit=25, filters=filters)
+        
+        # Deduplicate
+        deduped_results = deduplicate_results(raw_results)
+        
+        # Prepare results for template
+        results = []
+        for result in deduped_results:
+            metadata = result['metadata']
+            
+            # Extract text from document (if available)
+            text = metadata.get('text', '')
+            if not text and 'document' in result:
+                text = result['document'][:500]  # Truncate
+            
+            results.append({
+                'id': result['id'],
+                'metadata': metadata,
+                'text': text,
+                'relevance': result['relevance']
+            })
+        
+        total = len(results)
+        processing_time = int((time.time() - start_time) * 1000)
+    
     return render_template_string(
-        HTML_TEMPLATE, 
-        query=query, 
-        results=results, 
-        total=total, 
+        HTML_TEMPLATE,
+        query=query,
+        results=results,
+        total=total,
         processing_time=processing_time,
         f=f_filter,
-        audio=audio_filter
+        audio=audio_filter,
+        price=price_filter
     )
+
 
 @app.route('/autocomplete')
 def autocomplete():
-    query = request.args.get('q', '')
-    if not query:
+    """Autocomplete endpoint"""
+    query = request.args.get('q', '').strip()
+    
+    if not query or len(query) < 2:
         return jsonify([])
+    
     try:
-        res = requests.post(MEILI_SEARCH_URL, json={"q": query, "limit": 5}).json()
-        titles = [hit.get('title') for hit in res.get('hits', []) if 'title' in hit]
-        return jsonify(titles)
-    except Exception:
+        suggestions = autocomplete_query(query)
+        return jsonify(suggestions)
+    except Exception as e:
+        print(f"Autocomplete error: {e}")
         return jsonify([])
 
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8095)
+    print("=" * 60)
+    print("Mini Search - Vyhledávací rozhraní")
+    print("=" * 60)
+    print(f"Spouštím na http://0.0.0.0:8095")
+    print("Ctrl+C pro ukončení")
+    print("=" * 60)
+    
+    app.run(host='0.0.0.0', port=8095, threaded=True)

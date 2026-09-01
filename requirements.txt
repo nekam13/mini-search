@@ -1,0 +1,8 @@
+Flask==3.0.0
+APScheduler==3.10.4
+beautifulsoup4==4.12.2
+feedparser==6.0.10
+extruct==0.15.0
+sentence-transformers==2.2.2
+chromadb==0.4.22
+requests==2.31.0
