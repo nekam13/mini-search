@@ -1,16 +1,13 @@
 #!/bin/bash
 
-# Mini Search - Stop Script v2.0
-# Gracefully stops all Mini Search services
+# Mini Search - Stop skript v4.0
+# Graceful ukončení všech služeb
 
-set -e
-
-# Colors for output
+# Barvy
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 NC='\033[0m'
 
 print_header() {
@@ -20,7 +17,7 @@ print_header() {
 }
 
 print_status() {
-    echo -e "${BLUE}[*]${NC} $1"
+    echo -e "${CYAN}[*]${NC} $1"
 }
 
 print_success() {
@@ -31,92 +28,51 @@ print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
-print_error() {
-    echo -e "${RED}[-]${NC} $1"
-}
-
+# Úvod
 echo ""
-print_header "Mini Search - Ukončování systému v2.0"
+print_header "Mini Search - Ukončování systému v4.0"
 echo ""
 
-# Function to kill process by name
-kill_process() {
-    local PROCESS_NAME=$1
-    print_status "Ukončuji $PROCESS_NAME..."
+# Ukonči procesy na portech 8070 a 8095
+PORTS=(8070 8095)
+
+for port in "${PORTS[@]}"; do
+    print_status "Ukončování procesů na portu $port..."
     
-    # Try pkill first
-    pkill -f "$PROCESS_NAME" 2>/dev/null || true
-    sleep 1
-    
-    # Check if still running
-    if pgrep -f "$PROCESS_NAME" > /dev/null 2>&1; then
-        print_warning "První pokus neúspěšný, zkouším silnější metodu..."
-        pkill -9 -f "$PROCESS_NAME" 2>/dev/null || true
-        sleep 1
+    # Zkus fuser
+    if command -v fuser &> /dev/null; then
+        fuser -k $port/tcp 2>/dev/null || true
     fi
     
-    # Verify
-    if pgrep -f "$PROCESS_NAME" > /dev/null 2>&1; then
-        print_error "Nepodařilo se ukončit $PROCESS_NAME"
-        return 1
-    else
-        print_success "$PROCESS_NAME ukončen"
-        return 0
-    fi
-}
-
-# Kill all Mini Search processes
-kill_process "app.py"
-kill_process "search_ui.py"
-kill_process "crawler_engine.py"
-
-# Also try by port
-for PORT in 8070 8095; do
-    print_status "Kontrola portu $PORT..."
+    # Zkus lsof
     if command -v lsof &> /dev/null; then
-        if lsof -i :$PORT > /dev/null 2>&1; then
-            print_warning "Port $PORT je stále obsazený"
-            fuser -k $PORT/tcp 2>/dev/null || true
-            sleep 1
-            if lsof -i :$PORT > /dev/null 2>&1; then
-                print_error "Port $PORT zůstává obsazený"
-            else
-                print_success "Port $PORT uvolněn"
-            fi
-        else
-            print_success "Port $PORT je volný"
-        fi
-    elif command -v netstat &> /dev/null; then
-        if netstat -tuln | grep ":$PORT " > /dev/null 2>&1; then
-            print_warning "Port $PORT je obsazený"
-            pkill -9 -f ":$PORT" 2>/dev/null || true
-            sleep 1
-        else
-            print_success "Port $PORT je volný"
-        fi
-    else
-        print_info "Není dostupný lsof ani netstat, přeskakuji kontrolu portů"
+        lsof -ti:$port | xargs kill -9 2>/dev/null || true
     fi
+    
+    # Zkus pkill
+    pkill -f "python3.*port=$port" 2>/dev/null || true
+    pkill -f "python3 app.py" 2>/dev/null || true
+    pkill -f "python3 search_ui.py" 2>/dev/null || true
+    pkill -f "python3 crawler_engine.py" 2>/dev/null || true
+    
+    print_success "Procesy na portu $port ukončeny"
 done
 
 echo ""
-print_header "Všechny služby Mini Search ukončeny"
-echo ""
 
-# Show remaining processes
-print_status "Zbývající Python procesy:"
-echo "------------------------------------------"
-if command -v ps &> /dev/null; then
-    ps aux | grep python | grep -v grep | grep -v ".sh" | while read line; do
-        if [ -n "$line" ]; then
-            echo "  $line"
-        fi
-    done
-else
-    print_info "ps není dostupný"
+# Počkej na ukončení
+print_status "Čekání na ukončení všech procesů..."
+sleep 2
+
+# Zkontroluj, zda jsou procesy opravdu ukončeny
+if pgrep -f "python3 (app|search_ui|crawler_engine)" &> /dev/null; then
+    print_warning "Některé procesy stále běží, zkouším znovu..."
+    pkill -9 -f python3 2>/dev/null || true
+    sleep 1
 fi
-echo "------------------------------------------"
-echo ""
 
-print_success "✅ Ukončování dokončeno"
+echo ""
+print_header "Systém ukončen"
+echo ""
+print_success "✅ Všechny služby byly úspěšně ukončeny"
 echo ""
