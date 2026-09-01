@@ -228,18 +228,29 @@ class SQLiteHNSWBackend(VectorSearchBackend):
             similarities = []
             for row in all_data:
                 id, embedding_blob, metadata_str = row
-                embedding = pickle.loads(embedding_blob)
-                
-                # Cosine similarity
-                dot_product = np.dot(query_array[0], embedding)
-                norm_a = np.linalg.norm(query_array[0])
-                norm_b = np.linalg.norm(embedding)
-                similarity = dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
-                
-                # Convert similarity to distance (1 - similarity)
-                distance = 1.0 - similarity
-                
-                similarities.append((id, distance, json.loads(metadata_str)))
+                try:
+                    embedding = pickle.loads(embedding_blob)
+                    
+                    # Ensure embedding is numpy array
+                    if not isinstance(embedding, np.ndarray):
+                        embedding = np.array(embedding)
+                    
+                    # Ensure query is numpy array
+                    query_arr = np.array(query_array[0]) if not isinstance(query_array[0], np.ndarray) else query_array[0]
+                    
+                    # Cosine similarity
+                    dot_product = np.dot(query_arr, embedding)
+                    norm_a = np.linalg.norm(query_arr)
+                    norm_b = np.linalg.norm(embedding)
+                    similarity = dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
+                    
+                    # Convert similarity to distance (1 - similarity)
+                    distance = 1.0 - similarity
+                    
+                    similarities.append((id, distance, json.loads(metadata_str) if isinstance(metadata_str, str) else metadata_str))
+                except Exception as e:
+                    print(f"⚠️  Chyba při zpracování vektoru {id}: {e}")
+                    continue
             
             # Sort by distance (ascending)
             similarities.sort(key=lambda x: x[1])
@@ -468,7 +479,7 @@ def init_db():
             error_count INTEGER DEFAULT 0,
             last_crawled INTEGER DEFAULT 0,
             max_pages INTEGER DEFAULT 500,
-            created_at INTEGER DEFAULT strftime('%s', 'now')
+            created_at INTEGER DEFAULT 0
         )
     ''')
     
@@ -482,7 +493,7 @@ def init_db():
             locked_by TEXT DEFAULT '',
             error_reason TEXT DEFAULT '',
             retry_count INTEGER DEFAULT 0,
-            created_at INTEGER DEFAULT strftime('%s', 'now'),
+            created_at INTEGER DEFAULT 0,
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''')
@@ -809,10 +820,10 @@ def add_site(site_url, max_pages=500):
         conn.close()
         return site_id
     
-    # Insert new site
+    # Insert new site - store the domain (netloc) as canonical_url for consistency
     cursor.execute(
         "INSERT INTO sites (canonical_url, aliases, status, max_pages) VALUES (?, ?, 'active', ?)",
-        (site_url, json.dumps([]), max_pages)
+        (canonical_domain, json.dumps([site_url]), max_pages)
     )
     site_id = cursor.lastrowid
     conn.commit()

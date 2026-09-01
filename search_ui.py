@@ -717,7 +717,7 @@ HTML_TEMPLATE = '''
                     Vyhledávací index je připraven. Přidejte weby prostřednictvím správcovské konzole.
                 </p>
                 <p style="margin-top: 20px;">
-                    <a href="http://localhost:5000" target="_blank" class="filter-btn" style="padding: 10px 20px;">🔧 Otevřít správcovskou konzoli</a>
+                    <a href="http://localhost:8070" target="_blank" class="filter-btn" style="padding: 10px 20px;">🔧 Otevřít správcovskou konzoli</a>
                 </p>
             </div>
         {% endif %}

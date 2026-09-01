@@ -5,7 +5,7 @@ Optimized for Ubuntu 26.04 ARM64 + Termux environment
 Lightweight version with fallback vector search backends
 
 Flask-based admin interface for managing crawls and sites.
-Runs on port 5000.
+Runs on port 8070.
 """
 
 import sqlite3
@@ -1076,11 +1076,11 @@ if __name__ == '__main__':
     print("Mini Search - Správcovská konzole v3.0")
     print(f"Vector backend: {crawler_engine.VECTOR_BACKEND}")
     print("=" * 70)
-    print(f"Spouštím na http://0.0.0.0:5000")
+    print(f"Spouštím na http://0.0.0.0:8070")
     print("Ctrl+C pro ukončení")
     print("=" * 70)
     
     try:
-        app.run(host='0.0.0.0', port=5000, threaded=True)
+        app.run(host='0.0.0.0', port=8070, threaded=True)
     except KeyboardInterrupt:
         shutdown_handler()
