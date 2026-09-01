@@ -2,7 +2,7 @@ import sqlite3
 import json
 import time
 from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, redirect
 import crawler_engine
 
 app = Flask(__name__)
@@ -496,7 +496,7 @@ HTML_TEMPLATE = '''
                         </div>
                         
                         <div class="result-url">{{ item.metadata.url }}</div>
-                        <h3 class="result-title"><a href="{{ item.metadata.url }}" target="_blank">{{ item.metadata.title }}</a></h3>
+                        <h3 class="result-title"><a href="/click?url={{ item.metadata.url|urlencode }}" target="_blank">{{ item.metadata.title }}</a></h3>
                         <div class="result-snippet">{{ item.metadata.text[:220] }}...</div>
                         
                         {% if item.metadata.has_audio == 'True' and item.metadata.audio_url %}
@@ -670,6 +670,23 @@ def search():
         audio=audio_filter,
         price=price_filter
     )
+
+
+@app.route('/click')
+def track_click():
+    """Track clicks on search results and redirect to URL"""
+    url = request.args.get('url', '')
+    if url:
+        try:
+            conn = sqlite3.connect("console.db", timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("UPDATE crawl_queue SET hit_count = hit_count + 1 WHERE url = ?", (url,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return redirect(url)
+    return redirect('/')
 
 
 @app.route('/autocomplete')
