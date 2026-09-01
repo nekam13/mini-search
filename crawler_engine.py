@@ -1215,7 +1215,7 @@ def worker_a():
             
             # Lock a batch of pending URLs
             cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5 FOR UPDATE SKIP LOCKED",
+                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5",
                 (MAX_RETRIES,)
             )
             batch = cursor.fetchall()
@@ -1303,7 +1303,7 @@ def worker_b():
             
             # Lock a batch of pending URLs
             cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5 FOR UPDATE SKIP LOCKED",
+                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5",
                 (MAX_RETRIES,)
             )
             batch = cursor.fetchall()
