@@ -99,6 +99,32 @@ def init_db():
         )
     ''')
     
+    # Add new columns to crawl_queue if they don't exist
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN content_hash TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN last_checked INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN priority REAL DEFAULT 0.5")
+    except sqlite3.OperationalError:
+        pass
+    
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN hit_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN archived_at INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    
     # Sitemaps and feeds table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sitemaps_feeds (
@@ -110,6 +136,12 @@ def init_db():
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''')
+    
+    # Add lastmod column to sitemaps_feeds if it doesn't exist
+    try:
+        cursor.execute("ALTER TABLE sitemaps_feeds ADD COLUMN lastmod TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     
     conn.commit()
     conn.close()
@@ -453,19 +485,26 @@ def discover_sitemaps_and_feeds(site_url, site_id):
                         if hasattr(entry, 'link'):
                             discovered_feeds.append({
                                 'url': normalize_domain(entry.link),
-                                'date': entry.get('published_parsed', None)
+                                'date': entry.get('published_parsed', None),
+                                'priority': 1.0,
+                                'lastmod': ''
                             })
                 except:
                     pass
             else:  # sitemap
                 try:
                     soup = BeautifulSoup(response.text, 'xml')
-                    urls = [url.text for url in soup.find_all('loc') if url.text]
-                    for sitemap_url in urls:
-                        discovered_feeds.append({
-                            'url': normalize_domain(sitemap_url),
-                            'date': None
-                        })
+                    for url_tag in soup.find_all('url'):
+                        loc = url_tag.find('loc')
+                        priority_tag = url_tag.find('priority')
+                        lastmod_tag = url_tag.find('lastmod')
+                        if loc and loc.text:
+                            discovered_feeds.append({
+                                'url': normalize_domain(loc.text.strip()),
+                                'date': None,
+                                'priority': float(priority_tag.text.strip()) if priority_tag else 0.5,
+                                'lastmod': lastmod_tag.text.strip() if lastmod_tag else ''
+                            })
                 except:
                     pass
                     
@@ -529,19 +568,20 @@ def phase_1_discovery(site_url, max_pages=500):
     for item in discovered_items:
         url = item['url']
         if url not in existing_urls:
-            urls_to_add.append(url)
+            urls_to_add.append((url, item.get('priority', 0.5)))
             existing_urls.add(url)
     
     # If no URLs found from sitemaps/feeds, crawl homepage
     if not urls_to_add:
-        urls_to_add = crawl_homepage_for_links(site_url, site_id, max_pages)
+        homepage_urls = crawl_homepage_for_links(site_url, site_id, max_pages)
+        urls_to_add = [(u, 0.5) for u in homepage_urls]
     
-    # Add URLs to crawl queue
-    for url in urls_to_add:
+    # Add URLs to crawl queue with priority
+    for url, priority in urls_to_add:
         try:
             cursor.execute(
-                "INSERT INTO crawl_queue (site_id, url, status) VALUES (?, ?, 'pending')",
-                (site_id, url)
+                "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', ?)",
+                (site_id, url, priority)
             )
         except sqlite3.IntegrityError:
             pass  # URL already exists
@@ -612,6 +652,22 @@ def process_url(url, site_id, max_pages):
                     body_parts.append(text)
         body_text = ' '.join(body_parts)[:3500]
         
+        # Part 3: Compute content hash and check if unchanged
+        new_hash = hashlib.md5(body_text.encode('utf-8')).hexdigest()
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT content_hash FROM crawl_queue WHERE url = ?", (url,))
+        row = cursor.fetchone()
+        
+        if row and row[0] == new_hash:
+            # Content unchanged — update last_checked only, skip re-embedding
+            cursor.execute("UPDATE crawl_queue SET status='done', last_checked=? WHERE url=?", 
+                          (int(time.time()), url))
+            conn.commit()
+            conn.close()
+            return {"skipped": True, "url": url}, None
+        
         # Extract image
         image_url = meta_info["og"].get("image", "")
         if not image_url:
@@ -628,6 +684,32 @@ def process_url(url, site_id, max_pages):
         
         # Generate document ID
         doc_id = generate_doc_id(url)
+        
+        # Part 6: Check active index limit and evict if needed
+        cursor.execute("SELECT max_pages FROM sites WHERE id=?", (site_id,))
+        max_row = cursor.fetchone()
+        max_pages_limit = max_row[0] if max_row else 500
+        
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id=? AND status='done'", (site_id,))
+        active_count = cursor.fetchone()[0]
+        
+        if active_count >= max_pages_limit:
+            # Archive the lowest scoring page
+            cursor.execute("""
+                SELECT id FROM crawl_queue
+                WHERE site_id=? AND status='done'
+                ORDER BY priority ASC, last_checked ASC
+                LIMIT 1
+            """, (site_id,))
+            evict_row = cursor.fetchone()
+            if evict_row:
+                cursor.execute(
+                    "UPDATE crawl_queue SET status='archived', archived_at=? WHERE id=?",
+                    (int(time.time()), evict_row[0])
+                )
+        
+        conn.commit()
+        conn.close()
         
         # Prepare document for ChromaDB
         if CHROMA_AVAILABLE and body_text.strip():
@@ -656,6 +738,14 @@ def process_url(url, site_id, max_pages):
                 )
             except Exception as e:
                 print(f"Error storing in ChromaDB: {e}")
+        
+        # Save new hash and last_checked
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE crawl_queue SET content_hash=?, last_checked=? WHERE url=?",
+                      (new_hash, int(time.time()), url))
+        conn.commit()
+        conn.close()
         
         return {
             "id": doc_id,
