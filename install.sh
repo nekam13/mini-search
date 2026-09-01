@@ -460,13 +460,13 @@ print_status "  ./stop_all.sh            # Ukončení všech služeb"
 echo ""
 
 print_info "Příkazy pro ruční spuštění:"
-print_status "  python3 app.py           # Správcovská konzole (port 5000)"
+print_status "  python3 app.py           # Správcovská konzole (port 8070)"
 print_status "  python3 search_ui.py     # Vyhledávání (port 8095)"
 print_status "  python3 crawler_engine.py # Crawler engine"
 echo ""
 
 print_info "Důležité URL:"
-print_status "  http://localhost:5000   # Správcovská konzole"
+print_status "  http://localhost:8070   # Správcovská konzole"
 print_status "  http://localhost:8095   # Vyhledávání"
 echo ""
 

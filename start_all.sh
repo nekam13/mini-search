@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Mini Search - Startup Script v2.0
+# Mini Search - Startup Script v3.0
 # Optimized for Ubuntu 26.04 ARM64 + Termux environment
+# Forcefully kills existing processes on ports 8070 and 8095
 
 set -e
 
@@ -41,7 +42,7 @@ print_info() {
 }
 
 echo ""
-print_header "Mini Search - Spouštění systému v2.0"
+print_header "Mini Search - Spouštění systému v3.0"
 echo ""
 print_info "Prostředí: Ubuntu 26.04 ARM64 + Termux"
 echo ""
@@ -57,41 +58,71 @@ fi
 
 echo ""
 
-# Function to check and kill process on port
+# Function to forcefully kill process on port
 kill_port() {
     local PORT=$1
-    print_status "Kontrola portu $PORT..."
+    print_status "Násilné ukončení procesů na portu $PORT..."
     
-    # Check if port is in use
+    # Try multiple methods to kill processes
+    
+    # Method 1: fuser (most reliable)
+    if command -v fuser &> /dev/null; then
+        print_status "Používám fuser pro port $PORT..."
+        fuser -k $PORT/tcp 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # Method 2: lsof + kill
+    if command -v lsof &> /dev/null; then
+        print_status "Používám lsof + kill pro port $PORT..."
+        PIDS=$(lsof -t -i :$PORT 2>/dev/null || true)
+        if [ -n "$PIDS" ]; then
+            for PID in $PIDS; do
+                kill -9 $PID 2>/dev/null || true
+                print_status "Zabil jsem proces PID: $PID"
+            done
+        fi
+        sleep 1
+    fi
+    
+    # Method 3: pkill by name
+    print_status "Používám pkill pro python procesy..."
+    pkill -9 -f ":$PORT" 2>/dev/null || true
+    pkill -9 -f "port=$PORT" 2>/dev/null || true
+    pkill -9 -f "app.py" 2>/dev/null || true
+    pkill -9 -f "search_ui.py" 2>/dev/null || true
+    sleep 1
+    
+    # Method 4: ss + kill (alternative to lsof)
+    if command -v ss &> /dev/null; then
+        PIDS=$(ss -tlnp | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' || true)
+        if [ -n "$PIDS" ]; then
+            for PID in $PIDS; do
+                kill -9 $PID 2>/dev/null || true
+                print_status "Zabil jsem proces PID: $PID (přes ss)"
+            done
+        fi
+        sleep 1
+    fi
+    
+    # Method 5: netstat + kill
+    if command -v netstat &> /dev/null; then
+        PIDS=$(netstat -tlnp | grep ":$PORT " | grep -oP '[0-9]+/[a-zA-Z]+' | cut -d'/' -f1 || true)
+        if [ -n "$PIDS" ]; then
+            for PID in $PIDS; do
+                kill -9 $PID 2>/dev/null || true
+                print_status "Zabil jsem proces PID: $PID (přes netstat)"
+            done
+        fi
+        sleep 1
+    fi
+    
+    # Verify port is free
     if command -v lsof &> /dev/null; then
         if lsof -i :$PORT > /dev/null 2>&1; then
-            print_warning "Port $PORT je obsazený"
-            
-            # Try fuser
-            if command -v fuser &> /dev/null; then
-                print_status "Ukončuji procesy na portu $PORT (fuser)..."
-                fuser -k $PORT/tcp 2>/dev/null || true
-            else
-                # Try pkill
-                print_status "Ukončuji procesy na portu $PORT (pkill)..."
-                pkill -f ":$PORT" 2>/dev/null || true
-                pkill -f "port=$PORT" 2>/dev/null || true
-            fi
-            
-            sleep 2
-            
-            # Verify port is free
-            if lsof -i :$PORT > /dev/null 2>&1; then
-                print_error "Nepodařilo se ukončit procesy na portu $PORT"
-                print_info "Zkuste ručně: sudo lsof -i :$PORT"
-                return 1
-            fi
-        fi
-    elif command -v netstat &> /dev/null; then
-        if netstat -tuln | grep ":$PORT " > /dev/null 2>&1; then
-            print_warning "Port $PORT je obsazený"
-            pkill -f ":$PORT" 2>/dev/null || true
-            sleep 2
+            print_error "Port $PORT je stále obsazený!"
+            print_info "Zkuste ručně: sudo fuser -k $PORT/tcp"
+            return 1
         fi
     fi
     
@@ -99,16 +130,22 @@ kill_port() {
     return 0
 }
 
-# Kill processes on ports 5000 and 8095
-kill_port 5000
+# Forcefully kill processes on ports 8070 and 8095
+print_header "Ukončování existujících procesů"
+echo ""
+
+kill_port 8070
 kill_port 8095
 
 echo ""
 print_header "Spouštění služeb"
 echo ""
 
-# Start admin console (port 5000)
-print_status "Spouštím správcovskou konzoli na portu 5000..."
+# Navigate to script directory
+cd "$(dirname "$0")"
+
+# Start admin console (port 8070)
+print_status "Spouštím správcovskou konzoli na portu 8070..."
 python3 app.py > /tmp/mini_search_app.log 2>&1 &
 APP_PID=$!
 print_success "Správcovská konzole spuštěna (PID: $APP_PID)"
@@ -126,15 +163,15 @@ print_header "Systém spuštěn"
 echo ""
 
 # Show URLs
-print_info "🔧 Správcovská konzole: http://localhost:5000"
-print_info "🔍 Vyhledávání:       http://localhost:8095"
+print_info "🔧 Správcovská konzole: http://localhost:8070"
+print_info "🔍 Vyhledávání:       http://localhost:8095"}, {
 echo ""
 
 # Show process info
 print_status "Aktivní procesy:"
 echo "------------------------------------------"
 if command -v ps &> /dev/null; then
-    ps aux | grep -E "app.py|search_ui.py" | grep -v grep | while read line; do
+    ps aux | grep -E "app.py|search_ui.py" | grep -v grep | grep -v ".sh" | while read line; do
         if [ -n "$line" ]; then
             print_info "$line"
         fi
@@ -148,14 +185,14 @@ echo ""
 print_status "Pro zastavení systémů:"
 print_info "  ./stop_all.sh"
 print_info "nebo"
-print_info "  kill $APP_PID $SEARCH_PID"
+print_info "  kill -9 $APP_PID $SEARCH_PID"
 echo ""
 
 # Check if ports are accessible
 echo "Kontrola dostupnosti portů..."
 sleep 3
 
-for PORT in 5000 8095; do
+for PORT in 8070 8095; do
     if curl -s -o /dev/null -I "http://localhost:$PORT" > /dev/null 2>&1; then
         print_success "✅ Port $PORT je dostupný"
     else

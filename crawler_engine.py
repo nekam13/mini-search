@@ -228,18 +228,29 @@ class SQLiteHNSWBackend(VectorSearchBackend):
             similarities = []
             for row in all_data:
                 id, embedding_blob, metadata_str = row
-                embedding = pickle.loads(embedding_blob)
-                
-                # Cosine similarity
-                dot_product = np.dot(query_array[0], embedding)
-                norm_a = np.linalg.norm(query_array[0])
-                norm_b = np.linalg.norm(embedding)
-                similarity = dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
-                
-                # Convert similarity to distance (1 - similarity)
-                distance = 1.0 - similarity
-                
-                similarities.append((id, distance, json.loads(metadata_str)))
+                try:
+                    embedding = pickle.loads(embedding_blob)
+                    
+                    # Ensure embedding is numpy array
+                    if not isinstance(embedding, np.ndarray):
+                        embedding = np.array(embedding)
+                    
+                    # Ensure query is numpy array
+                    query_arr = np.array(query_array[0]) if not isinstance(query_array[0], np.ndarray) else query_array[0]
+                    
+                    # Cosine similarity
+                    dot_product = np.dot(query_arr, embedding)
+                    norm_a = np.linalg.norm(query_arr)
+                    norm_b = np.linalg.norm(embedding)
+                    similarity = dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
+                    
+                    # Convert similarity to distance (1 - similarity)
+                    distance = 1.0 - similarity
+                    
+                    similarities.append((id, distance, json.loads(metadata_str) if isinstance(metadata_str, str) else metadata_str))
+                except Exception as e:
+                    print(f"⚠️  Chyba při zpracování vektoru {id}: {e}")
+                    continue
             
             # Sort by distance (ascending)
             similarities.sort(key=lambda x: x[1])

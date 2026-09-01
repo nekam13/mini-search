@@ -71,7 +71,7 @@ kill_process "search_ui.py"
 kill_process "crawler_engine.py"
 
 # Also try by port
-for PORT in 5000 8095; do
+for PORT in 8070 8095; do
     print_status "Kontrola portu $PORT..."
     if command -v lsof &> /dev/null; then
         if lsof -i :$PORT > /dev/null 2>&1; then
