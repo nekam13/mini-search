@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""
+Mini Search - Crawler Engine
+Optimized for Ubuntu 26.04 ARM64 + Termux environment
+
+Core crawling and indexing functionality with:
+- Two-phase crawling (Discovery + Indexing)
+- ChromaDB vector storage
+- Sentence-transformers embeddings
+- Ethical crawling with robots.txt respect
+- Parallel workers for concurrent processing
+"""
+
 import sys
 import os
 import sqlite3
@@ -6,6 +19,8 @@ import hashlib
 import time
 import json
 import threading
+import signal
+import atexit
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -18,51 +33,102 @@ BOT_NAME = "MiniSearchBot/1.0"
 BOT_URL = "http://localhost/bot"
 HEADERS = {"User-Agent": f"{BOT_NAME} (+{BOT_URL})"}
 MIN_DELAY = 1.0  # Minimum delay between requests in seconds
+MAX_RETRIES = 3  # Maximum retry attempts
+REQUEST_TIMEOUT = 30  # Request timeout in seconds
 CHROMA_DB_PATH = "chroma_db"
 MODEL_PATH = "models/paraphrase-multilingual-MiniLM-L12-v2"
 
-# Global lock for rate limiting
+# Global state
+shutdown_flag = False
 rate_limit_lock = threading.Lock()
 last_request_time = 0.0
 
-# Robots.txt cache
-robots_cache = {}
-robots_cache_lock = threading.Lock()
+# Global references for cleanup
+embedding_model = None
+chroma_client = None
+pages_collection = None
+CHROMA_AVAILABLE = False
 
-# Initialize ChromaDB client
-try:
-    import chromadb
-    from sentence_transformers import SentenceTransformer
+
+def init_chroma():
+    """Initialize ChromaDB client and embedding model"""
+    global embedding_model, chroma_client, pages_collection, CHROMA_AVAILABLE
     
-    # Load embedding model
-    os.makedirs("models", exist_ok=True)
-    embedding_model = SentenceTransformer(MODEL_PATH, cache_folder="models")
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        from sentence_transformers import SentenceTransformer
+        
+        # Load embedding model
+        os.makedirs("models", exist_ok=True)
+        embedding_model = SentenceTransformer(MODEL_PATH, cache_folder="models")
+        
+        # Initialize ChromaDB with DuckDB for better ARM64 compatibility
+        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
+        chroma_client = chromadb.Client(
+            Settings(
+                chroma_db_impl="duckdb+parquet",
+                persist_directory=CHROMA_DB_PATH
+            )
+        )
+        
+        # Create or get pages collection
+        pages_collection = chroma_client.get_or_create_collection(
+            name="pages",
+            embedding_function=lambda texts: embedding_model.encode(texts).tolist()
+        )
+        
+        CHROMA_AVAILABLE = True
+        print("✅ ChromaDB a embedding model inicializovány")
+        
+    except ImportError as e:
+        print(f"⚠️  ChromaDB nebo sentence-transformers nejsou dostupné: {e}")
+        print("💡  Nainstalujte: pip install chromadb sentence-transformers")
+        CHROMA_AVAILABLE = False
+    except Exception as e:
+        print(f"⚠️  Chyba při inicializaci ChromaDB: {e}")
+        CHROMA_AVAILABLE = False
+
+
+def cleanup():
+    """Cleanup resources on shutdown"""
+    global chroma_client, shutdown_flag
+    shutdown_flag = True
     
-    # Initialize ChromaDB with PersistentClient
-    os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    print("\n🔄 Ukončování crawler engine...")
     
-    class MiniSearchEmbedding(chromadb.EmbeddingFunction):
-        def __call__(self, input):
-            return embedding_model.encode(input).tolist()
+    if chroma_client:
+        try:
+            chroma_client.persist()
+            print("✅ ChromaDB data uložena")
+        except Exception as e:
+            print(f"⚠️  Chyba při ukládání ChromaDB: {e}")
     
-    # Create or get pages collection
-    pages_collection = chroma_client.get_or_create_collection(
-        name="pages",
-        embedding_function=MiniSearchEmbedding()
-    )
-    
-    CHROMA_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: ChromaDB not available: {e}")
-    CHROMA_AVAILABLE = False
+    print("✅ Crawler engine ukončen")
+
+
+# Register cleanup on exit
+atexit.register(cleanup)
+
+
+def handle_shutdown(signum, frame):
+    """Handle shutdown signals"""
+    cleanup()
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 def get_db():
-    """Get SQLite database connection"""
+    """Get SQLite database connection with WAL mode for better concurrency"""
     conn = sqlite3.connect("console.db", timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -80,7 +146,8 @@ def init_db():
             status TEXT DEFAULT 'active',
             error_count INTEGER DEFAULT 0,
             last_crawled INTEGER DEFAULT 0,
-            max_pages INTEGER DEFAULT 500
+            max_pages INTEGER DEFAULT 500,
+            created_at INTEGER DEFAULT strftime('%s', 'now')
         )
     ''')
     
@@ -94,36 +161,10 @@ def init_db():
             locked_by TEXT DEFAULT '',
             error_reason TEXT DEFAULT '',
             retry_count INTEGER DEFAULT 0,
-            UNIQUE(site_id, url),
+            created_at INTEGER DEFAULT strftime('%s', 'now'),
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''')
-    
-    # Add new columns to crawl_queue if they don't exist
-    try:
-        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN content_hash TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
-    try:
-        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN last_checked INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN priority REAL DEFAULT 0.5")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN hit_count INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN archived_at INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
     
     # Sitemaps and feeds table
     cursor.execute('''
@@ -137,11 +178,15 @@ def init_db():
         )
     ''')
     
-    # Add lastmod column to sitemaps_feeds if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE sitemaps_feeds ADD COLUMN lastmod TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
+    # Create indexes for performance
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_sites_last_crawled ON sites(last_crawled)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_sites_created_at ON sites(created_at)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_queue_site_id ON crawl_queue(site_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_queue_status ON crawl_queue(status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_queue_created_at ON crawl_queue(created_at)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_feeds_site_id ON sitemaps_feeds(site_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_feeds_type ON sitemaps_feeds(type)')
     
     conn.commit()
     conn.close()
@@ -149,7 +194,16 @@ def init_db():
 
 def normalize_domain(url):
     """Normalize domain: strip www., lowercase, strip trailing slash"""
+    if not url:
+        return ""
+    
     parsed = urlparse(url)
+    
+    # Handle URLs without scheme
+    if not parsed.scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+    
     netloc = parsed.netloc.lower()
     
     # Remove www. prefix
@@ -166,6 +220,38 @@ def normalize_domain(url):
     return normalized
 
 
+def normalize_url(url):
+    """Normalize URL for comparison"""
+    if not url:
+        return ""
+    
+    parsed = urlparse(url)
+    
+    # Handle URLs without scheme
+    if not parsed.scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+    
+    # Normalize scheme and netloc
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    
+    # Remove www. prefix
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    
+    # Normalize path
+    path = parsed.path
+    if path and path != '/':
+        # Remove trailing slash
+        path = path.rstrip('/')
+    
+    # Reconstruct URL
+    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ''))
+    
+    return normalized
+
+
 def generate_doc_id(url):
     """Generate MD5 hash for document ID"""
     return hashlib.md5(url.encode('utf-8')).hexdigest()
@@ -174,6 +260,9 @@ def generate_doc_id(url):
 def respect_rate_limit():
     """Enforce minimum delay between requests"""
     global last_request_time
+    if shutdown_flag:
+        return
+    
     with rate_limit_lock:
         elapsed = time.time() - last_request_time
         if elapsed < MIN_DELAY:
@@ -184,20 +273,16 @@ def respect_rate_limit():
 def get_robots_parser(base_url):
     """Get and parse robots.txt for a domain"""
     parsed = urlparse(base_url)
-    domain = f"{parsed.scheme}://{parsed.netloc}"
-    with robots_cache_lock:
-        if domain in robots_cache:
-            return robots_cache[domain]
-    robots_url = f"{domain}/robots.txt"
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     rfp = RobotFileParser()
     rfp.set_url(robots_url)
+    
     try:
         respect_rate_limit()
         rfp.read()
-    except Exception:
-        pass
-    with robots_cache_lock:
-        robots_cache[domain] = rfp
+    except Exception as e:
+        print(f"⚠️  Nelze načíst robots.txt pro {base_url}: {e}")
+    
     return rfp
 
 
@@ -205,7 +290,9 @@ def extract_date(soup, feed_date=None):
     """Extract published date from page or feed"""
     if feed_date:
         try:
-            return int(time.mktime(feed_date))
+            if isinstance(feed_date, tuple):
+                return int(time.mktime(feed_date))
+            return int(time.mktime(feed_date.timetuple()))
         except Exception:
             pass
     
@@ -259,6 +346,27 @@ def extract_audio(soup, html, url):
     return ""
 
 
+def extract_image(soup, url):
+    """Extract image URL from page"""
+    # Check OpenGraph image
+    og_image = soup.find("meta", property="og:image")
+    if og_image and og_image.get("content"):
+        return urljoin(url, og_image["content"])
+    
+    # Check Twitter card image
+    twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
+    if twitter_image and twitter_image.get("content"):
+        return urljoin(url, twitter_image["content"])
+    
+    # Fall back to first non-logo image
+    for img in soup.find_all("img", src=True):
+        img_src = img["src"].lower()
+        if not any(x in img_src for x in ["logo", "icon", "svg", "1x1", "avatar", "banner", "pixel"]):
+            return urljoin(url, img["src"])
+    
+    return ""
+
+
 def extract_metadata(soup, html, url):
     """Extract Schema.org metadata using extruct"""
     meta_info = {
@@ -272,6 +380,8 @@ def extract_metadata(soup, html, url):
         prop = meta.get("property", "") or meta.get("name", "")
         if prop.startswith("og:"):
             meta_info["og"][prop[3:]] = meta.get("content", "").strip()
+        elif prop.startswith("twitter:"):
+            meta_info["og"][prop[8:]] = meta.get("content", "").strip()
     
     # Extract Schema.org using extruct
     try:
@@ -328,9 +438,17 @@ def extract_metadata(soup, html, url):
                             meta_info["schema_details"]["author"] = ", ".join(str(a) for a in author)
                     else:
                         meta_info["schema_details"]["author"] = str(author)
+                
+                # Extract title from Schema.org
+                if "headline" in item and not meta_info["og"].get("title"):
+                    meta_info["og"]["title"] = item.get("headline", "")
+                
+                # Extract description
+                if "description" in item and not meta_info["og"].get("description"):
+                    meta_info["og"]["description"] = item.get("description", "")
     
     except Exception as e:
-        print(f"Error extracting Schema.org: {e}")
+        print(f"⚠️  Chyba při extrakci Schema.org: {e}")
     
     return meta_info
 
@@ -338,6 +456,9 @@ def extract_metadata(soup, html, url):
 def add_site(site_url, max_pages=500):
     """Add a new site with domain deduplication"""
     site_url = normalize_domain(site_url)
+    if not site_url:
+        return None
+    
     parsed = urlparse(site_url)
     canonical_domain = parsed.netloc
     
@@ -345,19 +466,23 @@ def add_site(site_url, max_pages=500):
     cursor = conn.cursor()
     
     # Check if domain already exists
-    cursor.execute("SELECT id, canonical_url, aliases FROM sites WHERE canonical_url LIKE ? OR aliases LIKE ?",
-                   (f"%{canonical_domain}%", f"%{canonical_domain}%"))
+    cursor.execute(
+        "SELECT id, canonical_url, aliases FROM sites WHERE canonical_url = ? OR aliases LIKE ?",
+        (canonical_domain, f"%{canonical_domain}%")
+    )
     existing = cursor.fetchone()
     
     if existing:
-        site_id, canonical_url, aliases_str = existing
+        site_id, existing_canonical, aliases_str = existing
         aliases = json.loads(aliases_str) if aliases_str else []
         
         # Add new URL as alias if not already present
-        if site_url not in aliases and site_url != canonical_url:
+        if site_url not in aliases and site_url != existing_canonical:
             aliases.append(site_url)
-            cursor.execute("UPDATE sites SET aliases = ? WHERE id = ?", 
-                          (json.dumps(aliases), site_id))
+            cursor.execute(
+                "UPDATE sites SET aliases = ? WHERE id = ?",
+                (json.dumps(aliases), site_id)
+            )
             conn.commit()
         
         conn.close()
@@ -385,16 +510,8 @@ def discover_sitemaps_and_feeds(site_url, site_id):
     # Try to get sitemap URLs from robots.txt
     sitemap_urls = []
     try:
-        robots_url = f"{urlparse(site_url).scheme}://{urlparse(site_url).netloc}/robots.txt"
-        resp = requests.get(robots_url, headers=HEADERS, timeout=10)
-        if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if line.lower().startswith("sitemap:"):
-                    sitemap_url = line.split(":", 1)[1].strip()
-                    if sitemap_url:
-                        sitemap_urls.append(sitemap_url)
-    except Exception:
+        sitemap_urls = rfp.sitemaps()
+    except:
         pass
     
     # Common sitemap and feed URLs to check
@@ -409,7 +526,9 @@ def discover_sitemaps_and_feeds(site_url, site_id):
         "/feed.xml",
         "/rss.xml",
         "/feed/rss",
-        "/feed/atom"
+        "/feed/atom",
+        "/rss2.0.xml",
+        "/rdf.xml"
     ]
     
     discovered_urls = []
@@ -424,9 +543,9 @@ def discover_sitemaps_and_feeds(site_url, site_id):
             respect_rate_limit()
             response = requests.head(full_url, headers=HEADERS, timeout=10, allow_redirects=True)
             if response.status_code == 200:
-                discovered_urls.append(full_url)
-        except:
-            pass
+                discovered_urls.append((full_url, 'from_robots'))
+        except Exception as e:
+            print(f"⚠️  Chyba při kontrole {full_url}: {e}")
     
     # Check common URLs
     for path in common_urls:
@@ -435,15 +554,18 @@ def discover_sitemaps_and_feeds(site_url, site_id):
             respect_rate_limit()
             response = requests.head(full_url, headers=HEADERS, timeout=10, allow_redirects=True)
             if response.status_code == 200:
-                discovered_urls.append(full_url)
-        except:
-            pass
+                discovered_urls.append((full_url, 'common'))
+        except Exception as e:
+            print(f"⚠️  Chyba při kontrole {full_url}: {e}")
     
     # Process discovered URLs to identify type and extract links
     conn = get_db()
     cursor = conn.cursor()
     
-    for url in discovered_urls:
+    for url, source in discovered_urls:
+        if shutdown_flag:
+            break
+            
         try:
             respect_rate_limit()
             response = requests.get(url, headers=HEADERS, timeout=15)
@@ -473,7 +595,7 @@ def discover_sitemaps_and_feeds(site_url, site_id):
             
             # Save to sitemaps_feeds table
             cursor.execute(
-                "INSERT INTO sitemaps_feeds (site_id, url, type, last_checked) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO sitemaps_feeds (site_id, url, type, last_checked) VALUES (?, ?, ?, ?)",
                 (site_id, url, feed_type, int(time.time()))
             )
             
@@ -484,32 +606,25 @@ def discover_sitemaps_and_feeds(site_url, site_id):
                     for entry in feed_data.entries:
                         if hasattr(entry, 'link'):
                             discovered_feeds.append({
-                                'url': normalize_domain(entry.link),
-                                'date': entry.get('published_parsed', None),
-                                'priority': 1.0,
-                                'lastmod': ''
+                                'url': normalize_url(entry.link),
+                                'date': entry.get('published_parsed', None)
                             })
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️  Chyba při zpracování feedu {url}: {e}")
             else:  # sitemap
                 try:
                     soup = BeautifulSoup(response.text, 'xml')
-                    for url_tag in soup.find_all('url'):
-                        loc = url_tag.find('loc')
-                        priority_tag = url_tag.find('priority')
-                        lastmod_tag = url_tag.find('lastmod')
-                        if loc and loc.text:
-                            discovered_feeds.append({
-                                'url': normalize_domain(loc.text.strip()),
-                                'date': None,
-                                'priority': float(priority_tag.text.strip()) if priority_tag else 0.5,
-                                'lastmod': lastmod_tag.text.strip() if lastmod_tag else ''
-                            })
-                except:
-                    pass
+                    urls = [url.text for url in soup.find_all('loc') if url.text]
+                    for sitemap_url in urls:
+                        discovered_feeds.append({
+                            'url': normalize_url(sitemap_url),
+                            'date': None
+                        })
+                except Exception as e:
+                    print(f"⚠️  Chyba při zpracování sitemapy {url}: {e}")
                     
         except Exception as e:
-            print(f"Error processing {url}: {e}")
+            print(f"⚠️  Chyba při zpracování {url}: {e}")
             continue
     
     conn.commit()
@@ -527,12 +642,16 @@ def crawl_homepage_for_links(site_url, site_id, max_pages):
         if response.status_code != 200:
             return []
         
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'text/html' not in content_type:
+            return []
+        
         soup = BeautifulSoup(response.text, 'html.parser')
         discovered_urls = []
         
         for a in soup.find_all('a', href=True):
             link = urljoin(site_url, a['href'])
-            normalized = normalize_domain(link)
+            normalized = normalize_url(link)
             parsed_link = urlparse(link)
             parsed_site = urlparse(site_url)
             
@@ -544,17 +663,25 @@ def crawl_homepage_for_links(site_url, site_id, max_pages):
         return discovered_urls[:max_pages]
         
     except Exception as e:
-        print(f"Error crawling homepage {site_url}: {e}")
+        print(f"⚠️  Chyba při crawlování domovské stránky {site_url}: {e}")
         return []
 
 
 def phase_1_discovery(site_url, max_pages=500):
     """Phase 1: Discovery - Build full URL queue"""
     site_url = normalize_domain(site_url)
+    if not site_url:
+        return None, 0
+    
     site_id = add_site(site_url, max_pages)
+    if not site_id:
+        return None, 0
     
     conn = get_db()
     cursor = conn.cursor()
+    
+    # Clear existing queue for this site (for re-crawl)
+    cursor.execute("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,))
     
     # Get existing URLs for this site
     cursor.execute("SELECT url FROM crawl_queue WHERE site_id = ?", (site_id,))
@@ -567,25 +694,33 @@ def phase_1_discovery(site_url, max_pages=500):
     urls_to_add = []
     for item in discovered_items:
         url = item['url']
-        if url not in existing_urls:
-            urls_to_add.append((url, item.get('priority', 0.5)))
+        if url and url not in existing_urls:
+            urls_to_add.append(url)
             existing_urls.add(url)
     
     # If no URLs found from sitemaps/feeds, crawl homepage
     if not urls_to_add:
-        homepage_urls = crawl_homepage_for_links(site_url, site_id, max_pages)
-        urls_to_add = [(u, 0.5) for u in homepage_urls]
+        urls_to_add = crawl_homepage_for_links(site_url, site_id, max_pages)
     
-    # Add URLs to crawl queue with priority
-    for url, priority in urls_to_add:
+    # Add URLs to crawl queue
+    for url in urls_to_add:
+        if not url:
+            continue
         try:
             cursor.execute(
-                "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', ?)",
-                (site_id, url, priority)
+                "INSERT OR IGNORE INTO crawl_queue (site_id, url, status) VALUES (?, ?, 'pending')",
+                (site_id, url)
             )
         except sqlite3.IntegrityError:
-            pass  # URL already exists
+            pass
     
+    conn.commit()
+    conn.close()
+    
+    # Update site last_crawled time
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE sites SET last_crawled = ? WHERE id = ?", (int(time.time()), site_id))
     conn.commit()
     conn.close()
     
@@ -594,8 +729,14 @@ def phase_1_discovery(site_url, max_pages=500):
 
 def process_url(url, site_id, max_pages):
     """Process a single URL: extract content, generate embeddings, store in ChromaDB"""
+    if shutdown_flag:
+        return None, "Shutdown in progress"
+    
     try:
-        respect_rate_limit()
+        # Check if URL is valid
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None, "Invalid URL"
         
         # Check robots.txt
         rfp = get_robots_parser(url)
@@ -606,7 +747,9 @@ def process_url(url, site_id, max_pages):
             else:
                 return None, "Blocked by robots.txt"
         
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        respect_rate_limit()
+        
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         
         # Handle rate limiting (HTTP 429)
         if response.status_code == 429:
@@ -616,7 +759,13 @@ def process_url(url, site_id, max_pages):
         
         # Handle forbidden (HTTP 403)
         if response.status_code == 403:
-            return None, "HTTP 403 Forbidden"
+            # Mark entire domain as blocked
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE sites SET status = 'blocked' WHERE id = ?", (site_id,))
+            conn.commit()
+            conn.close()
+            return None, "HTTP 403 Forbidden - Domain blocked"
         
         if response.status_code != 200:
             return None, f"HTTP {response.status_code}"
@@ -633,9 +782,10 @@ def process_url(url, site_id, max_pages):
         meta_info = extract_metadata(soup, html, url)
         pub_timestamp = extract_date(soup)
         audio_url = extract_audio(soup, html, url)
+        image_url = extract_image(soup, url)
         
         # Clean HTML
-        for el in soup(['script', 'style', 'nav', 'footer', 'iframe', 'noscript']):
+        for el in soup(['script', 'style', 'nav', 'footer', 'iframe', 'noscript', 'head']):
             el.decompose()
         
         # Extract title
@@ -645,37 +795,12 @@ def process_url(url, site_id, max_pages):
         
         # Extract body text
         body_parts = []
-        for tag in ['p', 'h1', 'h2', 'h3', 'article']:
+        for tag in ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'article', 'section', 'main']:
             for el in soup.find_all(tag):
                 text = el.get_text().strip()
-                if text:
+                if text and len(text) > 10:
                     body_parts.append(text)
         body_text = ' '.join(body_parts)[:3500]
-        
-        # Part 3: Compute content hash and check if unchanged
-        new_hash = hashlib.md5(body_text.encode('utf-8')).hexdigest()
-        
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT content_hash FROM crawl_queue WHERE url = ?", (url,))
-        row = cursor.fetchone()
-        
-        if row and row[0] == new_hash:
-            # Content unchanged — update last_checked only, skip re-embedding
-            cursor.execute("UPDATE crawl_queue SET status='done', last_checked=? WHERE url=?", 
-                          (int(time.time()), url))
-            conn.commit()
-            conn.close()
-            return {"skipped": True, "url": url}, None
-        
-        # Extract image
-        image_url = meta_info["og"].get("image", "")
-        if not image_url:
-            for img in soup.find_all("img", src=True):
-                img_src = img["src"].lower()
-                if not any(x in img_src for x in ["logo", "icon", "svg", "1x1", "avatar", "banner"]):
-                    image_url = urljoin(url, img["src"])
-                    break
         
         # Determine schema type
         schema_type = meta_info.get("schema_type_override") or (meta_info["schema_types"][0] if meta_info["schema_types"] else "WebPage")
@@ -684,32 +809,6 @@ def process_url(url, site_id, max_pages):
         
         # Generate document ID
         doc_id = generate_doc_id(url)
-        
-        # Part 6: Check active index limit and evict if needed
-        cursor.execute("SELECT max_pages FROM sites WHERE id=?", (site_id,))
-        max_row = cursor.fetchone()
-        max_pages_limit = max_row[0] if max_row else 500
-        
-        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id=? AND status='done'", (site_id,))
-        active_count = cursor.fetchone()[0]
-        
-        if active_count >= max_pages_limit:
-            # Archive the lowest scoring page
-            cursor.execute("""
-                SELECT id FROM crawl_queue
-                WHERE site_id=? AND status='done'
-                ORDER BY priority ASC, last_checked ASC
-                LIMIT 1
-            """, (site_id,))
-            evict_row = cursor.fetchone()
-            if evict_row:
-                cursor.execute(
-                    "UPDATE crawl_queue SET status='archived', archived_at=? WHERE id=?",
-                    (int(time.time()), evict_row[0])
-                )
-        
-        conn.commit()
-        conn.close()
         
         # Prepare document for ChromaDB
         if CHROMA_AVAILABLE and body_text.strip():
@@ -722,7 +821,7 @@ def process_url(url, site_id, max_pages):
                 "title": title,
                 "image": image_url,
                 "audio_url": audio_url,
-                "has_audio": bool(audio_url),
+                "has_audio": str(bool(audio_url)).lower(),
                 "schema_type": schema_type,
                 "schema_details": json.dumps(meta_info["schema_details"]),
                 "published_timestamp": pub_timestamp,
@@ -736,16 +835,9 @@ def process_url(url, site_id, max_pages):
                     documents=[text_to_embed],
                     metadatas=[metadata]
                 )
+                chroma_client.persist()
             except Exception as e:
-                print(f"Error storing in ChromaDB: {e}")
-        
-        # Save new hash and last_checked
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE crawl_queue SET content_hash=?, last_checked=? WHERE url=?",
-                      (new_hash, int(time.time()), url))
-        conn.commit()
-        conn.close()
+                print(f"⚠️  Chyba při ukládání do ChromaDB: {e}")
         
         return {
             "id": doc_id,
@@ -762,28 +854,30 @@ def process_url(url, site_id, max_pages):
             "site_id": site_id
         }, None
         
+    except requests.exceptions.Timeout:
+        return None, "Request timeout"
+    except requests.exceptions.ConnectionError:
+        return None, "Connection error"
+    except requests.exceptions.RequestException as e:
+        return None, f"Request error: {str(e)}"
     except Exception as e:
-        return None, str(e)
+        return None, f"Error: {str(e)}"
 
 
 def worker_a():
     """Worker A: Process pending URLs from crawl queue"""
-    while True:
+    worker_name = "worker_a"
+    print(f"✅ Worker {worker_name} spuštěn")
+    
+    while not shutdown_flag:
         try:
             conn = get_db()
             cursor = conn.cursor()
             
             # Lock a batch of pending URLs
-            worker_name = threading.current_thread().name
             cursor.execute(
-                "UPDATE crawl_queue SET status='locked', locked_by=? WHERE id IN "
-                "(SELECT id FROM crawl_queue WHERE status='pending' AND retry_count < 3 LIMIT 5)",
-                (worker_name,)
-            )
-            conn.commit()
-            cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status='locked' AND locked_by=?",
-                (worker_name,)
+                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5 FOR UPDATE SKIP LOCKED",
+                (MAX_RETRIES,)
             )
             batch = cursor.fetchall()
             
@@ -792,82 +886,14 @@ def worker_a():
                 time.sleep(5)
                 continue
             
-            # Get site info
-            site_info = {}
-            unique_site_ids = set(row[1] for row in batch)
-            for sid in unique_site_ids:
-                cursor.execute("SELECT max_pages FROM sites WHERE id = ?", (sid,))
-                result = cursor.fetchone()
-                if result:
-                    site_info[sid] = result[0]
-            
-            # Process each URL
+            # Mark as locked
             for row_id, site_id, url in batch:
-                max_pages = site_info.get(site_id, 500)
-                result, error = process_url(url, site_id, max_pages)
-                
-                if result:
-                    cursor.execute(
-                        "UPDATE crawl_queue SET status = 'done' WHERE id = ?",
-                        (row_id,)
-                    )
-                else:
-                    retry_count = 0
-                    cursor.execute("SELECT retry_count FROM crawl_queue WHERE id = ?", (row_id,))
-                    retry_row = cursor.fetchone()
-                    if retry_row:
-                        retry_count = retry_row[0]
-                    
-                    if retry_count >= 2:
-                        cursor.execute(
-                            "UPDATE crawl_queue SET status = 'error', error_reason = ? WHERE id = ?",
-                            (error, row_id)
-                        )
-                        # Mark domain as error if too many errors
-                        cursor.execute(
-                            "UPDATE sites SET error_count = error_count + 1 WHERE id = ?",
-                            (site_id,)
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE crawl_queue SET status = 'pending', retry_count = retry_count + 1, error_reason = ? WHERE id = ?",
-                            (error, row_id)
-                        )
-                
-                conn.commit()
+                cursor.execute(
+                    "UPDATE crawl_queue SET status = 'locked', locked_by = ? WHERE id = ?",
+                    (worker_name, row_id)
+                )
             
-            conn.close()
-            
-        except Exception as e:
-            print(f"Worker A error: {e}")
-            time.sleep(10)
-
-
-def worker_b():
-    """Worker B: Process pending URLs from crawl queue"""
-    while True:
-        try:
-            conn = get_db()
-            cursor = conn.cursor()
-            
-            # Lock a batch of pending URLs
-            worker_name = threading.current_thread().name
-            cursor.execute(
-                "UPDATE crawl_queue SET status='locked', locked_by=? WHERE id IN "
-                "(SELECT id FROM crawl_queue WHERE status='pending' AND retry_count < 3 LIMIT 5)",
-                (worker_name,)
-            )
             conn.commit()
-            cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status='locked' AND locked_by=?",
-                (worker_name,)
-            )
-            batch = cursor.fetchall()
-            
-            if not batch:
-                conn.close()
-                time.sleep(5)
-                continue
             
             # Get site info
             site_info = {}
@@ -879,6 +905,9 @@ def worker_b():
             
             # Process each URL
             for row_id, site_id, url in batch:
+                if shutdown_flag:
+                    break
+                    
                 max_pages = site_info.get(site_id, 500)
                 result, error = process_url(url, site_id, max_pages)
                 
@@ -888,13 +917,12 @@ def worker_b():
                         (row_id,)
                     )
                 else:
-                    retry_count = 0
+                    # Get current retry count
                     cursor.execute("SELECT retry_count FROM crawl_queue WHERE id = ?", (row_id,))
                     retry_row = cursor.fetchone()
-                    if retry_row:
-                        retry_count = retry_row[0]
+                    retry_count = retry_row[0] if retry_row else 0
                     
-                    if retry_count >= 2:
+                    if retry_count >= MAX_RETRIES - 1:
                         cursor.execute(
                             "UPDATE crawl_queue SET status = 'error', error_reason = ? WHERE id = ?",
                             (error, row_id)
@@ -914,13 +942,108 @@ def worker_b():
             
             conn.close()
             
+        except sqlite3.OperationalError as e:
+            print(f"⚠️  Worker {worker_name} - SQLite chyba: {e}")
+            time.sleep(5)
         except Exception as e:
-            print(f"Worker B error: {e}")
+            print(f"⚠️  Worker {worker_name} chyba: {e}")
             time.sleep(10)
+    
+    print(f"✅ Worker {worker_name} ukončen")
+
+
+def worker_b():
+    """Worker B: Process pending URLs from crawl queue"""
+    worker_name = "worker_b"
+    print(f"✅ Worker {worker_name} spuštěn")
+    
+    while not shutdown_flag:
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            
+            # Lock a batch of pending URLs
+            cursor.execute(
+                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < ? LIMIT 5 FOR UPDATE SKIP LOCKED",
+                (MAX_RETRIES,)
+            )
+            batch = cursor.fetchall()
+            
+            if not batch:
+                conn.close()
+                time.sleep(5)
+                continue
+            
+            # Mark as locked
+            for row_id, site_id, url in batch:
+                cursor.execute(
+                    "UPDATE crawl_queue SET status = 'locked', locked_by = ? WHERE id = ?",
+                    (worker_name, row_id)
+                )
+            
+            conn.commit()
+            
+            # Get site info
+            site_info = {}
+            for row_id, site_id, url in batch:
+                cursor.execute("SELECT max_pages FROM sites WHERE id = ?", (site_id,))
+                result = cursor.fetchone()
+                if result:
+                    site_info[site_id] = result[0]
+            
+            # Process each URL
+            for row_id, site_id, url in batch:
+                if shutdown_flag:
+                    break
+                    
+                max_pages = site_info.get(site_id, 500)
+                result, error = process_url(url, site_id, max_pages)
+                
+                if result:
+                    cursor.execute(
+                        "UPDATE crawl_queue SET status = 'done' WHERE id = ?",
+                        (row_id,)
+                    )
+                else:
+                    # Get current retry count
+                    cursor.execute("SELECT retry_count FROM crawl_queue WHERE id = ?", (row_id,))
+                    retry_row = cursor.fetchone()
+                    retry_count = retry_row[0] if retry_row else 0
+                    
+                    if retry_count >= MAX_RETRIES - 1:
+                        cursor.execute(
+                            "UPDATE crawl_queue SET status = 'error', error_reason = ? WHERE id = ?",
+                            (error, row_id)
+                        )
+                        # Mark domain as error if too many errors
+                        cursor.execute(
+                            "UPDATE sites SET error_count = error_count + 1 WHERE id = ?",
+                            (site_id,)
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE crawl_queue SET status = 'pending', retry_count = retry_count + 1, error_reason = ? WHERE id = ?",
+                            (error, row_id)
+                        )
+                
+                conn.commit()
+            
+            conn.close()
+            
+        except sqlite3.OperationalError as e:
+            print(f"⚠️  Worker {worker_name} - SQLite chyba: {e}")
+            time.sleep(5)
+        except Exception as e:
+            print(f"⚠️  Worker {worker_name} chyba: {e}")
+            time.sleep(10)
+    
+    print(f"✅ Worker {worker_name} ukončen")
 
 
 def start_workers():
     """Start background worker threads"""
+    global worker_threads
+    
     # Create and start worker threads
     thread_a = threading.Thread(target=worker_a, name="worker_a", daemon=True)
     thread_b = threading.Thread(target=worker_b, name="worker_b", daemon=True)
@@ -928,8 +1051,9 @@ def start_workers():
     thread_a.start()
     thread_b.start()
     
-    print("✅ Workers started (worker_a, worker_b)")
-    return thread_a, thread_b
+    worker_threads = [thread_a, thread_b]
+    print("✅ Workers spuštěny (worker_a, worker_b)")
+    return worker_threads
 
 
 def crawl_site(site_url, max_pages=500):
@@ -937,20 +1061,17 @@ def crawl_site(site_url, max_pages=500):
     init_db()
     site_url = normalize_domain(site_url)
     
+    if not site_url:
+        print("⚠️  Neplatná URL")
+        return None
+    
     # Run Phase 1 discovery
     site_id, urls_added = phase_1_discovery(site_url, max_pages)
     
-    print(f"[Bot] Objeveno {urls_added} URL pro {site_url}")
-    
-    # Update site last_crawled time
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE sites SET last_crawled = ? WHERE id = ?",
-        (int(time.time()), site_id)
-    )
-    conn.commit()
-    conn.close()
+    if site_id:
+        print(f"[Bot] Objeveno {urls_added} URL pro {site_url}")
+    else:
+        print(f"[Bot] Nelze přidat {site_url}")
     
     return site_id
 
@@ -968,22 +1089,21 @@ def delete_site(site_id):
         conn.close()
         return False
     
-    canonical_url = site[0]
-    doc_prefix = generate_doc_id(canonical_url)[:8]  # Use prefix for ChromaDB query
-    
     # Delete from ChromaDB
     if CHROMA_AVAILABLE:
         try:
             # Get all documents for this site
             results = pages_collection.get(
                 where={"site_id": str(site_id)},
-                include=["metadatas", "documents", "ids"]
+                include=["ids"]
             )
             
             if results.get("ids"):
                 pages_collection.delete(ids=results["ids"])
+                chroma_client.persist()
+                print(f"✅ Smazáno {len(results['ids'])} dokumentů z ChromaDB")
         except Exception as e:
-            print(f"Error deleting from ChromaDB: {e}")
+            print(f"⚠️  Chyba při mazání z ChromaDB: {e}")
     
     # Delete from SQLite
     cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
@@ -993,6 +1113,7 @@ def delete_site(site_id):
     conn.commit()
     conn.close()
     
+    print(f"✅ Web s ID {site_id} a všechna jeho data smazána")
     return True
 
 
@@ -1011,6 +1132,9 @@ def recrawl_site(site_id):
     
     site_url, max_pages = site
     
+    # Reset site status
+    cursor.execute("UPDATE sites SET status = 'active', error_count = 0 WHERE id = ?", (site_id,))
+    
     # Delete existing queue and sitemaps/feeds
     cursor.execute("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,))
     cursor.execute("DELETE FROM sitemaps_feeds WHERE site_id = ?", (site_id,))
@@ -1024,8 +1148,10 @@ def recrawl_site(site_id):
             )
             if results.get("ids"):
                 pages_collection.delete(ids=results["ids"])
+                chroma_client.persist()
+                print(f"✅ Smazáno {len(results['ids'])} dokumentů z ChromaDB")
         except Exception as e:
-            print(f"Error deleting from ChromaDB: {e}")
+            print(f"⚠️  Chyba při mazání z ChromaDB: {e}")
     
     conn.commit()
     conn.close()
@@ -1033,12 +1159,86 @@ def recrawl_site(site_id):
     # Re-run Phase 1 discovery
     site_id_new, urls_added = phase_1_discovery(site_url, max_pages)
     
+    if site_id_new:
+        print(f"✅ Re-crawl zahájen: {urls_added} nových URL")
+    else:
+        print("⚠️  Re-crawl se nezdařil")
+    
     return True
 
 
+def get_site_info(site_id):
+    """Get information about a site"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM sites WHERE id = ?", (site_id,))
+    site = cursor.fetchone()
+    
+    conn.close()
+    
+    if site:
+        return dict(site)
+    return None
+
+
+def get_crawl_stats(site_id=None):
+    """Get crawl statistics"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if site_id:
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ?", (site_id,))
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'done'", (site_id,))
+        done = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'error'", (site_id,))
+        errors = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status IN ('pending', 'locked')", (site_id,))
+        pending = cursor.fetchone()[0]
+    else:
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'done'")
+        done = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'error'")
+        errors = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM crawl_queue WHERE status IN ('pending', 'locked')")
+        pending = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        'total': total,
+        'done': done,
+        'errors': errors,
+        'pending': pending
+    }
+
+
 if __name__ == "__main__":
+    # Initialize ChromaDB
+    init_chroma()
+    
+    # Initialize database
     init_db()
+    
+    # Start workers
     start_workers()
+    
+    print("=" * 70)
+    print("Mini Search - Crawler Engine v2.0")
+    print("=" * 70)
+    print("Pro spuštění crawlu: crawl_site(url, max_pages)")
+    print("Pro ukončení: Ctrl+C")
+    print("=" * 70)
     
     if len(sys.argv) > 1:
         crawl_site(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 500)
+    else:
+        # Keep running
+        try:
+            while not shutdown_flag:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            cleanup()
