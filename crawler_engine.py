@@ -820,10 +820,10 @@ def add_site(site_url, max_pages=500):
         conn.close()
         return site_id
     
-    # Insert new site
+    # Insert new site - store the domain (netloc) as canonical_url for consistency
     cursor.execute(
         "INSERT INTO sites (canonical_url, aliases, status, max_pages) VALUES (?, ?, 'active', ?)",
-        (site_url, json.dumps([]), max_pages)
+        (canonical_domain, json.dumps([site_url]), max_pages)
     )
     site_id = cursor.lastrowid
     conn.commit()
