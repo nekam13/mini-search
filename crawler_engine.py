@@ -815,8 +815,8 @@ def add_site(site_url, max_pages=500):
                 "UPDATE sites SET aliases = ? WHERE id = ?",
                 (json.dumps(aliases), site_id)
             )
-            conn.commit()
         
+        conn.commit()
         conn.close()
         return site_id
     
@@ -1473,10 +1473,13 @@ def recrawl_site(site_id):
     
     # Reset site status
     cursor.execute("UPDATE sites SET status = 'active', error_count = 0 WHERE id = ?", (site_id,))
+    conn.commit()
     
     # Delete existing queue and sitemaps/feeds
     cursor.execute("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,))
+    conn.commit()
     cursor.execute("DELETE FROM sitemaps_feeds WHERE site_id = ?", (site_id,))
+    conn.commit()
     
     # Delete existing vector DB documents for this site
     if vector_db:
@@ -1493,7 +1496,6 @@ def recrawl_site(site_id):
         except Exception as e:
             print(f"⚠️  Chyba při mazání z vector DB: {e}")
     
-    conn.commit()
     conn.close()
     
     # Re-run Phase 1 discovery
