@@ -25,29 +25,31 @@ MODEL_PATH = "models/paraphrase-multilingual-MiniLM-L12-v2"
 rate_limit_lock = threading.Lock()
 last_request_time = 0.0
 
+# Robots.txt cache
+robots_cache = {}
+robots_cache_lock = threading.Lock()
+
 # Initialize ChromaDB client
 try:
     import chromadb
-    from chromadb.config import Settings
     from sentence_transformers import SentenceTransformer
     
     # Load embedding model
     os.makedirs("models", exist_ok=True)
     embedding_model = SentenceTransformer(MODEL_PATH, cache_folder="models")
     
-    # Initialize ChromaDB
+    # Initialize ChromaDB with PersistentClient
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    chroma_client = chromadb.Client(
-        Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=CHROMA_DB_PATH
-        )
-    )
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    
+    class MiniSearchEmbedding(chromadb.EmbeddingFunction):
+        def __call__(self, input):
+            return embedding_model.encode(input).tolist()
     
     # Create or get pages collection
     pages_collection = chroma_client.get_or_create_collection(
         name="pages",
-        embedding_function=lambda texts: embedding_model.encode(texts).tolist()
+        embedding_function=MiniSearchEmbedding()
     )
     
     CHROMA_AVAILABLE = True
@@ -92,6 +94,7 @@ def init_db():
             locked_by TEXT DEFAULT '',
             error_reason TEXT DEFAULT '',
             retry_count INTEGER DEFAULT 0,
+            UNIQUE(site_id, url),
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''')
@@ -149,16 +152,20 @@ def respect_rate_limit():
 def get_robots_parser(base_url):
     """Get and parse robots.txt for a domain"""
     parsed = urlparse(base_url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    with robots_cache_lock:
+        if domain in robots_cache:
+            return robots_cache[domain]
+    robots_url = f"{domain}/robots.txt"
     rfp = RobotFileParser()
     rfp.set_url(robots_url)
-    
     try:
         respect_rate_limit()
         rfp.read()
     except Exception:
         pass
-    
+    with robots_cache_lock:
+        robots_cache[domain] = rfp
     return rfp
 
 
@@ -346,8 +353,16 @@ def discover_sitemaps_and_feeds(site_url, site_id):
     # Try to get sitemap URLs from robots.txt
     sitemap_urls = []
     try:
-        sitemap_urls = rfp.sitemaps()
-    except:
+        robots_url = f"{urlparse(site_url).scheme}://{urlparse(site_url).netloc}/robots.txt"
+        resp = requests.get(robots_url, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if line.lower().startswith("sitemap:"):
+                    sitemap_url = line.split(":", 1)[1].strip()
+                    if sitemap_url:
+                        sitemap_urls.append(sitemap_url)
+    except Exception:
         pass
     
     # Common sitemap and feed URLs to check
@@ -639,7 +654,6 @@ def process_url(url, site_id, max_pages):
                     documents=[text_to_embed],
                     metadatas=[metadata]
                 )
-                chroma_client.persist()
             except Exception as e:
                 print(f"Error storing in ChromaDB: {e}")
         
@@ -670,8 +684,16 @@ def worker_a():
             cursor = conn.cursor()
             
             # Lock a batch of pending URLs
+            worker_name = threading.current_thread().name
             cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < 3 LIMIT 5 FOR UPDATE SKIP LOCKED"
+                "UPDATE crawl_queue SET status='locked', locked_by=? WHERE id IN "
+                "(SELECT id FROM crawl_queue WHERE status='pending' AND retry_count < 3 LIMIT 5)",
+                (worker_name,)
+            )
+            conn.commit()
+            cursor.execute(
+                "SELECT id, site_id, url FROM crawl_queue WHERE status='locked' AND locked_by=?",
+                (worker_name,)
             )
             batch = cursor.fetchall()
             
@@ -680,22 +702,14 @@ def worker_a():
                 time.sleep(5)
                 continue
             
-            # Mark as locked
-            worker_name = threading.current_thread().name
-            for row_id, site_id, url in batch:
-                cursor.execute(
-                    "UPDATE crawl_queue SET status = 'locked', locked_by = ? WHERE id = ?",
-                    (worker_name, row_id)
-                )
-            
-            conn.commit()
-            
             # Get site info
             site_info = {}
-            cursor.execute("SELECT max_pages FROM sites WHERE id = ?", (site_id,))
-            result = cursor.fetchone()
-            if result:
-                site_info[site_id] = result[0]
+            unique_site_ids = set(row[1] for row in batch)
+            for sid in unique_site_ids:
+                cursor.execute("SELECT max_pages FROM sites WHERE id = ?", (sid,))
+                result = cursor.fetchone()
+                if result:
+                    site_info[sid] = result[0]
             
             # Process each URL
             for row_id, site_id, url in batch:
@@ -747,8 +761,16 @@ def worker_b():
             cursor = conn.cursor()
             
             # Lock a batch of pending URLs
+            worker_name = threading.current_thread().name
             cursor.execute(
-                "SELECT id, site_id, url FROM crawl_queue WHERE status = 'pending' AND retry_count < 3 LIMIT 5 FOR UPDATE SKIP LOCKED"
+                "UPDATE crawl_queue SET status='locked', locked_by=? WHERE id IN "
+                "(SELECT id FROM crawl_queue WHERE status='pending' AND retry_count < 3 LIMIT 5)",
+                (worker_name,)
+            )
+            conn.commit()
+            cursor.execute(
+                "SELECT id, site_id, url FROM crawl_queue WHERE status='locked' AND locked_by=?",
+                (worker_name,)
             )
             batch = cursor.fetchall()
             
@@ -756,16 +778,6 @@ def worker_b():
                 conn.close()
                 time.sleep(5)
                 continue
-            
-            # Mark as locked
-            worker_name = threading.current_thread().name
-            for row_id, site_id, url in batch:
-                cursor.execute(
-                    "UPDATE crawl_queue SET status = 'locked', locked_by = ? WHERE id = ?",
-                    (worker_name, row_id)
-                )
-            
-            conn.commit()
             
             # Get site info
             site_info = {}
@@ -880,7 +892,6 @@ def delete_site(site_id):
             
             if results.get("ids"):
                 pages_collection.delete(ids=results["ids"])
-                chroma_client.persist()
         except Exception as e:
             print(f"Error deleting from ChromaDB: {e}")
     
@@ -923,7 +934,6 @@ def recrawl_site(site_id):
             )
             if results.get("ids"):
                 pages_collection.delete(ids=results["ids"])
-                chroma_client.persist()
         except Exception as e:
             print(f"Error deleting from ChromaDB: {e}")
     
