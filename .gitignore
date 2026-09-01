@@ -1,0 +1,5 @@
+meilisearch
+data.ms/
+console.db
+__pycache__/
+.DS_Store
