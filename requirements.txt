@@ -1,5 +1,10 @@
-# Mini Search v5.0 - Minimalni zavislosti
-flask==3.0.3
-beautifulsoup4==4.12.2
-lxml==5.2.2
-feedparser==6.0.10
+flask
+apscheduler>=3.10
+requests
+beautifulsoup4
+lxml
+feedparser
+extruct
+numpy
+hnswlib
+sentence-transformers
