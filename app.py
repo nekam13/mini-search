@@ -1,6 +1,7 @@
 import sqlite3
 import time
 import json
+import requests
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -17,17 +18,171 @@ crawler_engine.init_db()
 worker_threads = crawler_engine.start_workers()
 
 
-def auto_recrawl():
-    """Auto-recrawl all sites every 12 hours"""
+def job_check_feeds():
+    """Every hour: check RSS/Atom feeds for new entries"""
     conn = crawler_engine.get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, canonical_url, max_pages FROM sites WHERE status = 'active'")
-    sites = cursor.fetchall()
+    cursor.execute("SELECT id, site_id, url, type FROM sitemaps_feeds WHERE type IN ('rss', 'atom')")
+    feeds = cursor.fetchall()
     conn.close()
-    
-    for site_id, site_url, max_pages in sites:
-        print(f"[Auto-recrawl] Re-crawling: {site_url}")
-        crawler_engine.recrawl_site(site_id)
+    for feed_id, site_id, feed_url, feed_type in feeds:
+        try:
+            import feedparser
+            data = feedparser.parse(feed_url)
+            conn = crawler_engine.get_db()
+            cursor = conn.cursor()
+            for entry in data.entries:
+                if not hasattr(entry, 'link'):
+                    continue
+                url = crawler_engine.normalize_domain(entry.link)
+                pub = entry.get('published_parsed', None)
+                pub_ts = int(time.mktime(pub)) if pub else int(time.time())
+                # Only add if newer than last_checked of this feed
+                cursor.execute("SELECT last_checked FROM sitemaps_feeds WHERE id=?", (feed_id,))
+                row = cursor.fetchone()
+                last_checked = row[0] if row else 0
+                if pub_ts > last_checked:
+                    try:
+                        cursor.execute(
+                            "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', 1.0)",
+                            (site_id, url)
+                        )
+                    except sqlite3.IntegrityError:
+                        pass  # Already in queue
+            cursor.execute("UPDATE sitemaps_feeds SET last_checked=? WHERE id=?", (int(time.time()), feed_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Feed check error {feed_url}: {e}")
+
+
+def job_check_sitemaps():
+    """Every day: compare sitemaps with index, queue changed/new URLs"""
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, site_id, url FROM sitemaps_feeds WHERE type = 'sitemap'")
+    sitemaps = cursor.fetchall()
+    conn.close()
+    for sm_id, site_id, sm_url in sitemaps:
+        try:
+            resp = requests.get(sm_url, headers=crawler_engine.HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, 'xml')
+            conn = crawler_engine.get_db()
+            cursor = conn.cursor()
+            sitemap_urls = set()
+            for url_tag in soup.find_all('url'):
+                loc = url_tag.find('loc')
+                lastmod_tag = url_tag.find('lastmod')
+                priority_tag = url_tag.find('priority')
+                if not loc or not loc.text:
+                    continue
+                url = crawler_engine.normalize_domain(loc.text.strip())
+                lastmod = lastmod_tag.text.strip() if lastmod_tag else ''
+                priority = float(priority_tag.text.strip()) if priority_tag else 0.5
+                sitemap_urls.add(url)
+                # Check if URL exists and if lastmod changed
+                cursor.execute("SELECT id, lastmod FROM crawl_queue WHERE url=? AND site_id=?", (url, site_id))
+                existing = cursor.fetchone()
+                if not existing:
+                    # New URL
+                    try:
+                        cursor.execute(
+                            "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', ?)",
+                            (site_id, url, priority)
+                        )
+                    except sqlite3.IntegrityError:
+                        pass
+                elif lastmod and existing[1] != lastmod:
+                    # lastmod changed — re-queue
+                    cursor.execute(
+                        "UPDATE crawl_queue SET status='pending', priority=? WHERE id=?",
+                        (priority, existing[0])
+                    )
+            # Mark URLs no longer in sitemap as stale -> archived
+            cursor.execute(
+                "SELECT id, url FROM crawl_queue WHERE site_id=? AND status NOT IN ('archived')",
+                (site_id,)
+            )
+            all_indexed = cursor.fetchall()
+            for row_id, row_url in all_indexed:
+                if row_url not in sitemap_urls:
+                    cursor.execute(
+                        "UPDATE crawl_queue SET status='archived', archived_at=? WHERE id=?",
+                        (int(time.time()), row_id)
+                    )
+            cursor.execute("UPDATE sitemaps_feeds SET last_checked=? WHERE id=?", (int(time.time()), sm_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Sitemap check error {sm_url}: {e}")
+
+
+def job_recrawl_by_priority():
+    """Every 2 days: re-queue active URLs with priority >= 0.8"""
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    two_days_ago = int(time.time()) - (2 * 24 * 3600)
+    cursor.execute(
+        "UPDATE crawl_queue SET status='pending' WHERE priority >= 0.8 AND status='done' AND last_checked < ?",
+        (two_days_ago,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def job_recrawl_low_priority():
+    """Every 30 days: re-queue active URLs with priority <= 0.1"""
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    thirty_days_ago = int(time.time()) - (30 * 24 * 3600)
+    cursor.execute(
+        "UPDATE crawl_queue SET status='pending' WHERE priority <= 0.1 AND status='done' AND last_checked < ?",
+        (thirty_days_ago,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def job_cleanup_archived():
+    """Every week: delete archived pages older than 30 days with zero hits"""
+    thirty_days_ago = int(time.time()) - (30 * 24 * 3600)
+    conn = crawler_engine.get_db()
+    cursor = conn.cursor()
+    # Get IDs to delete
+    cursor.execute(
+        "SELECT id FROM crawl_queue WHERE status='archived' AND archived_at < ? AND hit_count = 0",
+        (thirty_days_ago,)
+    )
+    rows = cursor.fetchall()
+    ids_to_delete = [r[0] for r in rows]
+    if ids_to_delete and crawler_engine.CHROMA_AVAILABLE:
+        try:
+            # Delete from ChromaDB
+            urls_cursor = conn.cursor()
+            placeholders = ','.join('?' * len(ids_to_delete))
+            urls_cursor.execute(
+                f"SELECT url FROM crawl_queue WHERE id IN ({placeholders})",
+                ids_to_delete
+            )
+            urls = [r[0] for r in urls_cursor.fetchall()]
+            doc_ids = [crawler_engine.generate_doc_id(u) for u in urls]
+            if doc_ids:
+                crawler_engine.pages_collection.delete(ids=doc_ids)
+        except Exception as e:
+            print(f"Cleanup ChromaDB error: {e}")
+    # Delete from SQLite
+    if ids_to_delete:
+        placeholders = ','.join('?' * len(ids_to_delete))
+        cursor.execute(
+            f"DELETE FROM crawl_queue WHERE id IN ({placeholders})",
+            ids_to_delete
+        )
+    conn.commit()
+    conn.close()
+    print(f"[Cleanup] Smazáno {len(ids_to_delete)} archivovaných stránek")
 
 
 def get_site_stats(site_id):
@@ -624,9 +779,13 @@ def check_active_crawls():
     return jsonify({'active': has_active_crawls()})
 
 
-# Initialize scheduler
+# Initialize scheduler with 5 jobs
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=auto_recrawl, trigger="interval", hours=12)
+scheduler.add_job(func=job_check_feeds, trigger="interval", hours=1, id="check_feeds")
+scheduler.add_job(func=job_check_sitemaps, trigger="interval", hours=24, id="check_sitemaps")
+scheduler.add_job(func=job_recrawl_by_priority, trigger="interval", hours=48, id="recrawl_high")
+scheduler.add_job(func=job_recrawl_low_priority, trigger="interval", days=30, id="recrawl_low")
+scheduler.add_job(func=job_cleanup_archived, trigger="interval", days=7, id="cleanup")
 scheduler.start()
 
 
