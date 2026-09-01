@@ -1,23 +1,5 @@
-# Mini Search v4.0 - Základní závislosti
-# Pro Ubuntu 26.04 ARM64 + Termux
-
-# Web framework
-Flask==3.0.3
-
-# Scheduling
-APScheduler==3.10.4
-
-# HTML parsing
+# Mini Search v5.0 - Minimalni zavislosti
+flask==3.0.3
 beautifulsoup4==4.12.2
 lxml==5.2.2
-
-# Feed parsing
 feedparser==6.0.10
-
-# Schema.org extraction
-# extruct==0.15.0 (komentovano - problem s lxml)
-
-# Vector search (optional - installed separately in install.sh)
-# chromadb>=0.5.0
-# torch (installed from ARM64 wheel)
-# sentence-transformers==2.2.2
