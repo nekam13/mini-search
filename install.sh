@@ -261,7 +261,7 @@ cursor.execute('''
         error_count INTEGER DEFAULT 0,
         last_crawled INTEGER DEFAULT 0,
         max_pages INTEGER DEFAULT 500,
-        created_at INTEGER DEFAULT strftime('%s', 'now')
+        created_at INTEGER DEFAULT 0
     )
 ''')
 
@@ -274,7 +274,7 @@ cursor.execute('''
         locked_by TEXT DEFAULT '',
         error_reason TEXT DEFAULT '',
         retry_count INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT strftime('%s', 'now'),
+        created_at INTEGER DEFAULT 0,
         FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
     )
 ''')
