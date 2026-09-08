@@ -432,12 +432,14 @@ def check_for_update():
 
 
 def get_update_status():
-    """Get current update status from database."""
     result = execute_db_fetchone("SELECT * FROM update_status WHERE id=1")
     if result:
-        return dict(result)
+        status = dict(result)
+        status['last_check_str'] = format_timestamp(status.get('last_check', 0))
+        return status
     return {
         'last_check': 0,
+        'last_check_str': 'Nikdy',
         'current_commit': _get_current_commit(),
         'latest_commit': '',
         'update_available': 0,
@@ -629,15 +631,21 @@ def get_site_by_id(site_id):
     return dict(result) if result else None
 
 
+def format_timestamp(ts):
+    if not ts or ts <= 0:
+        return 'Nikdy'
+    try:
+        return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return 'Neznámý datum'
+
+
 def get_all_sites():
     results = execute_db_fetchall("SELECT * FROM sites ORDER BY created_at DESC")
     sites = []
     for row in results:
         site = dict(row)
-        site['last_crawled_str'] = (
-            datetime.fromtimestamp(site['last_crawled']).strftime('%Y-%m-%d %H:%M:%S')
-            if site['last_crawled'] > 0 else 'Nikdy'
-        )
+        site['last_crawled_str'] = format_timestamp(site['last_crawled'])
         site['indexed_count'] = execute_db_fetchone(
             "SELECT COUNT(*) FROM pages WHERE site_id = ?", (site['id'],)
         )[0]
@@ -892,13 +900,7 @@ def vector_search(query, limit=25, filter_type=None):
 
         page['relevance'] = round(relevance, 1)
 
-        if page.get('published_timestamp', 0) > 0:
-            try:
-                page['published_date'] = datetime.fromtimestamp(page['published_timestamp']).strftime('%Y-%m-%d')
-            except Exception:
-                page['published_date'] = ''
-        else:
-            page['published_date'] = ''
+        page['published_date'] = format_timestamp(page.get('published_timestamp', 0))
 
         snippet = (page.get('body_text') or '')[:300]
         if any(_jaccard(snippet, seen) > 0.9 for seen in seen_texts):
@@ -1721,7 +1723,7 @@ ADMIN_HTML = """
             </div>
             <div class="update-item">
                 <div class="update-label">Posledni kontrola:</div>
-                <div class="update-value">{{ datetime.fromtimestamp(update_status.last_check).strftime('%Y-%m-%d %H:%M:%S') if update_status.last_check else 'Nikdy' }}</div>
+                <div class="update-value">{{ update_status.last_check_str if update_status else 'Nikdy' }}</div>
             </div>
         </div>
         <div style="margin-top:15px">
@@ -1828,7 +1830,7 @@ def autocomplete():
 @app.route('/admin')
 def admin_index():
     return render_template_string(ADMIN_HTML, stats=get_db_stats(), sites=get_all_sites(), 
-                                   update_status=get_update_status())
+                                   update_status=get_update_status(), datetime=datetime)
 
 
 @app.route('/admin/add', methods=['POST'])
