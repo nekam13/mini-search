@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Mini Search{% endblock %} · Mini Search</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/clay.css') }}">
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+<div class="{% block layout_class %}layout{% endblock %}">
+    <header class="topbar">
+        <div class="brand">
+            <div class="logo">M</div>
+            <div>
+                <h1>Mini Search</h1>
+                <div class="subtitle">{% block subtitle %}Vyhledávání v lokálním indexu{% endblock %}</div>
+            </div>
+        </div>
+        <nav class="topnav">
+            <a href="/" class="{% if active_page == 'search' %}active{% endif %}">Vyhledávání</a>
+            <a href="/admin" class="{% if active_page == 'dashboard' %}active{% endif %}">Přehled</a>
+            <a href="/admin/sites" class="{% if active_page == 'sites' %}active{% endif %}">Weby a zdroje</a>
+            <a href="/admin/sources/new" class="{% if active_page == 'add' %}active{% endif %}">Přidat zdroj</a>
+            <a href="/admin/search" class="{% if active_page == 'index_search' %}active{% endif %}">Hledat v indexu</a>
+        </nav>
+    </header>
+
+    {% block flash %}{% endblock %}
+
+    {% block content %}{% endblock %}
+
+    <footer class="card card-static" style="text-align:center;color:var(--text-light);font-size:.85rem">
+        {% block footer %}Mini Search v7.2 · Clay design{% endblock %}
+    </footer>
+</div>
+{% block extra_js %}{% endblock %}
+</body>
+</html>

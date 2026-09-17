@@ -1,0 +1,148 @@
+{% extends "base_clay.html" %}
+{% block title %}{% if query %}{{ query }}{% else %}Vyhledávání{% endif %}{% endblock %}
+{% block layout_class %}layout-narrow{% endblock %}
+{% block subtitle %}Vyhledávání v lokálním indexu{% endblock %}
+{% block extra_css %}<link rel="stylesheet" href="{{ url_for('static', filename='css/search.css') }}">{% endblock %}
+{% block footer %}Mini Search v7.2{% if query %} · {{ total_results }} {{ total_results|plural_cz('výsledek', 'výsledky', 'výsledků') }} v indexu{% endif %}{% endblock %}
+
+{% block content %}
+<div class="hero">
+    {% if not query %}<h2>Co chcete najít?</h2>{% endif %}
+    <p>Prohledávejte lokálně indexované stránky přirozeným jazykem, česky i v dalších jazycích.</p>
+
+    <form id="searchForm" action="/" method="get" role="search">
+        <input type="hidden" name="filter" id="filterInput" value="{{ current_filter }}">
+        <div class="search-wrap">
+            <div class="search-row">
+                <input type="text" name="q" id="searchInput" value="{{ query }}"
+                       placeholder="Zadejte hledaný text…" autocomplete="off"
+                       aria-label="Hledaný text" aria-autocomplete="list"
+                       aria-controls="acDropdown"{% if not query %} autofocus{% endif %}>
+                <button type="submit" class="btn btn-primary btn-lg">Hledat</button>
+            </div>
+            <div id="acDropdown" class="ac-dropdown" role="listbox" aria-label="Našeptávač"></div>
+        </div>
+    </form>
+
+    <div class="filter-buttons">
+        <button type="button" class="filter-btn{% if current_filter == 'all' %} active{% endif %}" data-filter="all">Vše</button>
+        <button type="button" class="filter-btn{% if current_filter == 'articles' %} active{% endif %}" data-filter="articles">Články</button>
+        <button type="button" class="filter-btn{% if current_filter == 'podcasts' %} active{% endif %}" data-filter="podcasts">Podcasty</button>
+        <button type="button" class="filter-btn{% if current_filter == 'audio' %} active{% endif %}" data-filter="audio">Audio</button>
+        <button type="button" class="filter-btn{% if current_filter == 'price' %} active{% endif %}" data-filter="price">Ceny</button>
+    </div>
+</div>
+
+{% if query %}
+<div class="card card-static">
+    <div class="result-toolbar">
+        <div>
+            <h2>Výsledky pro <span class="query-term">„{{ query }}“</span></h2>
+            <div class="result-count">{{ total_results }} {{ total_results|plural_cz('nalezený výsledek', 'nalezené výsledky', 'nalezených výsledků') }}{% if page > 1 %} · strana {{ page }}{% endif %}</div>
+        </div>
+        {% if results %}
+        <div class="sort-control">
+            <label for="sortSelect">Řadit</label>
+            <select id="sortSelect">
+                <option value="relevance">Podle relevance</option>
+                <option value="title">Podle názvu</option>
+                <option value="date">Podle data</option>
+            </select>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+{% if results %}
+<div id="resultList" class="result-list">
+    {% for r in results %}
+    <article class="result-item"
+             data-title="{{ r.display_title|lower }}"
+             data-date="{{ r.published_timestamp or 0 }}">
+        {% if r.thumb %}
+        <img src="{{ r.thumb }}" class="result-thumb" alt="" loading="lazy">
+        {% endif %}
+        <div class="result-content">
+            <div class="result-title">
+                {% if r.schema_type %}<span class="badge badge-type">{{ r.schema_type }}</span>{% endif %}
+                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">{{ r.display_title }}</a>
+            </div>
+            <div class="result-url"><span class="domain">{{ r.domain }}</span>{{ r.display_url_path }}</div>
+            <div class="result-snippet">{{ r.snippet_html|safe }}</div>
+            <div class="result-meta">
+                {% if r.display_date %}<span class="meta-item">{{ r.display_date }}</span>{% endif %}
+                {% if r.has_audio == 1 %}<span class="meta-item">Audio</span>{% endif %}
+                {% if r.relevance %}
+                <span class="relevance">
+                    <span class="relevance-track"><span class="relevance-fill" style="width: {{ [r.relevance_pct, 100]|min }}%"></span></span>
+                    <span class="relevance-value">{{ r.relevance_pct }}%</span>
+                </span>
+                {% endif %}
+            </div>
+            {% if r.audio_url and r.has_audio == 1 %}
+            <div class="result-audio">
+                <audio controls preload="none"><source src="{{ r.audio_url }}" type="audio/mpeg"></audio>
+            </div>
+            {% endif %}
+        </div>
+    </article>
+    {% endfor %}
+</div>
+
+{% if has_prev or has_next %}
+<nav class="pagination" aria-label="Stránkování výsledků">
+    {% if has_prev %}
+    <a href="/?q={{ query|urlencode }}&filter={{ current_filter }}&page={{ page - 1 }}">Předchozí</a>
+    {% else %}
+    <span class="disabled">Předchozí</span>
+    {% endif %}
+    <span class="current">Strana {{ page }}</span>
+    {% if has_next %}
+    <a href="/?q={{ query|urlencode }}&filter={{ current_filter }}&page={{ page + 1 }}">Další</a>
+    {% else %}
+    <span class="disabled">Další</span>
+    {% endif %}
+</nav>
+{% endif %}
+{% else %}
+<div class="card card-static">
+    <div class="empty-state">
+        <div class="icon">∅</div>
+        <h3>Žádné výsledky</h3>
+        <p>Pro „{{ query }}“ se nic nenašlo. Zkuste jiný výraz nebo přidejte zdroje ve správě.</p>
+        <div class="actions">
+            <a href="/admin/sources/new" class="btn btn-secondary">Přidat zdroj</a>
+            <a href="/" class="btn btn-ghost">Zrušit hledání</a>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% else %}
+<div class="card card-static">
+    <div class="empty-state" style="padding-bottom:10px">
+        <div class="icon">⌕</div>
+        <h3>Zadejte dotaz</h3>
+        <p>Napište, co hledáte, a prohledneme celý lokální index.</p>
+    </div>
+    <div class="tips-grid">
+        <div class="tip">
+            <strong>Hledejte přirozeně</strong>
+            Celou větou, ne jen klíčovými slovy. Hybridní vyhledávání kombinuje vektorové a plnotextové hledání.
+        </div>
+        <div class="tip">
+            <strong>Využijte filtry</strong>
+            Omezte výsledky na články, podcasty, audio nebo stránky s cenami.
+        </div>
+        <div class="tip">
+            <strong>Spravujte zdroje</strong>
+            Domény, konkrétní URL, sitemapy a feedy přidáte v <a href="/admin/sources/new">správě zdrojů</a>.
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/search.js') }}"></script>
+{% endblock %}

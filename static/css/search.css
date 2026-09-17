@@ -1,0 +1,174 @@
+/* Mini Search - public search page. Design tokens live in clay.css, loaded first. */
+
+/* ---------------- Hero + search box ---------------- */
+.hero {
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 28px 24px;
+    margin-bottom: 16px;
+    text-align: center;
+}
+.hero h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 6px; }
+.hero p { color: var(--text-light); font-size: 0.92rem; margin-bottom: 18px; }
+
+.search-wrap { position: relative; max-width: 720px; margin: 0 auto; }
+.search-row { display: flex; gap: 10px; }
+.search-wrap input[type="text"] {
+    flex: 1; padding: 14px 16px; font-size: 1.05rem;
+    border-radius: 10px; border: 1px solid #ddd;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.search-wrap input[type="text"]:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
+}
+.search-wrap .btn-lg { border-radius: 10px; }
+
+/* Autocomplete */
+.ac-dropdown {
+    position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+    background: #fff; border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow-hover); z-index: 60; overflow: hidden; display: none;
+    text-align: left;
+}
+.ac-dropdown.open { display: block; }
+.ac-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; cursor: pointer; font-size: 0.92rem;
+    border-bottom: 1px solid #f5f5f5;
+}
+.ac-item:last-child { border-bottom: none; }
+.ac-item:hover, .ac-item.highlighted { background: #f5f9f5; }
+.ac-item .ac-icon { color: var(--text-light); font-size: 0.85rem; }
+
+/* ---------------- Filter chips ---------------- */
+.filter-buttons { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 18px; }
+.filter-btn {
+    padding: 7px 16px; border-radius: 999px; border: 1px solid var(--border);
+    background: #fff; color: var(--text); cursor: pointer;
+    font-family: inherit; font-size: 0.88rem; font-weight: 500;
+    transition: background 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+}
+.filter-btn:hover { background: var(--background); box-shadow: var(--shadow); }
+.filter-btn.active {
+    background: var(--primary); color: #fff; border-color: var(--primary);
+    box-shadow: var(--shadow);
+}
+.filter-btn .count { opacity: 0.75; font-size: 0.8rem; margin-left: 4px; }
+
+/* ---------------- Result toolbar ---------------- */
+.result-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 4px;
+}
+.result-toolbar h2 { font-size: 1.1rem; font-weight: 600; }
+.result-toolbar .query-term { color: var(--primary-dark); }
+.result-count { color: var(--text-light); font-size: 0.88rem; }
+.sort-control { display: flex; align-items: center; gap: 8px; }
+.sort-control label { font-size: 0.85rem; color: var(--text-light); }
+.sort-control select { width: auto; padding: 6px 10px; font-size: 0.85rem; }
+
+/* ---------------- Result cards ---------------- */
+.result-list { display: flex; flex-direction: column; gap: 0; }
+.result-item {
+    display: flex; gap: 16px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--primary);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px;
+    margin: 10px 0;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.result-item:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-hover);
+}
+.result-thumb {
+    width: 120px; height: 80px; flex-shrink: 0;
+    border-radius: 8px; object-fit: cover;
+    border: 1px solid var(--border); background: var(--background);
+}
+.result-content { flex: 1; min-width: 0; }
+
+.result-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.result-title a {
+    font-size: 1.1rem; font-weight: 600; color: var(--secondary-dark);
+    word-break: break-word;
+}
+.result-title a:hover { color: var(--secondary); }
+
+.result-url {
+    color: var(--text-light); font-size: 0.82rem;
+    margin: 3px 0 6px; word-break: break-all;
+}
+.result-url .domain { color: var(--primary-dark); font-weight: 500; }
+.result-snippet { color: #444; font-size: 0.94rem; margin-bottom: 8px; }
+.result-snippet mark {
+    background: rgba(255, 193, 7, 0.35); color: inherit;
+    padding: 0 2px; border-radius: 3px;
+}
+
+.result-meta {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    color: var(--text-light); font-size: 0.82rem;
+}
+.result-meta .meta-item { display: inline-flex; align-items: center; gap: 4px; }
+
+/* Relevance meter */
+.relevance { display: inline-flex; align-items: center; gap: 6px; }
+.relevance-track {
+    width: 54px; height: 6px; border-radius: 999px;
+    background: #eceff1; overflow: hidden;
+}
+.relevance-fill {
+    height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, var(--secondary), var(--primary));
+}
+.relevance-value { font-weight: 600; color: var(--primary-dark); }
+
+.result-audio { margin-top: 12px; }
+.result-audio audio { width: 100%; max-width: 340px; }
+
+/* ---------------- Empty / initial states ---------------- */
+.empty-state { text-align: center; padding: 44px 20px; color: var(--text-light); }
+.empty-state .icon { font-size: 2.4rem; margin-bottom: 10px; }
+.empty-state h3 { font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.empty-state p { font-size: 0.9rem; }
+.empty-state .actions { justify-content: center; }
+
+.tips-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px; margin-top: 8px;
+}
+.tip {
+    background: var(--raised); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; font-size: 0.88rem;
+}
+.tip strong { display: block; margin-bottom: 4px; }
+
+/* Update notice reuses the shared accent message look */
+.update-notice {
+    background: rgba(255, 193, 7, 0.18);
+    border: 1px solid rgba(255, 193, 7, 0.4);
+    color: #8a6d00;
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;
+    font-size: 0.9rem;
+}
+
+@media (max-width: 600px) {
+    .hero { padding: 20px 16px; }
+    .hero h2 { font-size: 1.25rem; }
+    .search-row { flex-direction: column; }
+    .search-wrap .btn-lg { width: 100%; justify-content: center; }
+    .result-item { flex-direction: column; }
+    .result-thumb { width: 100%; height: 150px; }
+    .result-toolbar { flex-direction: column; align-items: flex-start; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .result-item, .filter-btn { transition: none; }
+}

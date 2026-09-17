@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mini Search - Complete Implementation v7.0
+Mini Search - Complete Implementation v7.2
 Hybrid Search: 60% hnswlib vector + 35% FTS5 full-text + 5% SEO scoring
 Database migration without deleting console.db
 FTS5 backfill for existing pages with triggers
@@ -10,7 +10,7 @@ Per-domain shared Crawl-delay enforcement
 Correct 429 rate_limited scheduling
 Non-destructive scheduled recrawl
 Robots checks before fetching discovery candidates
-Rich Czech search results and enhanced Czech admin console
+Clay design system shared by the public search page and the admin panel
 """
 
 import sqlite3
@@ -28,8 +28,8 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse, urljoin, urlencode
 from urllib.robotparser import RobotFileParser
 
-from flask import (Flask, render_template, render_template_string, request,
-                   redirect, jsonify)
+from flask import (Flask, render_template, request, redirect, jsonify)
+from markupsafe import escape
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
@@ -2003,177 +2003,142 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 # FLASK ROUTES
 # ============================================================================
 
+def _plural_cz(count, one, few, many):
+    """Czech plural form: the last significant digit decides, except for teens."""
+    count = abs(int(count))
+    if count == 1:
+        return one
+    if 2 <= count <= 4:
+        return few
+    if count >= 5 and count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
 app = Flask(__name__)
 app.secret_key = 'mini-search-secret-key'
+app.jinja_env.filters['plural_cz'] = _plural_cz
 
-SEARCH_HTML = """
-<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mini Search</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-             background:#1a1a2e;color:#e0e0e0;line-height:1.6;padding:20px}
-        .container{max-width:1200px;margin:0 auto}
-        h1{color:#e94560;margin-bottom:10px;font-size:2em}
-        .card{background:#16213e;border-radius:10px;padding:20px;margin-bottom:20px}
-        .search-wrap{display:flex;gap:10px;margin-bottom:10px;position:relative}
-        .search-wrap input{flex:1;padding:15px;border-radius:8px;border:1px solid #333;
-                           background:#1a1a2e;color:#e0e0e0;font-size:1.1em}
-        .search-wrap button{background:#e94560;color:#fff;border:none;padding:15px 30px;
-                            border-radius:8px;cursor:pointer;font-size:1.1em;font-weight:bold}
-        .search-wrap button:hover{background:#c81e45}
-        #acDropdown{position:absolute;top:58px;left:0;right:60px;background:#16213e;
-                    border:1px solid #333;border-radius:0 0 8px 8px;z-index:100;display:none}
-        #acDropdown div{padding:10px 15px;cursor:pointer;border-bottom:1px solid #222}
-        #acDropdown div:hover{background:#1f2b4a}
-        .result-item{background:#16213e;border-radius:8px;padding:20px;margin-bottom:15px;
-                     border-left:4px solid #e94560;display:flex;gap:15px}
-        .result-item:hover{background:#1f2b4a}
-        .result-content{flex:1}
-        .result-title a{color:#e94560;text-decoration:none;font-size:1.2em}
-        .result-title a:hover{text-decoration:underline}
-        .result-url{color:#2196f3;font-size:.9em;margin:4px 0;word-break:break-all}
-        .result-snippet{color:#aaa;margin-bottom:8px}
-        .result-meta{color:#666;font-size:.85em;display:flex;gap:10px;flex-wrap:wrap}
-        .result-image{max-width:120px;max-height:80px;border-radius:5px}
-        .schema-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75em;
-                      background:#2196f320;color:#2196f3;margin-right:6px}
-        .relevance-badge{display:inline-block;padding:2px 6px;background:#4caf5020;
-                         color:#4caf50;border-radius:5px;font-size:.85em;font-weight:bold}
-        .filter-buttons{display:flex;gap:10px;margin-bottom:15px;flex-wrap:wrap}
-        .filter-btn{padding:5px 12px;background:#333;border:none;border-radius:5px;
-                    color:#e0e0e0;cursor:pointer;font-size:.9em}
-        .filter-btn.active{background:#e94560}
-        .no-results{text-align:center;color:#666;padding:40px}
-        .nav a{color:#2196f3;margin-right:20px;text-decoration:none}
-        .update-notice{background:#ff980020;color:#ff9800;padding:10px;border-radius:5px;margin-bottom:15px}
-        audio{max-width:300px}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="nav" style="margin-bottom:20px">
-        <a href="/">Vyhledavani</a>
-        <a href="/admin">Sprava</a>
-    </div>
-    <h1>Mini Search</h1>
-    <div class="card">
-        <div class="filter-buttons">
-            <button class="filter-btn{% if current_filter=='all' %} active{% endif %}" onclick="setFilter('all')">Vse</button>
-            <button class="filter-btn{% if current_filter=='articles' %} active{% endif %}" onclick="setFilter('articles')">Clanky</button>
-            <button class="filter-btn{% if current_filter=='podcasts' %} active{% endif %}" onclick="setFilter('podcasts')">Podcasty</button>
-            <button class="filter-btn{% if current_filter=='audio' %} active{% endif %}" onclick="setFilter('audio')">Audio</button>
-            <button class="filter-btn{% if current_filter=='price' %} active{% endif %}" onclick="setFilter('price')">Ceny</button>
-        </div>
-        <form id="searchForm" action="/" method="get">
-            <div class="search-wrap">
-                <input type="text" name="q" id="searchInput" placeholder="Zadejte hledany text..."
-                       value="{{ query }}" autocomplete="off">
-                <input type="hidden" name="filter" id="filterInput" value="{{ current_filter }}">
-                <button type="submit">Hledat</button>
-                <div id="acDropdown"></div>
-            </div>
-        </form>
-    </div>
-    {% if query %}
-    <div class="card">
-        <h2>Vysledky pro: "{{ query }}"</h2>
-        <div style="color:#666;font-size:.9em;margin-top:5px">Nalezeno: {{ total_results }} vysledku</div>
-        {% if results %}
-        {% for r in results %}
-        <div class="result-item">
-            {% if r.og_image or r.favicon_url %}
-            <img src="{{ r.og_image or r.favicon_url }}" class="result-image" onerror="this.style.display='none'" alt="">
-            {% endif %}
-            <div class="result-content">
-                <div class="result-title">
-                    {% if r.schema_type %}<span class="schema-badge">{{ r.schema_type }}</span>{% endif %}
-                    <a href="{{ r.url }}" target="_blank">{{ r.og_title or r.title or r.url }}</a>
-                </div>
-                <div class="result-url">{{ r.url }}</div>
-                <div class="result-snippet">{{ (r.og_description or r.body_text)[:200] }}...</div>
-                <div class="result-meta">
-                    {% if r.published_date %} {{ r.published_date }}{% endif %}
-                    {% if r.has_audio == 1 %} {{ 'Audio' }}{% endif %}
-                    {% if r.relevance %}<span class="relevance-badge">{{ r.relevance }}%</span>{% endif %}
-                </div>
-                {% if r.audio_url and r.has_audio == 1 %}
-                <div style="margin-top:10px">
-                    <audio controls><source src="{{ r.audio_url }}" type="audio/mpeg"></audio>
-                </div>
-                {% endif %}
-            </div>
-        </div>
-        {% endfor %}
-        {% else %}
-        <div class="no-results">
-            <p>Zadne vysledky nenalezeny</p>
-            <p style="font-size:.9em;color:#666">Zkuste jine slovo nebo pridejte stranky pres spravce.</p>
-        </div>
-        {% endif %}
-    </div>
-    {% endif %}
-</div>
-<script>
-    function setFilter(f){
-        document.getElementById('filterInput').value=f;
-        document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-        event.target.classList.add('active');
-        document.getElementById('searchForm').submit();
-    }
-    let acTimer;
-    document.getElementById('searchInput').addEventListener('input',function(){
-        clearTimeout(acTimer);
-        const q=this.value.trim();
-        if(q.length<2){document.getElementById('acDropdown').style.display='none';return;}
-        acTimer=setTimeout(()=>{
-            fetch('/autocomplete?q='+encodeURIComponent(q))
-                .then(r=>r.json())
-                .then(data=>{
-                    const dd=document.getElementById('acDropdown');
-                    dd.innerHTML='';
-                    if(!data.results||!data.results.length){dd.style.display='none';return;}
-                    data.results.forEach(item=>{
-                        const d=document.createElement('div');
-                        d.textContent=item;
-                        d.onclick=()=>{document.getElementById('searchInput').value=item;
-                                        dd.style.display='none';
-                                        document.getElementById('searchForm').submit();};
-                        dd.appendChild(d);
-                    });
-                    dd.style.display='block';
-                });
-        },280);
-    });
-    document.addEventListener('click',e=>{
-        if(!e.target.closest('.search-wrap'))
-            document.getElementById('acDropdown').style.display='none';
-    });
-</script>
-</body>
-</html>
-"""
+SEARCH_PAGE_SIZE = 25
+# Hard ceiling on how many results a single query may pull from the index.
+# Also bounds how deep pagination can go (page * SEARCH_PAGE_SIZE).
+SEARCH_MAX_RESULTS = 500
 
-# Admin UI is rendered from templates/admin/*.html (Clay design).
 
+def _result_domain(url):
+    """Hostname for the breadcrumb line under a result title."""
+    try:
+        return (urlparse(url).hostname or '').replace('www.', '')
+    except Exception:
+        return ''
+
+
+def _result_url_path(url):
+    """Path portion shown after the domain in the breadcrumb line."""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or '/'
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return path
+    except Exception:
+        return url or ''
+
+
+def _result_snippet(page, query, length=240):
+    """Body text windowed around the first query match so the hit is visible."""
+    text = (page.get('og_description') or page.get('body_text') or '').strip()
+    if not text:
+        return ''
+    text = re.sub(r'\s+', ' ', text)
+
+    lowered = text.lower()
+    position = -1
+    for term in (query or '').lower().split():
+        position = lowered.find(term)
+        if position != -1:
+            break
+
+    if position > length // 2:
+        start = max(position - length // 3, 0)
+        prefix = '… '
+        text = text[start:start + length]
+    else:
+        prefix = ''
+        text = text[:length]
+
+    suffix = '…' if len(text) >= length else ''
+    return f"{prefix}{text.strip()}{suffix}"
+
+
+def _highlight_snippet(snippet, query):
+    """Wrap query terms in <mark>. Escaping happens before the markup is added."""
+    escaped = escape(snippet)
+    terms = {t for t in (query or '').lower().split() if len(t) > 2}
+    if not terms:
+        return escaped
+
+    pattern = '|'.join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
+
+    def replace(match):
+        return f'<mark>{match.group(0)}</mark>'
+
+    try:
+        return re.sub(f'({pattern})', replace, escaped, flags=re.IGNORECASE)
+    except re.error:
+        return escaped
+
+
+def prepare_results(results, query):
+    """Attach display-only fields so the template stays free of logic."""
+    prepared = []
+    for page in results:
+        item = dict(page)
+        item['domain'] = _result_domain(item.get('url', ''))
+        item['display_url_path'] = _result_url_path(item.get('url', ''))
+        item['snippet_html'] = _highlight_snippet(_result_snippet(item, query), query)
+        item['relevance_pct'] = int(round(float(item.get('relevance') or 0)))
+        item['display_title'] = item.get('og_title') or item.get('title') or item.get('url', '')
+        item['display_date'] = item.get('published_date') or ''
+        item['thumb'] = item.get('og_image') or item.get('favicon_url') or ''
+        prepared.append(item)
+    return prepared
 
 
 @app.route('/')
 def search_index():
     query = request.args.get('q', '').strip()
     filter_type = request.args.get('filter', 'all')
+    try:
+        page = max(int(request.args.get('page', 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+
+    results = []
+    has_next = False
     if query:
-        results = hybrid_search(query, limit=25, filter_type=filter_type if filter_type != 'all' else None)
-        return render_template_string(
-            SEARCH_HTML, query=query, results=results,
-            total_results=len(results), current_filter=filter_type
+        # hybrid_search has no offset, so fetch the window for the requested
+        # page plus one peek row (to detect a next page) and slice it. The cap
+        # bounds how deep pagination can reach into the index.
+        fetch_limit = min(page * SEARCH_PAGE_SIZE + 1, SEARCH_MAX_RESULTS)
+        window = hybrid_search(
+            query, limit=fetch_limit,
+            filter_type=filter_type if filter_type != 'all' else None
         )
-    return render_template_string(
-        SEARCH_HTML, query='', results=[], total_results=0, current_filter='all'
+        start = (page - 1) * SEARCH_PAGE_SIZE
+        results = window[start:start + SEARCH_PAGE_SIZE]
+        has_next = len(window) > start + SEARCH_PAGE_SIZE
+
+    return render_template(
+        'search.html',
+        active_page='search',
+        query=query,
+        results=prepare_results(results, query),
+        total_results=len(results),
+        current_filter=filter_type,
+        page=page,
+        has_prev=page > 1,
+        has_next=has_next,
     )
 
 
@@ -2463,7 +2428,7 @@ def admin_search():
     message, ok = _admin_message()
     return render_template(
         'admin/search.html',
-        active_page='search',
+        active_page='index_search',
         query=query,
         results=results,
         current_filter=filter_type,
@@ -2646,7 +2611,7 @@ def admin_update_status():
 
 if __name__ == '__main__':
     print('=' * 70)
-    print('Mini Search v7.0 - Hybrid Search Engine')
+    print('Mini Search v7.2 - Hybrid Search Engine')
     print('=' * 70)
 
     get_db()

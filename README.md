@@ -2,7 +2,7 @@
 
 Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje stránky, ukládá jejich metadata a text do SQLite a používá vektorové vyhledávání pro sémanticky podobné výsledky.
 
-> **Aktuální vývojová větev: `beta-optimized` (v7.1)**
+> **Aktuální vývojová větev: `beta-optimized` (v7.2)**
 
 ## Funkce
 
@@ -15,6 +15,7 @@ Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje
 - Extrakce titulků, Open Graph metadat, textu, obrázků, audio odkazů a JSON-LD schema.org dat
 - Filtry pro články, podcasty, audio a stránky s cenami
 - **Autocomplete** nad názvy indexovaných stránek
+- **Moderní vyhledávací stránka (Clay design)** s našeptávačem, filtry a řazením výsledků
 - **Moderní admin panel (Clay design)**: dashboard, správa webů a zdrojů, vyhledávání v indexu, hromadné akce
 - **Hierarchická správa zdrojů**: domény, konkrétní URL, sitemapy, RSS/Atom feedy
 - **REST API** pro zdroje, weby a statistiky
@@ -117,6 +118,27 @@ cd ~/mini-search
 4. Workery postupně stahují povolené stránky a ukládají je do lokálního indexu.
 5. Vyhledávejte na `http://127.0.0.1:8070/` přirozeným jazykem, česky i dalšími jazyky podporovanými použitým modelem.
 
+## Vyhledávací stránka (Clay design)
+
+Veřejné vyhledávání na `/` používá stejný design systém jako admin panel. Sdílené
+tokeny (barvy, stíny, rádiusy, tlačítka, formuláře) jsou v `static/css/clay.css`,
+stránkově specifické styly v `static/css/search.css` a logika v `static/js/search.js`.
+
+Prvky rozhraní:
+
+| Prvek | Popis |
+|---|---|
+| Našeptávač | Napovídá titulky z indexu, ovládá se šipkami, Enter potvrdí, Esc zavře |
+| Filtry | Vše, Články, Podcasty, Audio, Ceny (tlačítka ve stylu chipů) |
+| Řazení | Podle relevance, názvu nebo data (klientsky, bez přenačtení) |
+| Karty výsledků | Doménový breadcrumb, zvýrazněné shody, indikátor relevance, audio přehrávač |
+| Stránkování | 25 výsledků na stránku, parametr `page` (nad 500 výsledků se nepokračuje) |
+| Prázdné stavy | Vysvětlení a přímý odkaz do správy zdrojů, když se nic nenajde |
+
+Šablona dostává už připravená data (`prepare_results()`), takže v HTML nezůstává
+žádná logika. Zvýrazňování hledaných výrazů escapuje text ještě před vložením
+značek `<mark>`, takže uložené HTML v titulech se nevykreslí.
+
 ## Admin panel (Clay design)
 
 Admin rozhraní je postavené na Flask šablonách (`templates/admin/`) a statických souborech
@@ -201,6 +223,7 @@ python3 tests/test_db.py                     # schéma, indexy, FTS5, site_sourc
 python3 tests/test_admin.py                  # admin stránky a JSON API
 python3 tests/test_admin_panel.py            # kompletní end-to-end testy admin panelu
 python3 tests/test_discovery_integration.py  # napojení zdrojů na discovery a plánovač
+python3 tests/test_search_page.py            # vyhledávací stránka, filtry, XSS, našeptávač
 ```
 
 ## Filtry ve vyhledávání
