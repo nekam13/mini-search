@@ -25,10 +25,11 @@ import re
 import gzip
 import io
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse, urljoin
+from urllib.parse import urlparse, urlunparse, urljoin, urlencode
 from urllib.robotparser import RobotFileParser
 
-from flask import Flask, render_template_string, request, redirect, jsonify
+from flask import (Flask, render_template, render_template_string, request,
+                   redirect, jsonify)
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
@@ -161,8 +162,29 @@ DB_SCHEMA = {
             last_update_time INTEGER DEFAULT 0,
             last_update_result TEXT DEFAULT ''
         )
+    ''',
+    'site_sources': '''
+        CREATE TABLE IF NOT EXISTS site_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            source_type TEXT NOT NULL CHECK(source_type IN ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')),
+            priority INTEGER DEFAULT 5,
+            notes TEXT DEFAULT '',
+            last_checked INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )
     '''
 }
+
+VALID_SOURCE_TYPES = ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')
+FEED_SOURCE_TYPES = ('feed', 'rss', 'atom')
+VALID_SITE_STATUSES = ('active', 'blocked', 'paused')
+MAX_PAGES_MIN = 1
+MAX_PAGES_MAX = 10000
+ERROR_LOG_PATH = "logs/errors.log"
 
 DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status)",
@@ -174,6 +196,8 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
     "CREATE INDEX IF NOT EXISTS idx_pages_indexed ON pages(indexed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sources_site ON site_sources(site_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sources_type ON site_sources(source_type)",
 ]
 
 DB_TRIGGERS = [
@@ -231,6 +255,7 @@ def get_db():
             _init_schema(_db_conn)
             _migrate_db(_db_conn)
             _backfill_fts(_db_conn)
+            _migrate_sources(_db_conn)
     return _db_conn
 
 
@@ -293,6 +318,13 @@ def _migrate_db(conn):
     except sqlite3.OperationalError:
         pass
     
+    # Create site_sources table if not exists
+    try:
+        cursor.execute(DB_SCHEMA['site_sources'])
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
     # Create triggers if not exists
     for trigger in DB_TRIGGERS:
         try:
@@ -316,6 +348,47 @@ def _backfill_fts(conn):
         """)
         conn.commit()
         print("FTS5 table backfilled with existing pages data")
+
+
+def _migrate_sources(conn):
+    """Seed site_sources from existing sites and sitemaps_feeds (idempotent)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+            SELECT s.id, s.canonical_url, 'domain', 5, '', 0, 'active'
+            FROM sites s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM site_sources ss
+                WHERE ss.site_id = s.id AND ss.source_type = 'domain'
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+            SELECT sf.site_id, sf.url,
+                   CASE WHEN sf.type IN ('rss','atom') THEN sf.type ELSE 'sitemap' END,
+                   CASE WHEN sf.type IN ('rss','atom') THEN 1 ELSE 3 END,
+                   '', COALESCE(sf.last_checked, 0), 'active'
+            FROM sitemaps_feeds sf
+            WHERE NOT EXISTS (
+                SELECT 1 FROM site_sources ss
+                WHERE ss.site_id = sf.site_id AND ss.url = sf.url
+            )
+        """)
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        print(f"Source migration skipped: {e}")
+
+
+def log_error(message, exc=None):
+    """Append an error line to logs/errors.log (best effort)."""
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH) or '.', exist_ok=True)
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            detail = f" | {type(exc).__name__}: {exc}" if exc is not None else ""
+            f.write(f"{datetime.now().isoformat()} - {message}{detail}\n")
+    except Exception:
+        pass
 
 
 def close_db():
@@ -670,6 +743,393 @@ def get_db_stats():
         'errors': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='error'")[0],
     }
 
+# ============================================================================
+# SOURCE MANAGEMENT (domain / url / sitemap / feed)
+# ============================================================================
+
+def validate_url(value):
+    """Return (ok, message). Accepts bare domains and full URLs."""
+    if not value or not value.strip():
+        return False, 'URL je povinná'
+    candidate = value.strip()
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', candidate):
+        candidate = f"https://{candidate}"
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ('http', 'https'):
+        return False, 'Povolena je pouze adresa http nebo https'
+    host = parsed.hostname or ''
+    if not host or '.' not in host or host.startswith('.') or host.endswith('.'):
+        return False, 'Neplatný formát URL'
+    if any(ch.isspace() for ch in host):
+        return False, 'Neplatný formát URL'
+    return True, ''
+
+
+def validate_max_pages(value):
+    """Return (ok, message, int_value)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False, 'Max. stránek musí být číslo', None
+    if number < MAX_PAGES_MIN or number > MAX_PAGES_MAX:
+        return False, f'Max. stránek musí být {MAX_PAGES_MIN}–{MAX_PAGES_MAX}', None
+    return True, '', number
+
+
+def validate_priority(value):
+    """Return (ok, message, int_value)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False, 'Priorita musí být číslo', None
+    if number < 1 or number > 10:
+        return False, 'Priorita musí být 1–10', None
+    return True, '', number
+
+
+def detect_source_type(url, fallback='url'):
+    """Guess source_type from URL shape."""
+    lower = (url or '').lower()
+    if lower.endswith('.xml') or lower.endswith('.xml.gz') or 'sitemap' in lower:
+        return 'sitemap'
+    if (lower.endswith('.rss') or lower.endswith('.atom') or '/rss' in lower
+            or '/feed' in lower or '/atom' in lower or 'feed' in lower):
+        return 'rss'
+    return fallback
+
+
+def get_site_sources(site_id):
+    rows = execute_db_fetchall(
+        "SELECT * FROM site_sources WHERE site_id = ? ORDER BY source_type, priority, id",
+        (site_id,)
+    )
+    sources = []
+    for row in rows:
+        source = dict(row)
+        source['last_checked_str'] = format_timestamp(source.get('last_checked', 0))
+        sources.append(source)
+    return sources
+
+
+def get_source_by_id(source_id):
+    row = execute_db_fetchone("SELECT * FROM site_sources WHERE id = ?", (source_id,))
+    return dict(row) if row else None
+
+
+def add_source(site_id, url, source_type='url', priority=5, notes=''):
+    """Add a source under a site. Returns (source_id, error_message)."""
+    if source_type not in VALID_SOURCE_TYPES:
+        return None, f'Nepodporovaný typ zdroje: {source_type}'
+
+    ok, message = validate_url(url)
+    if not ok:
+        return None, message
+
+    ok, message, priority = validate_priority(priority)
+    if not ok:
+        return None, message
+
+    if source_type == 'domain':
+        normalized = normalize_url(url)
+        domain = get_domain(normalized)
+        existing = execute_db_fetchone(
+            "SELECT id FROM sites WHERE canonical_url = ?", (domain,)
+        )
+        if existing:
+            site_id = existing[0]
+        else:
+            site_id = add_site(normalized, 500)
+            if not site_id:
+                return None, 'Doménu nebylo možné vytvořit'
+
+    normalized = normalize_url(url)
+    if source_type == 'domain':
+        normalized = get_domain(normalized)
+
+    duplicate = execute_db_fetchone(
+        "SELECT id FROM site_sources WHERE site_id = ? AND url = ?",
+        (site_id, normalized)
+    )
+    if duplicate:
+        return None, 'Tento zdroj je již pod doménou zaregistrován'
+
+    execute_db(
+        """INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+           VALUES (?, ?, ?, ?, ?, 0, 'active')""",
+        (site_id, normalized, source_type, priority, notes or ''), commit=True
+    )
+    source_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
+
+    if source_type in ('sitemap', 'feed', 'rss', 'atom'):
+        _mirror_source_to_legacy(site_id, normalized, source_type)
+
+    return source_id, None
+
+
+def _mirror_source_to_legacy(site_id, url, source_type):
+    """Keep sitemaps_feeds in sync so existing schedulers keep working."""
+    legacy_type = source_type if source_type in ('rss', 'atom') else 'sitemap'
+    try:
+        existing = execute_db_fetchone(
+            "SELECT id FROM sitemaps_feeds WHERE site_id = ? AND url = ?",
+            (site_id, url)
+        )
+        if not existing:
+            execute_db(
+                "INSERT INTO sitemaps_feeds (site_id, url, type, last_checked) VALUES (?, ?, ?, 0)",
+                (site_id, url, legacy_type), commit=True
+            )
+    except Exception as e:
+        log_error(f"Could not mirror source {url} to sitemaps_feeds", e)
+
+
+def update_source(source_id, **kwargs):
+    """Update fields of a source. Returns (ok, message)."""
+    source = get_source_by_id(source_id)
+    if not source:
+        return False, 'Zdroj nenalezen'
+
+    updates = []
+    params = []
+
+    if kwargs.get('url') is not None:
+        ok, message = validate_url(kwargs['url'])
+        if not ok:
+            return False, message
+        new_url = normalize_url(kwargs['url'])
+        if source['source_type'] == 'domain':
+            new_url = get_domain(new_url)
+        if new_url != source['url']:
+            duplicate = execute_db_fetchone(
+                "SELECT id FROM site_sources WHERE site_id = ? AND url = ? AND id != ?",
+                (source['site_id'], new_url, source_id)
+            )
+            if duplicate:
+                return False, 'Tento zdroj je již pod doménou zaregistrován'
+        updates.append("url = ?")
+        params.append(new_url)
+
+    if kwargs.get('source_type') is not None:
+        if kwargs['source_type'] not in VALID_SOURCE_TYPES:
+            return False, f"Nepodporovaný typ zdroje: {kwargs['source_type']}"
+        updates.append("source_type = ?")
+        params.append(kwargs['source_type'])
+
+    if kwargs.get('priority') is not None:
+        ok, message, priority = validate_priority(kwargs['priority'])
+        if not ok:
+            return False, message
+        updates.append("priority = ?")
+        params.append(priority)
+
+    if kwargs.get('notes') is not None:
+        updates.append("notes = ?")
+        params.append(str(kwargs['notes']))
+
+    if kwargs.get('status') is not None:
+        if kwargs['status'] not in VALID_SITE_STATUSES:
+            return False, 'Neplatný stav zdroje'
+        updates.append("status = ?")
+        params.append(kwargs['status'])
+
+    if kwargs.get('max_pages') is not None:
+        ok, message, max_pages = validate_max_pages(kwargs['max_pages'])
+        if not ok:
+            return False, message
+        execute_db(
+            "UPDATE sites SET max_pages = ? WHERE id = ?",
+            (max_pages, source['site_id']), commit=True
+        )
+
+    if not updates:
+        return True, 'Nic ke změně'
+
+    params.append(source_id)
+    try:
+        execute_db(
+            f"UPDATE site_sources SET {', '.join(updates)} WHERE id = ?",
+            tuple(params), commit=True
+        )
+    except sqlite3.IntegrityError as e:
+        log_error(f"Update source {source_id} failed", e)
+        return False, 'Aktualizace zdroje selhala'
+
+    if kwargs.get('url') is not None:
+        _sync_legacy_source(source, kwargs['url'])
+    return True, 'Zdroj byl upraven'
+
+
+def _sync_legacy_source(source, new_url):
+    try:
+        execute_db(
+            "UPDATE sitemaps_feeds SET url = ? WHERE site_id = ? AND url = ?",
+            (normalize_url(new_url), source['site_id'], source['url']), commit=True
+        )
+    except Exception as e:
+        log_error(f"Could not sync legacy source {source['id']}", e)
+
+
+def delete_source(source_id):
+    """Delete a source. Domains delete the whole site (cascade)."""
+    source = get_source_by_id(source_id)
+    if not source:
+        return False, 'Zdroj nenalezen'
+    if source['source_type'] == 'domain':
+        delete_site(source['site_id'])
+        return True, 'Doména byla smazána'
+    execute_db("DELETE FROM site_sources WHERE id = ?", (source_id,), commit=True)
+    execute_db(
+        "DELETE FROM sitemaps_feeds WHERE site_id = ? AND url = ?",
+        (source['site_id'], source['url']), commit=True
+    )
+    return True, 'Zdroj byl smazán'
+
+
+def get_source_stats(site_id):
+    """Aggregate stats for a site (used by cards and detail view)."""
+    indexed = execute_db_fetchone(
+        "SELECT COUNT(*) FROM pages WHERE site_id = ?", (site_id,)
+    )[0]
+    pending = execute_db_fetchone(
+        "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'pending'",
+        (site_id,)
+    )[0]
+    errors = execute_db_fetchone(
+        "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'error'",
+        (site_id,)
+    )[0]
+    sources = execute_db_fetchone(
+        "SELECT COUNT(*) FROM site_sources WHERE site_id = ?", (site_id,)
+    )[0]
+    return {
+        'indexed': indexed,
+        'pending': pending,
+        'errors': errors,
+        'sources': sources,
+        'total': indexed + pending,
+    }
+
+
+def update_site(site_id, **kwargs):
+    """Update editable site fields. Returns (ok, message)."""
+    site = get_site_by_id(site_id)
+    if not site:
+        return False, 'Web nenalezen'
+
+    updates = []
+    params = []
+
+    if kwargs.get('max_pages') is not None:
+        ok, message, max_pages = validate_max_pages(kwargs['max_pages'])
+        if not ok:
+            return False, message
+        updates.append("max_pages = ?")
+        params.append(max_pages)
+
+    if kwargs.get('status') is not None:
+        status = kwargs['status']
+        if status not in VALID_SITE_STATUSES:
+            return False, 'Neplatný stav webu'
+        updates.append("status = ?")
+        params.append(status)
+
+    if kwargs.get('aliases') is not None:
+        aliases = kwargs['aliases']
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(',') if a.strip()]
+        updates.append("aliases = ?")
+        params.append(json.dumps(aliases))
+
+    if not updates:
+        return True, 'Nic ke změně'
+
+    params.append(site_id)
+    execute_db(f"UPDATE sites SET {', '.join(updates)} WHERE id = ?", tuple(params), commit=True)
+    return True, 'Web byl upraven'
+
+
+def pause_site(site_id):
+    return update_site(site_id, status='paused')
+
+
+def resume_site(site_id):
+    return update_site(site_id, status='active')
+
+
+def get_all_sources():
+    """Flat list of every source enriched with its site (for API)."""
+    rows = execute_db_fetchall("""
+        SELECT ss.*, s.canonical_url AS site_domain, s.status AS site_status,
+               s.max_pages AS max_pages
+        FROM site_sources ss
+        JOIN sites s ON ss.site_id = s.id
+        ORDER BY s.created_at DESC, ss.source_type, ss.priority
+    """)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item['last_checked_str'] = format_timestamp(item.get('last_checked', 0))
+        result.append(item)
+    return result
+
+
+def get_recent_pages(site_id, limit=10):
+    rows = execute_db_fetchall(
+        """SELECT id, url, og_title, title, schema_type, indexed_at, seo_score
+           FROM pages WHERE site_id = ? ORDER BY indexed_at DESC LIMIT ?""",
+        (site_id, limit)
+    )
+    pages = []
+    for row in rows:
+        page = dict(row)
+        page['title'] = page['og_title'] or page['title'] or page['url']
+        page['indexed_at_str'] = format_timestamp(page['indexed_at'])
+        pages.append(page)
+    return pages
+
+
+def get_filtered_sites(search='', status='', source_type=''):
+    """Return sites with stats, optionally filtered."""
+    query = "SELECT * FROM sites WHERE 1=1"
+    params = []
+    if search:
+        query += " AND (canonical_url LIKE ? OR aliases LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if source_type:
+        query += " AND id IN (SELECT site_id FROM site_sources WHERE source_type = ?)"
+        params.append(source_type)
+    query += " ORDER BY created_at DESC"
+
+    sites = []
+    for row in execute_db_fetchall(query, tuple(params)):
+        site = dict(row)
+        site['last_crawled_str'] = format_timestamp(site['last_crawled'])
+        stats = get_source_stats(site['id'])
+        site.update(stats)
+        site['indexed_count'] = stats['indexed']
+        site['pending_count'] = stats['pending']
+        try:
+            site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+        except Exception:
+            site['aliases_list'] = []
+        sites.append(site)
+    return sites
+
+
+def recrawl_site(site_id):
+    """Queue every domain/url/sitemap/feed source belonging to a site."""
+    site = get_site_by_id(site_id)
+    if not site:
+        return False, 'Web nenalezen'
+    try:
+        site_id_result, added = phase_1_discovery(site['canonical_url'], site['max_pages'])
+        return True, f"Re-crawl zahájen ({added} URL ve frontě)"
+    except Exception as e:
+        log_error(f"Recrawl failed for site {site_id}", e)
+        return False, f"Re-crawl selhal: {e}"
 
 # ============================================================================
 # VECTOR SEARCH (hnswlib)
@@ -1141,6 +1601,47 @@ def phase_1_discovery(site_url, max_pages=500):
     # Update site max_pages
     execute_db("UPDATE sites SET max_pages = ? WHERE id = ?", (max_pages, site_id), commit=True)
 
+    # Ensure a domain source row exists for this site
+    if not execute_db_fetchone(
+        "SELECT id FROM site_sources WHERE site_id = ? AND source_type = 'domain'", (site_id,)
+    ):
+        try:
+            execute_db(
+                """INSERT INTO site_sources (site_id, url, source_type, priority, notes, status)
+                   VALUES (?, ?, 'domain', 5, '', 'active')""",
+                (site_id, domain), commit=True
+            )
+        except Exception as e:
+            log_error(f"Could not create domain source for site {site_id}", e)
+
+    # Manually registered sources take priority over auto-discovery
+    manual_sources = execute_db_fetchall(
+        "SELECT id, url, source_type, priority FROM site_sources "
+        "WHERE site_id = ? AND source_type != 'domain' AND status = 'active'",
+        (site_id,)
+    )
+    for source_row in manual_sources:
+        source_id, source_url, source_type, source_priority = source_row
+        try:
+            if source_type == 'url':
+                _queue_url(site_id, normalize_url(source_url), source_priority or 5)
+            elif source_type == 'sitemap':
+                for u in parse_sitemap(source_url):
+                    n = normalize_url(u)
+                    if n:
+                        _queue_url(site_id, n, 3)
+            elif source_type in FEED_SOURCE_TYPES:
+                for u in parse_feed(source_url):
+                    n = normalize_url(u)
+                    if n:
+                        _queue_url(site_id, n, 1)
+            execute_db(
+                "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
+                (source_id,), commit=True
+            )
+        except Exception as e:
+            log_error(f"Manual source {source_url} failed", e)
+
     discovered = discover_sitemaps_and_feeds(site_url, site_id, max_pages)
     urls_to_add = []
 
@@ -1425,8 +1926,13 @@ def check_feeds():
                 "UPDATE sitemaps_feeds SET last_checked=strftime('%s','now') WHERE id=?",
                 (feed_id,), commit=True
             )
+            execute_db(
+                "UPDATE site_sources SET last_checked=strftime('%s','now') WHERE site_id=? AND url=?",
+                (site_id, url), commit=True
+            )
         except Exception as e:
             print(f"Feed check error {url}: {e}")
+            log_error(f"Feed check error {url}", e)
 
 
 def check_sitemaps():
@@ -1443,8 +1949,13 @@ def check_sitemaps():
                 "UPDATE sitemaps_feeds SET last_checked=strftime('%s','now') WHERE id=?",
                 (sm_id,), commit=True
             )
+            execute_db(
+                "UPDATE site_sources SET last_checked=strftime('%s','now') WHERE site_id=? AND url=?",
+                (site_id, url), commit=True
+            )
         except Exception as e:
             print(f"Sitemap check error {url}: {e}")
+            log_error(f"Sitemap check error {url}", e)
 
 
 def recrawl_all_sites():
@@ -1647,153 +2158,8 @@ SEARCH_HTML = """
 </html>
 """
 
-ADMIN_HTML = """
-<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mini Search - Admin</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-             background:#1a1a2e;color:#e0e0e0;line-height:1.6;padding:20px}
-        .container{max-width:1200px;margin:0 auto}
-        h1{color:#e94560;margin-bottom:10px;font-size:1.8em}
-        .card{background:#16213e;border-radius:10px;padding:20px;margin-bottom:20px}
-        .card h3{color:#0f3460;margin-bottom:15px}
-        .btn{background:#e94560;color:#fff;border:none;padding:10px 20px;
-             border-radius:5px;cursor:pointer;font-size:1em;text-decoration:none;display:inline-block}
-        .btn:hover{background:#c81e45}
-        .btn-green{background:#4caf50}.btn-green:hover{background:#388e3c}
-        .btn-orange{background:#ff9800}.btn-orange:hover{background:#e68a00}
-        .btn-gray{background:#666}.btn-gray:hover{background:#555}
-        .form-group{margin-bottom:15px}
-        .form-group label{display:block;margin-bottom:5px;color:#0f3460}
-        .form-group input{width:100%;padding:10px;border-radius:5px;border:1px solid #333;
-                          background:#1a1a2e;color:#e0e0e0;font-size:1em}
-        table{width:100%;border-collapse:collapse}
-        th,td{padding:12px;text-align:left;border-bottom:1px solid #333}
-        th{background:#0f3460;color:#fff}
-        tr:hover{background:#1f2b4a}
-        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:15px}
-        .stat-card{background:#1a1a2e;padding:15px;border-radius:8px;text-align:center}
-        .stat-value{font-size:2em;font-weight:bold;color:#e94560}
-        .stat-label{color:#0f3460;font-size:.9em;margin-top:5px}
-        .nav a{color:#2196f3;margin-right:20px;text-decoration:none}
-        .msg{padding:10px 15px;border-radius:5px;margin-bottom:15px}
-        .msg-ok{background:#4caf5020;color:#4caf50}
-        .msg-err{background:#e9456020;color:#e94560}
-        .update-section{background:#16213e;padding:20px;border-radius:10px;margin-bottom:20px}
-        .update-section h3{color:#0f3460;margin-bottom:15px}
-        .update-info{display:flex;gap:20px;flex-wrap:wrap;margin-top:10px}
-        .update-item{background:#1a1a2e;padding:10px;border-radius:5px;min-width:200px}
-        .update-label{color:#666;font-size:.85em}
-        .update-value{color:#e0e0e0;font-size:1.1em;font-weight:bold}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="nav" style="margin-bottom:20px">
-        <a href="/">Vyhledavani</a>
-        <a href="/admin">Sprava</a>
-    </div>
-    <h1>Spravce</h1>
-    {% if request.args.get('success') %}
-    <div class="msg msg-ok">{{ request.args.get('success') }}</div>
-    {% endif %}
-    {% if request.args.get('error') %}
-    <div class="msg msg-err">{{ request.args.get('error') }}</div>
-    {% endif %}
-    
-    <div class="update-section">
-        <h3>Aktualizace</h3>
-        <div class="update-info">
-            <div class="update-item">
-                <div class="update-label">Aktualni commit:</div>
-                <div class="update-value">{{ update_status.current_commit[:8] if update_status.current_commit else 'N/A' }}</div>
-            </div>
-            <div class="update-item">
-                <div class="update-label">Posledni commit:</div>
-                <div class="update-value">{{ update_status.latest_commit[:8] if update_status.latest_commit else 'N/A' }}</div>
-            </div>
-            <div class="update-item">
-                <div class="update-label">Aktualizace dostupna:</div>
-                <div class="update-value">{{ 'Ano' if update_status.update_available else 'Ne' }}</div>
-            </div>
-            <div class="update-item">
-                <div class="update-label">Posledni kontrola:</div>
-                <div class="update-value">{{ update_status.last_check_str if update_status else 'Nikdy' }}</div>
-            </div>
-        </div>
-        <div style="margin-top:15px">
-            <a href="/admin/check-update" class="btn">Kontrolovat aktualizace</a>
-            {% if update_status.update_available %}
-            <a href="/admin/apply-update" class="btn btn-green" onclick="return confirm('Opravdu chcete aktualizovat?')">Aktualizovat</a>
-            {% endif %}
-        </div>
-    </div>
-    
-    <div class="card">
-        <h3>Prehled</h3>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">{{ stats.sites }}</div><div class="stat-label">Weby</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.pages }}</div><div class="stat-label">Indexovano</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.pending }}</div><div class="stat-label">Ceka</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.completed }}</div><div class="stat-label">Dokonceno</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.errors }}</div><div class="stat-label">Chyby</div></div>
-        </div>
-    </div>
-    <div class="card">
-        <h3>Pridat stranku</h3>
-        <form action="/admin/add" method="post">
-            <div class="form-group"><label>URL:</label>
-                <input type="url" name="url" placeholder="https://priklad.cz" required></div>
-            <div class="form-group"><label>Max. stranek (default 500):</label>
-                <input type="number" name="max_pages" value="500" min="1" max="10000"></div>
-            <button type="submit" class="btn btn-green">Pridat</button>
-        </form>
-    </div>
-    <div class="card">
-        <h3>Sledovane stranky</h3>
-        {% if sites %}
-        <table>
-            <thead><tr><th>ID</th><th>URL</th><th>Stav</th><th>Indexovano</th><th>Ceka</th><th>Posledni crawl</th><th>Akce</th></tr></thead>
-            <tbody>
-            {% for site in sites %}
-            <tr>
-                <td>{{ site.id }}</td>
-                <td>{{ site.canonical_url }}</td>
-                <td>{{ site.status }}</td>
-                <td>{{ site.indexed_count }}</td>
-                <td>{{ site.pending_count }}</td>
-                <td>{{ site.last_crawled_str }}</td>
-                <td>
-                    <a href="/admin/recrawl/{{ site.id }}" class="btn btn-orange" style="padding:5px 10px;font-size:.9em">Recrawl</a>
-                    <a href="/admin/delete/{{ site.id }}" class="btn btn-gray" style="padding:5px 10px;font-size:.9em"
-                       onclick="return confirm('Opravdu smazat?')">Smazat</a>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p style="color:#666">Zadne stranky. Pridejte prvni stranku vyse.</p>
-        {% endif %}
-    </div>
-</div>
-<script>
-    function checkPending(){
-        fetch('/admin/stats').then(r=>r.json()).then(d=>{
-            if(d.pending>0) setTimeout(()=>location.reload(),5000);
-        });
-    }
-    setInterval(checkPending,30000);
-    checkPending();
-</script>
-</body>
-</html>
-"""
+# Admin UI is rendered from templates/admin/*.html (Clay design).
+
 
 
 @app.route('/')
@@ -1827,41 +2193,413 @@ def autocomplete():
     return jsonify({'results': [row[0] for row in rows]})
 
 
+# ============================================================================
+# ADMIN UI (Clay panel, Google Search Console style)
+# ============================================================================
+
+ADMIN_PAGE_SIZE = 10
+
+
+def _admin_message():
+    """Read flash message from query string."""
+    if request.args.get('success'):
+        return request.args.get('success'), True
+    if request.args.get('error'):
+        return request.args.get('error'), False
+    return '', True
+
+
+def _page_url(page_number):
+    args = request.args.to_dict()
+    args['page'] = page_number
+    return '/admin/sites?' + urlencode(args)
+
+
+def _source_from_form(payload, require_site=True):
+    """Extract and coerce a source payload. Returns (data, error)."""
+    source_type = (payload.get('source_type') or '').strip()
+    if source_type not in VALID_SOURCE_TYPES:
+        return None, 'Neplatný typ zdroje'
+    url = (payload.get('url') or '').strip()
+    ok, message = validate_url(url)
+    if not ok:
+        return None, message
+    ok, message, priority = validate_priority(payload.get('priority', 5))
+    if not ok:
+        return None, message
+    data = {
+        'url': url,
+        'source_type': source_type,
+        'priority': priority,
+        'notes': (payload.get('notes') or '').strip(),
+    }
+    if require_site:
+        site_id = payload.get('site_id')
+        if not site_id:
+            return None, 'Vyberte doménu'
+        try:
+            data['site_id'] = int(site_id)
+        except (TypeError, ValueError):
+            return None, 'Neplatná doména'
+    elif payload.get('site_id'):
+        try:
+            data['site_id'] = int(payload['site_id'])
+        except (TypeError, ValueError):
+            return None, 'Neplatná doména'
+    if payload.get('max_pages') not in (None, ''):
+        ok, message, max_pages = validate_max_pages(payload['max_pages'])
+        if not ok:
+            return None, message
+        data['max_pages'] = max_pages
+    return data, None
+
+
 @app.route('/admin')
 def admin_index():
-    return render_template_string(ADMIN_HTML, stats=get_db_stats(), sites=get_all_sites(), 
-                                   update_status=get_update_status(), datetime=datetime)
+    message, ok = _admin_message()
+    return render_template(
+        'admin/dashboard.html',
+        active_page='dashboard',
+        stats=get_db_stats(),
+        sites=get_all_sites()[:6],
+        update_status=get_update_status(),
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/add', methods=['POST'])
-def admin_add_site():
-    url = request.form.get('url', '').strip()
-    max_pages = int(request.form.get('max_pages', 500))
-    if not url:
-        return redirect('/admin?error=URL je povinna')
-    site_id, added = phase_1_discovery(url, max_pages)
-    if site_id:
-        return redirect(f'/admin?success=Stranka pridana! {added} URL k prozkoumani')
-    return redirect('/admin?error=Chyba pri pridavani stranky')
+@app.route('/admin/sites')
+def admin_sites():
+    search = request.args.get('q', '').strip()
+    status = request.args.get('status', '').strip()
+    source_type = request.args.get('source_type', '').strip()
+
+    all_sites = get_filtered_sites(search=search, status=status, source_type=source_type)
+    total = len(all_sites)
+
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (TypeError, ValueError):
+        page = 1
+    pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = min(page, pages)
+    start = (page - 1) * ADMIN_PAGE_SIZE
+    page_sites = all_sites[start:start + ADMIN_PAGE_SIZE]
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/sites.html',
+        active_page='sites',
+        sites=page_sites,
+        total=total,
+        page=page,
+        pages=pages,
+        query=search,
+        status=status,
+        source_type=source_type,
+        build_page_url=_page_url,
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/recrawl/<int:site_id>')
-def admin_recrawl_site(site_id):
+@app.route('/admin/sites/<int:site_id>')
+def admin_site_detail(site_id):
     site = get_site_by_id(site_id)
-    if site:
-        phase_1_discovery(site['canonical_url'], site['max_pages'])
-    return redirect('/admin?success=Re-crawl zahajen')
+    if not site:
+        return redirect('/admin/sites?error=Web nenalezen')
+
+    try:
+        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+    except Exception:
+        site['aliases_list'] = []
+    site['last_crawled_str'] = format_timestamp(site['last_crawled'])
+
+    errors = [
+        dict(row) for row in execute_db_fetchall(
+            "SELECT url, error_reason, retry_count FROM crawl_queue "
+            "WHERE site_id = ? AND status = 'error' ORDER BY id DESC LIMIT 50",
+            (site_id,)
+        )
+    ]
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/site_detail.html',
+        active_page='sites',
+        site=site,
+        stats=get_source_stats(site_id),
+        sources=get_site_sources(site_id),
+        recent_pages=get_recent_pages(site_id, limit=15),
+        errors=errors,
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/delete/<int:site_id>')
-def admin_delete_site(site_id):
+@app.route('/admin/sites/<int:site_id>/edit', methods=['GET', 'POST'])
+def admin_site_edit(site_id):
+    site = get_site_by_id(site_id)
+    if not site:
+        return redirect('/admin/sites?error=Web nenalezen')
+
+    if request.method == 'POST':
+        ok, message = update_site(
+            site_id,
+            max_pages=request.form.get('max_pages'),
+            status=request.form.get('status'),
+            aliases=request.form.get('aliases', ''),
+        )
+        if ok:
+            return redirect(f'/admin/sites/{site_id}?success={message}')
+        return redirect(f'/admin/sites/{site_id}/edit?error={message}')
+
+    try:
+        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+    except Exception:
+        site['aliases_list'] = []
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/edit_site.html',
+        active_page='sites',
+        site=site,
+        max_pages_min=MAX_PAGES_MIN,
+        max_pages_max=MAX_PAGES_MAX,
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sites/<int:site_id>/recrawl')
+def admin_site_recrawl(site_id):
+    ok, message = recrawl_site(site_id)
+    key = 'success' if ok else 'error'
+    return redirect(f'/admin/sites/{site_id}?{key}={message}')
+
+
+@app.route('/admin/sites/<int:site_id>/delete')
+def admin_site_delete(site_id):
     delete_site(site_id)
-    return redirect('/admin?success=Stranka smazana')
+    return redirect('/admin/sites?success=Web byl smazán')
+
+
+@app.route('/admin/sources/new', methods=['GET'])
+def admin_source_new():
+    message, ok = _admin_message()
+    preselect = request.args.get('site_id', type=int)
+    return render_template(
+        'admin/add_source.html',
+        active_page='add',
+        sites=get_all_sites(),
+        preselect_site=preselect,
+        redirect_to=f'/admin/sites/{preselect}' if preselect else '/admin/sites',
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sites/<int:site_id>/sources/new', methods=['GET'])
+def admin_site_source_new(site_id):
+    message, ok = _admin_message()
+    return render_template(
+        'admin/add_source.html',
+        active_page='sites',
+        sites=get_all_sites(),
+        preselect_site=site_id,
+        redirect_to=f'/admin/sites/{site_id}',
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sources/<int:source_id>/edit', methods=['GET'])
+def admin_source_edit(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return redirect('/admin/sites?error=Zdroj nenalezen')
+    site = get_site_by_id(source['site_id']) or {}
+    message, ok = _admin_message()
+    return render_template(
+        'admin/edit_source.html',
+        active_page='sites',
+        source=source,
+        max_pages=site.get('max_pages', 500),
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/recrawl-all')
+def admin_recrawl_all():
+    count = 0
+    for site in get_all_sites():
+        if site['status'] == 'active':
+            recrawl_site(site['id'])
+            count += 1
+    return redirect(f'/admin?success=Recrawl zahájen pro {count} webů')
+
+
+@app.route('/admin/pause-all')
+def admin_pause_all():
+    execute_db("UPDATE sites SET status='paused' WHERE status='active'", commit=True)
+    return redirect('/admin?success=Všechny aktivní weby byly pozastaveny')
+
+
+@app.route('/admin/resume-all')
+def admin_resume_all():
+    execute_db("UPDATE sites SET status='active' WHERE status='paused'", commit=True)
+    return redirect('/admin?success=Všechny pozastavené weby byly obnoveny')
+
+
+@app.route('/admin/search')
+def admin_search():
+    query = request.args.get('q', '').strip()
+    filter_type = request.args.get('filter', 'all')
+    results = []
+    if query:
+        results = hybrid_search(query, limit=50,
+                                filter_type=filter_type if filter_type != 'all' else None)
+    message, ok = _admin_message()
+    return render_template(
+        'admin/search.html',
+        active_page='search',
+        query=query,
+        results=results,
+        current_filter=filter_type,
+        message=message,
+        message_ok=ok,
+    )
+
+
+# ---------------------------- JSON API ------------------------------------
+
+@app.route('/admin/api/sources', methods=['GET'])
+def api_sources_list():
+    site_id = request.args.get('site_id', type=int)
+    source_type = request.args.get('source_type', '').strip()
+    if site_id:
+        sources = get_site_sources(site_id)
+    else:
+        sources = get_all_sources()
+    if source_type:
+        sources = [s for s in sources if s.get('source_type') == source_type]
+    return jsonify({'sources': sources, 'count': len(sources)})
+
+
+@app.route('/admin/api/sources', methods=['POST'])
+def api_sources_create():
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    data, error = _source_from_form(payload, require_site=False)
+    if error:
+        return jsonify({'error': error}), 400
+
+    site_id = data.pop('site_id', None)
+    max_pages = data.pop('max_pages', None)
+
+    if site_id is None:
+        if data['source_type'] != 'domain':
+            # Auto-create the parent domain from the supplied URL
+            site_id = add_site(data['url'], 500)
+            if not site_id:
+                return jsonify({'error': 'Doménu nebylo možné vytvořit'}), 400
+        else:
+            site_id = 0
+
+    source_id, error = add_source(site_id, **data)
+    if error:
+        return jsonify({'error': error}), 400
+
+    if max_pages is not None:
+        source = get_source_by_id(source_id)
+        if source:
+            update_site(source['site_id'], max_pages=max_pages)
+
+    return jsonify({'id': source_id, 'message': 'Zdroj byl přidán'}), 201
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['GET'])
+def api_source_get(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return jsonify({'error': 'Zdroj nenalezen'}), 404
+    return jsonify(source)
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['PUT', 'PATCH'])
+def api_source_update(source_id):
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    allowed = ('url', 'source_type', 'priority', 'notes', 'status', 'max_pages')
+    kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
+    ok, message = update_source(source_id, **kwargs)
+    if not ok:
+        return jsonify({'error': message}), 400
+    return jsonify({'message': message, 'source': get_source_by_id(source_id)})
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['DELETE'])
+def api_source_delete(source_id):
+    ok, message = delete_source(source_id)
+    if not ok:
+        return jsonify({'error': message}), 404
+    return jsonify({'message': message})
+
+
+@app.route('/admin/api/sites', methods=['GET'])
+def api_sites_list():
+    search = request.args.get('q', '').strip()
+    status = request.args.get('status', '').strip()
+    source_type = request.args.get('source_type', '').strip()
+    return jsonify({'sites': get_filtered_sites(search, status, source_type)})
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['GET'])
+def api_site_get(site_id):
+    site = get_site_by_id(site_id)
+    if not site:
+        return jsonify({'error': 'Web nenalezen'}), 404
+    site['stats'] = get_source_stats(site_id)
+    site['sources'] = get_site_sources(site_id)
+    return jsonify(site)
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['PUT', 'PATCH'])
+def api_site_update(site_id):
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    allowed = ('max_pages', 'status', 'aliases')
+    kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
+    ok, message = update_site(site_id, **kwargs)
+    if not ok:
+        return jsonify({'error': message}), 400
+    return jsonify({'message': message, 'site': get_site_by_id(site_id)})
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['DELETE'])
+def api_site_delete(site_id):
+    if not get_site_by_id(site_id):
+        return jsonify({'error': 'Web nenalezen'}), 404
+    delete_site(site_id)
+    return jsonify({'message': 'Web byl smazán'})
+
+
+@app.route('/admin/api/stats')
+def api_stats():
+    stats = get_db_stats()
+    stats['sources'] = execute_db_fetchone("SELECT COUNT(*) FROM site_sources")[0]
+    return jsonify(stats)
+
+
+@app.route('/admin/api/sources/<int:source_id>/stats')
+def api_source_stats(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return jsonify({'error': 'Zdroj nenalezen'}), 404
+    return jsonify(get_source_stats(source['site_id']))
 
 
 @app.route('/admin/stats')
 def admin_stats():
-    return jsonify(get_db_stats())
+    return api_stats()
 
 
 @app.route('/admin/errors/<int:site_id>')
@@ -1878,28 +2616,28 @@ def admin_check_update():
     try:
         available, msg = check_for_update()
         if available:
-            return redirect('/admin?success=Aktualizace je dostupna! ' + msg)
-        else:
-            return redirect('/admin?success=Zadna aktualizace neni dostupna. ' + msg)
+            return redirect('/admin?success=Aktualizace je dostupná! ' + msg)
+        return redirect('/admin?success=Žádná aktualizace není dostupná. ' + msg)
     except Exception as e:
-        return redirect(f'/admin?error=Chyba pri kontrole aktualizace: {str(e)}')
+        log_error('Update check failed', e)
+        return redirect(f'/admin?error=Chyba při kontrole aktualizace: {str(e)}')
 
 
 @app.route('/admin/apply-update')
 def admin_apply_update():
     try:
         success, msg = apply_update()
-        if success:
-            return redirect('/admin?success=' + msg)
-        else:
-            return redirect('/admin?error=' + msg)
+        key = 'success' if success else 'error'
+        return redirect(f'/admin?{key}={msg}')
     except Exception as e:
-        return redirect(f'/admin?error=Chyba pri aktualizaci: {str(e)}')
+        log_error('Apply update failed', e)
+        return redirect(f'/admin?error=Chyba při aktualizaci: {str(e)}')
 
 
 @app.route('/admin/update-status')
 def admin_update_status():
     return jsonify(get_update_status())
+
 
 
 # ============================================================================

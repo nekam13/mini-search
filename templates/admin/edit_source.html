@@ -1,0 +1,57 @@
+{% extends "admin/base.html" %}
+{% block title %}Editovat zdroj{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>Editovat zdroj</h2>
+        <span class="badge badge-type">{{ source.source_type }}</span>
+    </div>
+    <form id="source-form"
+          data-endpoint="/admin/api/sources/{{ source.id }}"
+          data-method="PUT"
+          data-redirect="/admin/sites/{{ source.site_id }}">
+        <div class="form-group">
+            <label for="url">URL zdroje</label>
+            <input type="text" id="url" name="url" value="{{ source.url }}" required>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="source_type">Typ zdroje</label>
+                <select id="source_type" name="source_type">
+                    {% for type in ['domain', 'url', 'sitemap', 'feed', 'rss', 'atom'] %}
+                    <option value="{{ type }}" {% if source.source_type == type %}selected{% endif %}>{{ type }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="priority">Priorita (1–10)</label>
+                <input type="number" id="priority" name="priority" value="{{ source.priority }}" min="1" max="10">
+            </div>
+            <div class="form-group">
+                <label for="max_pages">Max. stránek domény (1–10000)</label>
+                <input type="number" id="max_pages" name="max_pages" value="{{ max_pages }}" min="1" max="10000">
+            </div>
+            <div class="form-group">
+                <label for="status">Stav zdroje</label>
+                <select id="status" name="status">
+                    {% for state in ['active', 'paused', 'blocked'] %}
+                    <option value="{{ state }}" {% if source.status == state %}selected{% endif %}>{{ state }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="notes">Poznámka</label>
+            <textarea id="notes" name="notes">{{ source.notes }}</textarea>
+        </div>
+
+        <div class="actions">
+            <button type="submit" class="btn btn-primary">Uložit změny</button>
+            <a href="/admin/sites/{{ source.site_id }}" class="btn btn-ghost">Zpět na detail</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

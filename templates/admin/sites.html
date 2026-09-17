@@ -1,0 +1,111 @@
+{% extends "admin/base.html" %}
+{% block title %}Weby a zdroje{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header"><h2>Vyhledávání a filtry</h2></div>
+    <form method="get" action="/admin/sites" class="filter-bar">
+        <div>
+            <label for="q">Název nebo doména</label>
+            <input type="search" id="q" name="q" value="{{ query }}" placeholder="např. example.com">
+        </div>
+        <div>
+            <label for="status">Stav</label>
+            <select id="status" name="status">
+                <option value="">Vše</option>
+                <option value="active" {% if status == 'active' %}selected{% endif %}>Aktivní</option>
+                <option value="blocked" {% if status == 'blocked' %}selected{% endif %}>Blokováno</option>
+                <option value="paused" {% if status == 'paused' %}selected{% endif %}>Pozastaveno</option>
+            </select>
+        </div>
+        <div>
+            <label for="source_type">Typ zdroje</label>
+            <select id="source_type" name="source_type">
+                <option value="">Vše</option>
+                <option value="domain" {% if source_type == 'domain' %}selected{% endif %}>Doména</option>
+                <option value="url" {% if source_type == 'url' %}selected{% endif %}>URL</option>
+                <option value="sitemap" {% if source_type == 'sitemap' %}selected{% endif %}>Sitemap</option>
+                <option value="rss" {% if source_type == 'rss' %}selected{% endif %}>RSS</option>
+                <option value="atom" {% if source_type == 'atom' %}selected{% endif %}>Atom</option>
+                <option value="feed" {% if source_type == 'feed' %}selected{% endif %}>Feed</option>
+            </select>
+        </div>
+        <div class="actions" style="margin:0">
+            <button type="submit" class="btn btn-primary">Filtrovat</button>
+            <a href="/admin/sites" class="btn btn-ghost">Zrušit</a>
+        </div>
+    </form>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h2>Weby ({{ total }})</h2>
+        <a href="/admin/sources/new" class="btn btn-primary btn-sm">Přidat zdroj</a>
+    </div>
+
+    {% if sites %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+            <tr>
+                <th>Doména</th><th>Stav</th><th>Indexováno</th><th>Čeká</th>
+                <th>Chyby</th><th>Zdroje</th><th>Poslední crawl</th><th>Akce</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for site in sites %}
+            <tr>
+                <td>
+                    <a href="/admin/sites/{{ site.id }}"><strong>{{ site.canonical_url }}</strong></a>
+                    {% if site.aliases_list %}
+                    <div class="muted" style="font-size:.8rem">{{ site.aliases_list | join(', ') }}</div>
+                    {% endif %}
+                </td>
+                <td><span class="badge status-{{ site.status }}">
+                    {% if site.status == 'active' %}Aktivní{% elif site.status == 'blocked' %}Blokováno{% else %}Pozastaveno{% endif %}
+                </span></td>
+                <td>{{ site.indexed }}</td>
+                <td>{{ site.pending }}</td>
+                <td>{{ site.errors }}</td>
+                <td>{{ site.sources }}</td>
+                <td>{{ site.last_crawled_str }}</td>
+                <td>
+                    <div class="actions" style="margin:0">
+                        <a href="/admin/sites/{{ site.id }}/edit" class="btn btn-secondary btn-sm">Editovat</a>
+                        <a href="/admin/sites/{{ site.id }}/recrawl" class="btn btn-primary btn-sm">Recrawl</a>
+                        {% if site.status == 'active' %}
+                        <button class="btn btn-accent btn-sm" data-toggle-status="paused" data-site-id="{{ site.id }}">Pauza</button>
+                        {% else %}
+                        <button class="btn btn-accent btn-sm" data-toggle-status="active" data-site-id="{{ site.id }}">Obnovit</button>
+                        {% endif %}
+                        <a href="/admin/sites/{{ site.id }}/delete" class="btn btn-danger btn-sm"
+                           onclick="return confirm('Smazat web včetně všech stránek?')">Smazat</a>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if pages > 1 %}
+    <nav class="pagination">
+        {% if page > 1 %}
+        <a href="{{ build_page_url(page - 1) }}">Předchozí</a>
+        {% else %}
+        <span class="disabled">Předchozí</span>
+        {% endif %}
+        <span class="current">{{ page }} / {{ pages }}</span>
+        {% if page < pages %}
+        <a href="{{ build_page_url(page + 1) }}">Další</a>
+        {% else %}
+        <span class="disabled">Další</span>
+        {% endif %}
+    </nav>
+    {% endif %}
+
+    {% else %}
+    <p class="table-empty">Žádné weby neodpovídají filtru.</p>
+    {% endif %}
+</div>
+{% endblock %}

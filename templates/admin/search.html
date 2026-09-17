@@ -1,0 +1,55 @@
+{% extends "admin/base.html" %}
+{% block title %}Hledat v indexu{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header"><h2>Hledat v indexovaných stránkách</h2></div>
+    <form method="get" action="/admin/search" class="filter-bar">
+        <div>
+            <label for="q">Dotaz</label>
+            <input type="search" id="q" name="q" value="{{ query }}" placeholder="Hledaný výraz">
+        </div>
+        <div>
+            <label for="filter">Filtr</label>
+            <select id="filter" name="filter">
+                {% for value, label in [('all','Vše'), ('articles','Články'), ('podcasts','Podcasty'), ('audio','Audio'), ('price','Ceny')] %}
+                <option value="{{ value }}" {% if current_filter == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div></div>
+        <div class="actions" style="margin:0">
+            <button type="submit" class="btn btn-primary">Hledat</button>
+        </div>
+    </form>
+</div>
+
+{% if query %}
+<div class="card">
+    <div class="card-header">
+        <h3>Výsledky pro „{{ query }}“</h3>
+        <span class="muted">{{ results | length }} výsledků</span>
+    </div>
+    {% if results %}
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Titulek</th><th>URL</th><th>Typ</th><th>Relevance</th><th>SEO</th></tr></thead>
+            <tbody>
+            {% for result in results %}
+            <tr>
+                <td>{{ result.og_title or result.title or result.url }}</td>
+                <td><a href="{{ result.url }}" target="_blank" rel="noopener">{{ result.url }}</a></td>
+                <td>{% if result.schema_type %}<span class="badge badge-type">{{ result.schema_type }}</span>{% endif %}</td>
+                <td><span class="badge badge-accent">{{ result.relevance }}%</span></td>
+                <td>{{ '%.0f' | format(result.seo_score or 0) }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="table-empty">Žádné výsledky.</p>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

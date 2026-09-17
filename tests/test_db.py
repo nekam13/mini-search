@@ -11,7 +11,8 @@ DB_SCHEMA = {
     'sitemaps_feeds': "CREATE TABLE IF NOT EXISTS sitemaps_feeds (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT, type TEXT, last_checked INTEGER DEFAULT 0, recursion_depth INTEGER DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
     'pages': "CREATE TABLE IF NOT EXISTS pages (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT UNIQUE, url_hash TEXT, title TEXT DEFAULT '', og_title TEXT DEFAULT '', og_description TEXT DEFAULT '', og_image TEXT DEFAULT '', favicon_url TEXT DEFAULT '', body_text TEXT DEFAULT '', images TEXT DEFAULT '[]', schema_type TEXT DEFAULT '', schema_details TEXT DEFAULT '{}', audio_url TEXT DEFAULT '', has_audio INTEGER DEFAULT 0, published_timestamp INTEGER DEFAULT 0, embedding BLOB, indexed_at INTEGER DEFAULT 0, seo_score REAL DEFAULT 0.0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
     'pages_fts': "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(page_id, title, body_text, og_title, og_description, url, schema_type)",
-    'update_status': "CREATE TABLE IF NOT EXISTS update_status (id INTEGER PRIMARY KEY AUTOINCREMENT, last_check INTEGER DEFAULT 0, current_commit TEXT DEFAULT '', latest_commit TEXT DEFAULT '', update_available INTEGER DEFAULT 0, last_update_time INTEGER DEFAULT 0, last_update_result TEXT DEFAULT '')"
+    'update_status': "CREATE TABLE IF NOT EXISTS update_status (id INTEGER PRIMARY KEY AUTOINCREMENT, last_check INTEGER DEFAULT 0, current_commit TEXT DEFAULT '', latest_commit TEXT DEFAULT '', update_available INTEGER DEFAULT 0, last_update_time INTEGER DEFAULT 0, last_update_result TEXT DEFAULT '')",
+    'site_sources': "CREATE TABLE IF NOT EXISTS site_sources (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER NOT NULL, url TEXT NOT NULL, source_type TEXT NOT NULL CHECK(source_type IN ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')), priority INTEGER DEFAULT 5, notes TEXT DEFAULT '', last_checked INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_at INTEGER DEFAULT (strftime('%s','now')), FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)"
 }
 
 DB_INDEXES = [
@@ -54,6 +55,7 @@ def test_db_schema():
     assert 'pages' in tables
     assert 'pages_fts' in tables
     assert 'update_status' in tables
+    assert 'site_sources' in tables
     
     conn.close()
     print("Test 1: DB Schema (v7.0) - PASSED")
@@ -209,6 +211,49 @@ def test_fts5_czech():
     print("Test 7: FTS5 Czech Support - PASSED")
 
 
+def test_site_sources_table():
+    """Test 8: site_sources hierarchy and cascade"""
+    conn = sqlite3.connect(":memory:")
+    _init_schema(conn)
+
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("INSERT INTO sites (canonical_url) VALUES ('https://example.com')")
+    site_id = cursor.lastrowid
+
+    cursor.execute(
+        "INSERT INTO site_sources (site_id, url, source_type, priority, notes) VALUES (?, ?, 'domain', 5, '')",
+        (site_id, "example.com"))
+    cursor.execute(
+        "INSERT INTO site_sources (site_id, url, source_type, priority, notes) VALUES (?, ?, 'sitemap', 3, 'test')",
+        (site_id, "https://example.com/sitemap.xml"))
+    cursor.execute(
+        "INSERT INTO site_sources (site_id, url, source_type) VALUES (?, ?, 'rss')",
+        (site_id, "https://example.com/feed.xml"))
+    conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM site_sources WHERE site_id = ?", (site_id,))
+    assert cursor.fetchone()[0] == 3
+
+    # Invalid source type must be rejected by CHECK constraint
+    try:
+        cursor.execute(
+            "INSERT INTO site_sources (site_id, url, source_type) VALUES (?, ?, 'bogus')",
+            (site_id, "https://example.com/x"))
+        raise AssertionError("CHECK constraint did not reject invalid source_type")
+    except sqlite3.IntegrityError:
+        pass
+
+    # Cascade delete
+    cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
+    conn.commit()
+    cursor.execute("SELECT COUNT(*) FROM site_sources WHERE site_id = ?", (site_id,))
+    assert cursor.fetchone()[0] == 0
+
+    conn.close()
+    print("Test 8: site_sources Table - PASSED")
+
+
 if __name__ == "__main__":
     test_db_schema()
     test_db_indexes()
@@ -217,4 +262,5 @@ if __name__ == "__main__":
     test_new_columns()
     test_foreign_keys_cascade()
     test_fts5_czech()
-    print("\nVsech 7 testu prochazi!")
+    test_site_sources_table()
+    print("\nVsech 8 testu prochazi!")

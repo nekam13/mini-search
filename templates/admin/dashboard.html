@@ -1,0 +1,101 @@
+{% extends "admin/base.html" %}
+{% block title %}Přehled{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>Globální přehled</h2>
+        <span class="muted">Aktualizováno průběžně</span>
+    </div>
+    <div class="stats-grid" id="global-stats">
+        <div class="stat-card">
+            <div class="stat-value" data-stat="sites">{{ stats.sites }}</div>
+            <div class="stat-label">Weby</div>
+        </div>
+        <div class="stat-card secondary">
+            <div class="stat-value" data-stat="pages">{{ stats.pages }}</div>
+            <div class="stat-label">Indexované stránky</div>
+        </div>
+        <div class="stat-card accent">
+            <div class="stat-value" data-stat="pending">{{ stats.pending }}</div>
+            <div class="stat-label">Čekající URL</div>
+        </div>
+        <div class="stat-card danger">
+            <div class="stat-value" data-stat="errors">{{ stats.errors }}</div>
+            <div class="stat-label">Chyby</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" data-stat="sources">{{ stats.sources }}</div>
+            <div class="stat-label">Zdroje celkem</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h2>Rychlé akce</h2></div>
+    <div class="actions">
+        <a href="/admin/sources/new" class="btn btn-primary">Přidat web nebo zdroj</a>
+        <a href="/admin/recrawl-all" class="btn btn-secondary"
+           onclick="return confirm('Zahájit recrawl všech aktivních webů?')">Recrawl všech webů</a>
+        <a href="/admin/pause-all" class="btn btn-accent"
+           onclick="return confirm('Pozastavit všechny aktivní weby?')">Pozastavit vše</a>
+        <a href="/admin/resume-all" class="btn btn-ghost"
+           onclick="return confirm('Obnovit všechny pozastavené weby?')">Obnovit vše</a>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h2>Stav aktualizací</h2></div>
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value" style="font-size:1.1rem">{{ update_status.current_commit[:8] if update_status.current_commit else 'N/A' }}</div><div class="stat-label">Aktuální commit</div></div>
+        <div class="stat-card secondary"><div class="stat-value" style="font-size:1.1rem">{{ update_status.latest_commit[:8] if update_status.latest_commit else 'N/A' }}</div><div class="stat-label">Poslední commit</div></div>
+        <div class="stat-card {% if update_status.update_available %}accent{% endif %}"><div class="stat-value" style="font-size:1.1rem">{{ 'Ano' if update_status.update_available else 'Ne' }}</div><div class="stat-label">Aktualizace dostupná</div></div>
+        <div class="stat-card"><div class="stat-value" style="font-size:1.1rem">{{ update_status.last_check_str }}</div><div class="stat-label">Poslední kontrola</div></div>
+    </div>
+    <div class="actions">
+        <a href="/admin/check-update" class="btn btn-secondary">Zkontrolovat aktualizace</a>
+        {% if update_status.update_available %}
+        <a href="/admin/apply-update" class="btn btn-primary"
+           onclick="return confirm('Opravdu provést aktualizaci?')">Aktualizovat</a>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h2>Weby</h2>
+        <a href="/admin/sites" class="btn btn-ghost btn-sm">Zobrazit všechny</a>
+    </div>
+    {% if sites %}
+    <div class="site-grid">
+        {% for site in sites %}
+        <div class="card site-card">
+            <div class="card-header">
+                <h3><a href="/admin/sites/{{ site.id }}">{{ site.canonical_url }}</a></h3>
+                <span class="badge status-{{ site.status }}">
+                    {% if site.status == 'active' %}Aktivní{% elif site.status == 'blocked' %}Blokováno{% else %}Pozastaveno{% endif %}
+                </span>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-value">{{ site.indexed }}</div><div class="stat-label">Indexováno</div></div>
+                <div class="stat-card secondary"><div class="stat-value">{{ site.pending }}</div><div class="stat-label">Čeká</div></div>
+                <div class="stat-card danger"><div class="stat-value">{{ site.errors }}</div><div class="stat-label">Chyby</div></div>
+                <div class="stat-card accent"><div class="stat-value">{{ site.sources }}</div><div class="stat-label">Zdroje</div></div>
+            </div>
+            <div class="meta" style="margin-top:10px">
+                <span>Poslední crawl: {{ site.last_crawled_str }}</span>
+                <span>Max. stránek: {{ site.max_pages }}</span>
+            </div>
+            <div class="actions">
+                <a href="/admin/sites/{{ site.id }}/edit" class="btn btn-secondary btn-sm">Editovat</a>
+                <a href="/admin/sites/{{ site.id }}/recrawl" class="btn btn-primary btn-sm">Recrawl</a>
+                <a href="/admin/sites/{{ site.id }}" class="btn btn-accent btn-sm">Detail</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="table-empty">Zatím žádné weby. <a href="/admin/sources/new">Přidejte první zdroj</a>.</p>
+    {% endif %}
+</div>
+{% endblock %}

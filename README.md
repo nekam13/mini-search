@@ -2,7 +2,7 @@
 
 Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje stránky, ukládá jejich metadata a text do SQLite a používá vektorové vyhledávání pro sémanticky podobné výsledky.
 
-> **Aktuální vývojová větev: `beta-optimized` (v7.0)**
+> **Aktuální vývojová větev: `beta-optimized` (v7.1)**
 
 ## Funkce
 
@@ -14,8 +14,10 @@ Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje
 - **FTS5 full-text vyhledávání** s podporou češtiny (unicode61 tokenizer)
 - Extrakce titulků, Open Graph metadat, textu, obrázků, audio odkazů a JSON-LD schema.org dat
 - Filtry pro články, podcasty, audio a stránky s cenami
-- Autocomplete nad názvy indexovaných stránek
-- **Správcovské rozhraní** s podporou aktualizací
+- **Autocomplete** nad názvy indexovaných stránek
+- **Moderní admin panel (Clay design)**: dashboard, správa webů a zdrojů, vyhledávání v indexu, hromadné akce
+- **Hierarchická správa zdrojů**: domény, konkrétní URL, sitemapy, RSS/Atom feedy
+- **REST API** pro zdroje, weby a statistiky
 - Pravidelné kontroly RSS feedů, sitemap a opakované procházení aktivních webů
 - Ošetření HTTP 429 (`Retry-After`) a HTTP 403 (označení webu jako blokovaného)
 - **Nedestruktivní recrawl** s respektováním max_pages
@@ -110,10 +112,96 @@ cd ~/mini-search
 ## Použití
 
 1. Otevřete `http://127.0.0.1:8070/admin`.
-2. Do formuláře vložíte URL webu a nastavte maximální počet stránek.
-3. Aplikace najde sitemapu nebo feed; pokud je nenajde, pokusí se získat odkazy z domovské stránky.
+2. Na dashboardu klikněte na **Přidat zdroj**.
+3. Vyberte existující doménu, nebo ponechte „— nová doména —" a zadejte plnou URL. Typ zdroje se předvyplní automaticky podle adresy.
 4. Workery postupně stahují povolené stránky a ukládají je do lokálního indexu.
 5. Vyhledávejte na `http://127.0.0.1:8070/` přirozeným jazykem, česky i dalšími jazyky podporovanými použitým modelem.
+
+## Admin panel (Clay design)
+
+Admin rozhraní je postavené na Flask šablonách (`templates/admin/`) a statických souborech
+(`static/css/admin.css`, `static/js/admin.js`). Nahrazuje původní inline `ADMIN_HTML`.
+
+| Stránka | URL | Popis |
+|---|---|---|
+| Přehled | `/admin` | Globální statistiky, rychlé akce, poslední weby |
+| Weby a zdroje | `/admin/sites` | Filtrování, stránkování, správa webů |
+| Detail webu | `/admin/sites/<id>` | Statistiky, seznam zdrojů, naposledy indexované stránky, chyby |
+| Editace webu | `/admin/sites/<id>/edit` | `max_pages`, status, aliasy |
+| Přidat zdroj | `/admin/sources/new` | Doména, URL, sitemap, RSS/Atom feed |
+| Editace zdroje | `/admin/sources/<id>/edit` | URL, typ, priorita, poznámka, `max_pages` |
+| Hledat v indexu | `/admin/search` | Fulltext/hybridní vyhledávání v indexovaných stránkách |
+
+### Hierarchie zdrojů
+
+Každý web (doména) může mít pod sebou libovolný počet zdrojů. Typy zdrojů:
+
+| Typ | Popis |
+|---|---|
+| `domain` | Kanonická doména, zakládá záznam v `sites` |
+| `url` | Konkrétní stránka, která se má indexovat přednostně |
+| `sitemap` | Sitemap ke zpracování v rámci discovery |
+| `feed`, `rss`, `atom` | RSS/Atom feed pro průběžné kontroly novinek |
+
+Každý zdroj má `priority` (1–10), volitelnou `notes` a `status`. Manuálně přidané
+sitemapy a feedy zpracovává jak `phase_1_discovery()`, tak plánovač
+(`check_feeds`, `check_sitemaps`).
+
+### Hromadné akce
+
+- `/admin/recrawl-all` – zahájí recrawl všech aktivních webů
+- `/admin/pause-all` – pozastaví všechny aktivní weby
+- `/admin/resume-all` – obnoví všechny pozastavené weby
+
+### Ověřování aktualizací
+
+- `/admin/update-status` – JSON stav kontroly aktualizací
+- `/admin/stats` – JSON statistiky indexu (kompatibilní s v6.1)
+
+## REST API
+
+Všechny endpointy vrací JSON a používají parametrizované dotazy (ochrana proti SQL injection).
+Šablony escapují výstup (ochrana proti XSS).
+
+| Metoda | Endpoint | Popis |
+|---|---|---|
+| `GET` | `/admin/api/sources` | Seznam zdrojů (volitelně `?site_id=`, `?source_type=`) |
+| `POST` | `/admin/api/sources` | Přidat zdroj (JSON nebo form) |
+| `GET` | `/admin/api/sources/<id>` | Detail zdroje |
+| `PUT` | `/admin/api/sources/<id>` | Editace zdroje (`url`, `source_type`, `priority`, `notes`, `status`, `max_pages`) |
+| `DELETE` | `/admin/api/sources/<id>` | Smazat zdroj |
+| `GET` | `/admin/api/sources/<id>/stats` | Statistiky zdroje |
+| `GET` | `/admin/api/sites` | Seznam webů (filtry `q`, `status`, `source_type`) |
+| `GET` | `/admin/api/sites/<id>` | Detail webu včetně zdrojů a statistik |
+| `PUT` | `/admin/api/sites/<id>` | Editace webu (`max_pages`, `status`, `aliases`) |
+| `DELETE` | `/admin/api/sites/<id>` | Smazat web (kaskádově i zdroje) |
+| `GET` | `/admin/api/stats` | Globální statistiky |
+
+Příklad:
+
+```bash
+curl -X POST http://127.0.0.1:8070/admin/api/sources \
+  -H "Content-Type: application/json" \
+  -d '{"site_id": 1, "url": "https://example.com/sitemap.xml", "source_type": "sitemap", "priority": 7}'
+```
+
+## Validace a bezpečnost
+
+- URL musí být platná (přijímá se doména i plná adresa včetně schématu).
+- `max_pages` musí být celé číslo v rozsahu 1–10000.
+- Priorita musí být celé číslo v rozsahu 1–10.
+- URL musí být v rámci domény unikátní; duplicity jsou odmítnuty.
+- Neplatný typ zdroje je odmítnut na úrovni aplikace i databázového `CHECK` constraintu.
+- Chyby se logují do souboru (viz `ERROR_LOG_PATH`).
+
+## Testy
+
+```bash
+python3 tests/test_db.py                     # schéma, indexy, FTS5, site_sources
+python3 tests/test_admin.py                  # admin stránky a JSON API
+python3 tests/test_admin_panel.py            # kompletní end-to-end testy admin panelu
+python3 tests/test_discovery_integration.py  # napojení zdrojů na discovery a plánovač
+```
 
 ## Filtry ve vyhledávání
 
@@ -258,14 +346,17 @@ FTS5 je dostupné od SQLite 3.9.0 (2015).
 - Model i PyTorch mohou na telefonu zabrat významné množství úložiště a RAM.
 - **Důležité**: Při aktualizaci se databáze nemazá! Všechny indexované stránky a embeddingy zůstávají zachovány.
 
-## Migrace z v6.1
+## Migrace z v6.1 / v7.0
 
-Při prvním spuštění v7.0 dojde k automatické migraci:
+Automatická migrace probíhá při prvním spuštění:
 1. Přidají se nové sloupce do existujících tabulek (crawl_delay, scheduled_at, seo_score, recursion_depth)
 2. Vytvoří se nová tabulka `pages_fts` pro full-text vyhledávání
 3. Vytvoří se nová tabulka `update_status` pro sledování aktualizací
-4. Vytvoří se triggery pro automatickou synchronizaci FTS5
-5. Provede se backfill FTS5 tabulky z existujících dat
+4. Vytvoří se nová tabulka `site_sources` pro hierarchickou správu zdrojů
+5. Vytvoří se triggery pro automatickou synchronizaci FTS5
+6. Provede se backfill FTS5 tabulky z existujících dat
+7. Stávající weby se převedou na zdroj typu `domain` a existující `sitemaps_feeds`
+   se převedou do `site_sources` (idempotentně, tedy bez duplicit při opakovaném spuštění)
 
 **Žádná data nebudou smazána!**
 

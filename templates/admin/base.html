@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Správa indexu{% endblock %} · Mini Search</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+</head>
+<body>
+<div class="layout">
+    <header class="topbar">
+        <div class="brand">
+            <div class="logo">M</div>
+            <div>
+                <h1>Mini Search</h1>
+                <div class="subtitle">Správa indexu a zdrojů</div>
+            </div>
+        </div>
+        <nav class="topnav">
+            <a href="/admin" class="{% if active_page == 'dashboard' %}active{% endif %}">Přehled</a>
+            <a href="/admin/sites" class="{% if active_page == 'sites' %}active{% endif %}">Weby a zdroje</a>
+            <a href="/admin/sources/new" class="{% if active_page == 'add' %}active{% endif %}">Přidat zdroj</a>
+            <a href="/admin/search" class="{% if active_page == 'search' %}active{% endif %}">Hledat v indexu</a>
+            <a href="/">Vyhledávání</a>
+        </nav>
+    </header>
+
+    <div id="flash" class="msg {% if message_ok is defined and message_ok %}msg-ok{% else %}msg-err{% endif %}"
+         style="{% if not message %}display:none{% endif %}">{{ message }}</div>
+
+    {% block content %}{% endblock %}
+
+    <footer class="card" style="text-align:center;color:#666;font-size:.85rem">
+        Mini Search v7.1 · Clay admin panel
+    </footer>
+</div>
+<script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+</body>
+</html>
