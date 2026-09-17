@@ -2,7 +2,7 @@
 
 Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje stránky, ukládá jejich metadata a text do SQLite a používá vektorové vyhledávání pro sémanticky podobné výsledky.
 
-> **Aktuální vývojová větev: `beta-optimized` (v7.2)**
+> **Aktuální vývojová větev: `beta-optimized` (v7.3)**
 
 ## Funkce
 
@@ -135,6 +135,12 @@ Prvky rozhraní:
 | Stránkování | 25 výsledků na stránku, parametr `page` (nad 500 výsledků se nepokračuje) |
 | Prázdné stavy | Vysvětlení a přímý odkaz do správy zdrojů, když se nic nenajde |
 
+Vzhled stojí na „clay" principech: měkký vnější stín (`--clay-drop`) doplněný
+vnitřním odleskem (`--clay-lift`) u vyvýšených ploch a vnitřním stínem
+(`--clay-inset`) u vstupů a stisknutých tlačítek. Díky tomu prvky působí jako
+vytvarované z jednoho kusu materiálu, ne jako ploché obdélníky. Interaktivní
+prvky se při najetí nadzvednou a při stisku „zapadnou".
+
 Šablona dostává už připravená data (`prepare_results()`), takže v HTML nezůstává
 žádná logika. Zvýrazňování hledaných výrazů escapuje text ještě před vložením
 značek `<mark>`, takže uložené HTML v titulech se nevykreslí.
@@ -207,6 +213,22 @@ curl -X POST http://127.0.0.1:8070/admin/api/sources \
   -d '{"site_id": 1, "url": "https://example.com/sitemap.xml", "source_type": "sitemap", "priority": 7}'
 ```
 
+### Automatická indexace po přidání zdroje
+
+`POST /admin/api/sources` zdroj nejen uloží, ale rovnou spustí jeho indexaci
+(`index_source()`), takže není potřeba ručně otevírat detail a mačkat recrawl:
+
+| Typ zdroje | Co se zařadí do fronty |
+|---|---|
+| `url` | Daná URL s prioritou zdroje |
+| `sitemap` | Všechny URL ze sitemapy (priorita 3) |
+| `feed` / `rss` / `atom` | Všechny položky feedu (priorita 1) |
+| `domain` | Odkazy nalezené na úvodní stránce (priorita 5) |
+
+Indexace běží na pozadí (`index_source_async()`), takže odpověď API nečeká na
+síť. Zdroj ve stavu `paused` se neindexuje. Sloupec `last_checked` se po
+zpracování aktualizuje.
+
 ## Validace a bezpečnost
 
 - URL musí být platná (přijímá se doména i plná adresa včetně schématu).
@@ -224,6 +246,7 @@ python3 tests/test_admin.py                  # admin stránky a JSON API
 python3 tests/test_admin_panel.py            # kompletní end-to-end testy admin panelu
 python3 tests/test_discovery_integration.py  # napojení zdrojů na discovery a plánovač
 python3 tests/test_search_page.py            # vyhledávací stránka, filtry, XSS, našeptávač
+python3 tests/test_source_indexing.py        # auto-indexace nových zdrojů a data dashboardu
 ```
 
 ## Filtry ve vyhledávání

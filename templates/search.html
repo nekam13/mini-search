@@ -3,7 +3,7 @@
 {% block layout_class %}layout-narrow{% endblock %}
 {% block subtitle %}Vyhledávání v lokálním indexu{% endblock %}
 {% block extra_css %}<link rel="stylesheet" href="{{ url_for('static', filename='css/search.css') }}">{% endblock %}
-{% block footer %}Mini Search v7.2{% if query %} · {{ total_results }} {{ total_results|plural_cz('výsledek', 'výsledky', 'výsledků') }} v indexu{% endif %}{% endblock %}
+{% block footer %}Mini Search v7.3{% if query %} · {{ total_results }} {{ total_results|plural_cz('výsledek', 'výsledky', 'výsledků') }} v indexu{% endif %}{% endblock %}
 
 {% block content %}
 <div class="hero">
@@ -127,14 +127,17 @@
     </div>
     <div class="tips-grid">
         <div class="tip">
+            <div class="tip-icon" aria-hidden="true">⌕</div>
             <strong>Hledejte přirozeně</strong>
             Celou větou, ne jen klíčovými slovy. Hybridní vyhledávání kombinuje vektorové a plnotextové hledání.
         </div>
         <div class="tip">
+            <div class="tip-icon" aria-hidden="true">≡</div>
             <strong>Využijte filtry</strong>
             Omezte výsledky na články, podcasty, audio nebo stránky s cenami.
         </div>
         <div class="tip">
+            <div class="tip-icon" aria-hidden="true">⚙</div>
             <strong>Spravujte zdroje</strong>
             Domény, konkrétní URL, sitemapy a feedy přidáte v <a href="/admin/sources/new">správě zdrojů</a>.
         </div>

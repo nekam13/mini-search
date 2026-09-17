@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mini Search - Complete Implementation v7.2
+Mini Search - Complete Implementation v7.3
 Hybrid Search: 60% hnswlib vector + 35% FTS5 full-text + 5% SEO scoring
 Database migration without deleting console.db
 FTS5 backfill for existing pages with triggers
@@ -719,12 +719,13 @@ def get_all_sites():
     for row in results:
         site = dict(row)
         site['last_crawled_str'] = format_timestamp(site['last_crawled'])
-        site['indexed_count'] = execute_db_fetchone(
-            "SELECT COUNT(*) FROM pages WHERE site_id = ?", (site['id'],)
-        )[0]
-        site['pending_count'] = execute_db_fetchone(
-            "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'pending'", (site['id'],)
-        )[0]
+        # Templates read indexed/pending/errors/sources, so reuse the same
+        # aggregation the filtered list and detail view use.
+        site.update(get_source_stats(site['id']))
+        try:
+            site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+        except Exception:
+            site['aliases_list'] = []
         sites.append(site)
     return sites
 
@@ -741,6 +742,7 @@ def get_db_stats():
         'pending': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='pending'")[0],
         'completed': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='completed'")[0],
         'errors': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='error'")[0],
+        'sources': execute_db_fetchone("SELECT COUNT(*) FROM site_sources")[0],
     }
 
 # ============================================================================
@@ -1130,6 +1132,18 @@ def recrawl_site(site_id):
     except Exception as e:
         log_error(f"Recrawl failed for site {site_id}", e)
         return False, f"Re-crawl selhal: {e}"
+
+
+def recrawl_async(site_id):
+    """Run recrawl_site in the background (discovery hits the network)."""
+
+    def _run():
+        try:
+            recrawl_site(site_id)
+        except Exception as e:
+            log_error(f"Background recrawl of site {site_id} failed", e)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # ============================================================================
 # VECTOR SEARCH (hnswlib)
@@ -1582,11 +1596,66 @@ def _queue_url(site_id, url, priority):
         pass
 
 
+def index_source(source_id):
+    """Queue every URL a single non-domain source contributes.
+
+    Returns the number of URLs considered. Safe to call from a worker thread.
+    """
+    source = get_source_by_id(source_id)
+    if not source:
+        return 0
+    if source['status'] != 'active':
+        return 0
+
+    site_id = source['site_id']
+    url = source['url']
+    source_type = source['source_type']
+    priority = source['priority'] or 5
+    queued = 0
+
+    try:
+        if source_type == 'url':
+            _queue_url(site_id, normalize_url(url), priority)
+            queued = 1
+        elif source_type == 'sitemap':
+            for u in parse_sitemap(url):
+                n = normalize_url(u)
+                if n:
+                    _queue_url(site_id, n, 3)
+                    queued += 1
+        elif source_type in FEED_SOURCE_TYPES:
+            for u in parse_feed(url):
+                n = normalize_url(u)
+                if n:
+                    _queue_url(site_id, n, 1)
+                    queued += 1
+        execute_db(
+            "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
+            (source_id,), commit=True
+        )
+    except Exception as e:
+        log_error(f"Indexing source {source_id} ({url}) failed", e)
+
+    return queued
+
+
+def index_source_async(source_id):
+    """Run index_source off the request path so adding a source never blocks."""
+
+    def _run():
+        try:
+            index_source(source_id)
+        except Exception as e:
+            log_error(f"Background indexing of source {source_id} failed", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def phase_1_discovery(site_url, max_pages=500):
     site_url = normalize_url(site_url)
     if not site_url:
         return None, 0
-    
+
     # Check if site already exists
     domain = get_domain(site_url)
     existing = execute_db_fetchone("SELECT id FROM sites WHERE canonical_url = ?", (domain,))
@@ -1616,31 +1685,12 @@ def phase_1_discovery(site_url, max_pages=500):
 
     # Manually registered sources take priority over auto-discovery
     manual_sources = execute_db_fetchall(
-        "SELECT id, url, source_type, priority FROM site_sources "
+        "SELECT id FROM site_sources "
         "WHERE site_id = ? AND source_type != 'domain' AND status = 'active'",
         (site_id,)
     )
-    for source_row in manual_sources:
-        source_id, source_url, source_type, source_priority = source_row
-        try:
-            if source_type == 'url':
-                _queue_url(site_id, normalize_url(source_url), source_priority or 5)
-            elif source_type == 'sitemap':
-                for u in parse_sitemap(source_url):
-                    n = normalize_url(u)
-                    if n:
-                        _queue_url(site_id, n, 3)
-            elif source_type in FEED_SOURCE_TYPES:
-                for u in parse_feed(source_url):
-                    n = normalize_url(u)
-                    if n:
-                        _queue_url(site_id, n, 1)
-            execute_db(
-                "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
-                (source_id,), commit=True
-            )
-        except Exception as e:
-            log_error(f"Manual source {source_url} failed", e)
+    for (source_id,) in manual_sources:
+        index_source(source_id)
 
     discovered = discover_sitemaps_and_feeds(site_url, site_id, max_pages)
     urls_to_add = []
@@ -2475,12 +2525,19 @@ def api_sources_create():
     if error:
         return jsonify({'error': error}), 400
 
-    if max_pages is not None:
-        source = get_source_by_id(source_id)
-        if source:
-            update_site(source['site_id'], max_pages=max_pages)
+    source = get_source_by_id(source_id)
+    if max_pages is not None and source:
+        update_site(source['site_id'], max_pages=max_pages)
 
-    return jsonify({'id': source_id, 'message': 'Zdroj byl přidán'}), 201
+    # Actually index the new source instead of waiting for a manual recrawl.
+    if source:
+        index_source_async(source_id)
+        if source['source_type'] == 'domain':
+            # A bare domain has no sitemap/feed to walk yet, so discover the
+            # links reachable from the homepage to give the queue something.
+            recrawl_async(source['site_id'])
+
+    return jsonify({'id': source_id, 'message': 'Zdroj byl přidán a zařazen k indexaci'}), 201
 
 
 @app.route('/admin/api/sources/<int:source_id>', methods=['GET'])
@@ -2611,7 +2668,7 @@ def admin_update_status():
 
 if __name__ == '__main__':
     print('=' * 70)
-    print('Mini Search v7.2 - Hybrid Search Engine')
+    print('Mini Search v7.3 - Hybrid Search Engine')
     print('=' * 70)
 
     get_db()

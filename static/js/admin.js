@@ -56,12 +56,12 @@
                 if (value !== '') payload[key] = value;
             });
             try {
-                await api(form.dataset.endpoint, {
+                var result = await api(form.dataset.endpoint, {
                     method: form.dataset.method || 'POST',
                     body: JSON.stringify(payload)
                 });
-                showMessage('Uloženo', true);
-                setTimeout(function () { window.location.href = form.dataset.redirect; }, 400);
+                showMessage((result && result.message) || 'Uloženo', true);
+                setTimeout(function () { window.location.href = form.dataset.redirect; }, 700);
             } catch (err) {
                 showMessage(err.message, false);
             }
