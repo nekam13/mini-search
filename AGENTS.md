@@ -16,6 +16,7 @@ python3 tests/test_admin_panel.py            # end-to-end admin panel
 python3 tests/test_discovery_integration.py  # sources -> discovery + scheduler
 python3 tests/test_search_page.py            # public search page, filters, XSS, pagination
 python3 tests/test_source_indexing.py        # new-source auto-indexing + dashboard data
+python3 tests/test_local_sites.py            # local-network detection, robots bypass, boost
 ```
 
 `tests/test_search_page.py` prints `PASS:` lines and an `ALL ... PASSED` summary;
@@ -80,6 +81,31 @@ and returns `indexed`, `pending`, `errors`, `sources`, `total` — those are the
 names templates read (`site.indexed`, `stats.sources`, …). `get_all_sites()` and
 `get_filtered_sites()` must both merge that dict in; do not reintroduce the older
 `indexed_count` / `pending_count` names, which never matched the templates.
+
+## Local-network sites
+
+`is_local_url(url)` / `extract_host(value)` decide whether an address lives on a
+private network (localhost, private/CGNAT ranges, single-label hosts, `.local`,
+`.lan`, `.internal`, `.home.arpa`). This flag rides along on `sites.is_local`.
+
+Three behaviours depend on it, so keep them consistent:
+
+- **robots.txt bypass** вЂ” `is_allowed(url, site_id, is_local)` returns `True` for
+  local targets, because dev servers commonly serve `Disallow: /`. Callers that
+  know the site should pass `site_id`/`is_local` instead of relying on the URL.
+- **Search boost** вЂ” `sites.search_priority_multiplier` multiplies the final score.
+  Local sites default to `LOCAL_SITE_PRIORITY_MULTIPLIER` (3.0), public to
+  `PUBLIC_SITE_PRIORITY_MULTIPLIER` (1.0). `_site_priority_multiplier()` is the
+  lookup; `vector_search()` and `hybrid_search()` both apply it *before* the final
+  sort (the vector index returns approximate neighbours, so re-sorting matters).
+- **Queue priority** вЂ” the crawl worker orders by `priority ASC`, so a *lower*
+  number is crawled sooner. `_queue_url()` clamps local URLs to
+  `LOCAL_QUEUE_PRIORITY` (1) and `add_source()` promotes the parent domain to
+  local whenever a local child source is added.
+
+`_decorate_site(site)` is the single place that adds derived display fields
+(stats, parsed aliases, `is_local`, `search_priority_multiplier`); routes must
+use it rather than re-deriving those keys by hand.
 
 ## Environment notes
 

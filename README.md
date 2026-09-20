@@ -2,7 +2,7 @@
 
 Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje stránky, ukládá jejich metadata a text do SQLite a používá vektorové vyhledávání pro sémanticky podobné výsledky.
 
-> **Aktuální vývojová větev: `beta-optimized` (v7.3)**
+> **Aktuální vývojová větev: `beta-optimized` (v7.4)**
 
 ## Funkce
 
@@ -10,6 +10,7 @@ Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje
 - Indexace vybraných webů ze sitemap, RSS/Atom feedů nebo odkazů z úvodní stránky
 - **Gzip sitemap podpora** s omezením rekurze a maximálním počtem URL
 - **Respektování robots.txt** a Crawl-delay pro každou doménu
+- **Indexace lokálních webů**: automatická detekce privátních adres, ignorování robots.txt a 3× vyšší priorita ve vyhledávání
 - Vektorové vyhledávání pomocí SentenceTransformers a hnswlib
 - **FTS5 full-text vyhledávání** s podporou češtiny (unicode61 tokenizer)
 - Extrakce titulků, Open Graph metadat, textu, obrázků, audio odkazů a JSON-LD schema.org dat
@@ -247,7 +248,28 @@ python3 tests/test_admin_panel.py            # kompletní end-to-end testy admin
 python3 tests/test_discovery_integration.py  # napojení zdrojů na discovery a plánovač
 python3 tests/test_search_page.py            # vyhledávací stránka, filtry, XSS, našeptávač
 python3 tests/test_source_indexing.py        # auto-indexace nových zdrojů a data dashboardu
+python3 tests/test_local_sites.py            # lokální sítě: detekce, robots.txt, boost
 ```
+
+## Lokální weby (místní síť)
+
+Mini Search umí indexovat weby běžící v místní síti – `localhost`, `127.0.0.1`,
+`192.168.x.x`, `10.x.x.x`, `172.16–31.x.x`, `*.local`, `*.lan` a podobně.
+
+- **Automatická detekce**: adresa se rozpozná jako lokální podle hostitele
+  (privátní rozsahy, CGNAT, single-label jména, vyhrazené suffixy).
+- **Bez robots.txt**: u lokálních webů se `robots.txt` nevyžaduje ani
+  nevyhodnocuje – dev servery často vrací `Disallow: /`, což by blokovalo indexaci.
+- **Vyšší priorita (3×)**: lokální výsledky se ve vyhledávání násobí koeficientem
+  `3.0` (veřejné `1.0`) a v přehledech se řadí nahoru. Koeficient lze upravit
+  u každého webu v adminu (1–10).
+- **Fronta**: lokální URL se zařazují s nejurgentnější prioritou (`1`), tedy se
+  zpracují před ostatními.
+
+Lokální web přidáte v adminu přes **Přidat zdroj** (zaškrtněte „Lokální web“
+nebo nechte prázdné pro automatickou detekci), případně v **Editovat web**
+u existující domény. Nové zdroje (URL, sitemap, feed) přidané pod lokální
+doménu automaticky doménu označí jako lokální.
 
 ## Filtry ve vyhledávání
 

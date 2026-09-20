@@ -31,6 +31,10 @@
             </select>
         </div>
         <div class="actions" style="margin:0">
+            <label class="checkbox-label" style="margin-right:8px">
+                <input type="checkbox" name="local" value="1" {% if local_only %}checked{% endif %}>
+                Jen lokální
+            </label>
             <button type="submit" class="btn btn-primary">Filtrovat</button>
             <a href="/admin/sites" class="btn btn-ghost">Zrušit</a>
         </div>
@@ -49,7 +53,7 @@
             <thead>
             <tr>
                 <th>Doména</th><th>Stav</th><th>Indexováno</th><th>Čeká</th>
-                <th>Chyby</th><th>Zdroje</th><th>Poslední crawl</th><th>Akce</th>
+                <th>Chyby</th><th>Zdroje</th><th>Priorita</th><th>Poslední crawl</th><th>Akce</th>
             </tr>
             </thead>
             <tbody>
@@ -57,6 +61,7 @@
             <tr>
                 <td>
                     <a href="/admin/sites/{{ site.id }}"><strong>{{ site.canonical_url }}</strong></a>
+                    {% if site.is_local %}<span class="badge local-badge" title="Lokální web">🏠 Lokální</span>{% endif %}
                     {% if site.aliases_list %}
                     <div class="muted" style="font-size:.8rem">{{ site.aliases_list | join(', ') }}</div>
                     {% endif %}
@@ -68,6 +73,7 @@
                 <td>{{ site.pending }}</td>
                 <td>{{ site.errors }}</td>
                 <td>{{ site.sources }}</td>
+                <td>{{ '%g×'|format(site.search_priority_multiplier) }}</td>
                 <td>{{ site.last_crawled_str }}</td>
                 <td>
                     <div class="actions" style="margin:0">

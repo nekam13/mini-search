@@ -55,6 +55,18 @@
         </div>
 
         <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="is_local" name="is_local" value="1">
+                Lokální web (místní síť)
+            </label>
+            <div class="hint">
+                Ponechte nezaškrtnuté pro automatickou detekci. Lokální weby
+                (localhost, 192.168.x.x, 10.x.x.x, …) se indexují bez ohledu na
+                robots.txt a mají 3× vyšší prioritu ve vyhledávání.
+            </div>
+        </div>
+
+        <div class="form-group">
             <label for="notes">Poznámka</label>
             <textarea id="notes" name="notes" placeholder="Volitelná poznámka ke zdroji"></textarea>
         </div>

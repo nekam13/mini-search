@@ -71,7 +71,9 @@
         {% for site in sites %}
         <div class="card site-card">
             <div class="card-header">
-                <h3><a href="/admin/sites/{{ site.id }}">{{ site.canonical_url }}</a></h3>
+                <h3><a href="/admin/sites/{{ site.id }}">{{ site.canonical_url }}</a>
+                    {% if site.is_local %}<span class="badge local-badge" title="Lokální web">🏠</span>{% endif %}
+                </h3>
                 <span class="badge status-{{ site.status }}">
                     {% if site.status == 'active' %}Aktivní{% elif site.status == 'blocked' %}Blokováno{% else %}Pozastaveno{% endif %}
                 </span>
@@ -85,6 +87,7 @@
             <div class="meta" style="margin-top:10px">
                 <span>Poslední crawl: {{ site.last_crawled_str }}</span>
                 <span>Max. stránek: {{ site.max_pages }}</span>
+                <span>Priorita ve vyhledávání: {{ '%g×'|format(site.search_priority_multiplier) }}</span>
             </div>
             <div class="actions">
                 <a href="/admin/sites/{{ site.id }}/edit" class="btn btn-secondary btn-sm">Editovat</a>

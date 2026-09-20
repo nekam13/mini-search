@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mini Search - Complete Implementation v7.3
+Mini Search - Complete Implementation v7.4
 Hybrid Search: 60% hnswlib vector + 35% FTS5 full-text + 5% SEO scoring
 Database migration without deleting console.db
 FTS5 backfill for existing pages with triggers
@@ -11,6 +11,8 @@ Correct 429 rate_limited scheduling
 Non-destructive scheduled recrawl
 Robots checks before fetching discovery candidates
 Clay design system shared by the public search page and the admin panel
+Local-network (LAN) indexing: auto-detected private hosts skip robots.txt and
+receive a 3x search boost, tunable per site in the admin panel
 """
 
 import sqlite3
@@ -24,7 +26,9 @@ import hashlib
 import re
 import gzip
 import io
+import socket
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from urllib.parse import urlparse, urlunparse, urljoin, urlencode
 from urllib.robotparser import RobotFileParser
 
@@ -33,11 +37,17 @@ from markupsafe import escape
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
+import requests.packages.urllib3.util.connection as urllib3_cn
 from bs4 import BeautifulSoup
 import feedparser
 import extruct
 import numpy as np
 import hnswlib
+
+
+# Some local networks resolve a hostname to both IPv4 and IPv6, and a stalled
+# IPv6 route makes requests hang until the timeout. Prefer IPv4 everywhere.
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 
 # ============================================================================
@@ -48,10 +58,27 @@ DB_PATH = "console.db"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 MIN_DELAY = 1.0
-USER_AGENT = "MiniSearchBot/1.0 (+http://localhost/bot)"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MiniSearchBot/1.0")
 SHUTDOWN_FLAG = False
 MAX_SITEMAP_RECURSION = 5
 MAX_SITEMAP_URLS = 5000
+
+# Local (private-network) sites are trusted: we skip robots.txt for them and
+# boost them in search results. The multiplier is stored per site so the admin
+# can tune it.
+LOCAL_SITE_PRIORITY_MULTIPLIER = 3.0
+PUBLIC_SITE_PRIORITY_MULTIPLIER = 1.0
+PRIORITY_MULTIPLIER_MIN = 1.0
+PRIORITY_MULTIPLIER_MAX = 10.0
+# The crawl worker selects by ``ORDER BY priority ASC``, so a *lower* number is
+# crawled sooner. Local pages therefore get the most urgent priority.
+LOCAL_QUEUE_PRIORITY = 1
+DEFAULT_QUEUE_PRIORITY = 5
+
+# Suffixes that only ever resolve inside a private network.
+LOCAL_HOST_SUFFIXES = ('.local', '.localhost', '.internal', '.lan', '.home.arpa')
+
 
 _db_lock = threading.Lock()
 _db_conn = None
@@ -88,6 +115,8 @@ DB_SCHEMA = {
             last_crawled INTEGER DEFAULT 0,
             max_pages INTEGER DEFAULT 500,
             crawl_delay REAL DEFAULT 1.0,
+            is_local INTEGER DEFAULT 0,
+            search_priority_multiplier REAL DEFAULT 1.0,
             created_at INTEGER DEFAULT (strftime('%s','now'))
         )
     ''',
@@ -188,6 +217,7 @@ ERROR_LOG_PATH = "logs/errors.log"
 
 DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status)",
+    "CREATE INDEX IF NOT EXISTS idx_sites_local ON sites(is_local)",
     "CREATE INDEX IF NOT EXISTS idx_queue_status ON crawl_queue(status)",
     "CREATE INDEX IF NOT EXISTS idx_queue_priority ON crawl_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_queue_site ON crawl_queue(site_id)",
@@ -283,6 +313,20 @@ def _migrate_db(conn):
     except sqlite3.OperationalError:
         pass
     
+    # Add is_local column to sites if not exists (marks private-network sites)
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN is_local INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add search_priority_multiplier column to sites if not exists
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN search_priority_multiplier REAL DEFAULT 1.0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     # Add scheduled_at column to crawl_queue if not exists
     try:
         cursor.execute("ALTER TABLE crawl_queue ADD COLUMN scheduled_at INTEGER DEFAULT 0")
@@ -573,13 +617,63 @@ def apply_update():
 # URL HELPERS
 # ============================================================================
 
+def extract_host(value):
+    """Best-effort host extraction from a URL, ``host:port`` or bare hostname."""
+    if not value:
+        return ''
+    candidate = value.strip()
+    if '://' not in candidate:
+        # urlparse("localhost:8000") reports scheme='localhost', so force a
+        # scheme for anything that has no explicit one.
+        candidate = f"http://{candidate}"
+    try:
+        host = urlparse(candidate).hostname or ''
+    except ValueError:
+        return ''
+    return host.lower().rstrip('.')
+
+
+def is_local_host(host):
+    """True for loopback, link-local and RFC 1918 hosts, plus mDNS style names."""
+    if not host:
+        return False
+    host = host.lower().rstrip('.')
+    if host in ('localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'):
+        return True
+    if host.endswith(LOCAL_HOST_SUFFIXES):
+        return True
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        # A single-label name like "nas" can never be a public DNS name.
+        return '.' not in host
+    # is_private covers 10/8, 172.16/12, 192.168/16, 169.254/16 and their IPv6
+    # counterparts; is_global additionally catches CGNAT (100.64/10) and other
+    # ranges that cannot be reached from the public internet.
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or not ip.is_global)
+
+
+def is_local_url(url):
+    """Detect whether a URL points into the local network (ports are ignored)."""
+    return is_local_host(extract_host(url))
+
+
 def normalize_url(url):
+    """Normalize a URL, keeping the port for local sites.
+
+    A bare local address gets ``http://`` (private servers rarely serve TLS),
+    a bare public hostname keeps ``https://``.
+    """
     if not url:
         return ""
+    url = url.strip()
     parsed = urlparse(url)
-    if not parsed.scheme:
-        url = f"https://{url}"
-        parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        # A bare "localhost:8000" parses with scheme='localhost', so re-parse
+        # after forcing a scheme rather than trusting the first split.
+        scheme = 'http' if is_local_url(url) else 'https'
+        parsed = urlparse(f"{scheme}://{url}")
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
@@ -591,9 +685,9 @@ def normalize_url(url):
 
 def get_domain(url):
     parsed = urlparse(url)
-    if not parsed.scheme:
-        url = f"https://{url}"
-        parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        scheme = 'http' if is_local_url(url) else 'https'
+        parsed = urlparse(f"{scheme}://{url}")
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
@@ -626,8 +720,20 @@ def _get_robots(base_url):
     return rp
 
 
-def is_allowed(url):
-    """Return True if MiniSearchBot is allowed to fetch url."""
+def is_allowed(url, site_id=None, is_local=None):
+    """Return True if MiniSearchBot may fetch url.
+
+    Local sites bypass robots.txt: they live on the user's own network, often
+    ship no robots.txt at all, and when one exists it is typically misconfigured
+    (a blanket ``Disallow: /`` from a dev server) which would block indexing.
+    """
+    if is_local is None and site_id:
+        site = get_site_by_id(site_id)
+        is_local = bool(site and site.get('is_local'))
+    if is_local:
+        return True
+    if is_local_url(url):
+        return True
     try:
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
@@ -643,17 +749,21 @@ def get_crawl_delay(base_url):
     with _domain_delay_lock:
         if domain in _domain_crawl_delay:
             return _domain_crawl_delay[domain]
-    
-    try:
-        rp = _get_robots(base_url)
-        delay = rp.crawl_delay(USER_AGENT) or rp.crawl_delay('*')
-        if delay:
-            delay = max(MIN_DELAY, float(delay))
-        else:
-            delay = MIN_DELAY
-    except Exception:
+
+    if is_local_url(base_url):
+        # No robots.txt to consult on a private LAN; stay a good citizen anyway.
         delay = MIN_DELAY
-    
+    else:
+        try:
+            rp = _get_robots(base_url)
+            delay = rp.crawl_delay(USER_AGENT) or rp.crawl_delay('*')
+            if delay:
+                delay = max(MIN_DELAY, float(delay))
+            else:
+                delay = MIN_DELAY
+        except Exception:
+            delay = MIN_DELAY
+
     with _domain_delay_lock:
         _domain_crawl_delay[domain] = delay
     return delay
@@ -671,10 +781,22 @@ def update_crawl_delay(site_id, delay):
 # SITE MANAGEMENT
 # ============================================================================
 
-def add_site(site_url, max_pages=500):
+def add_site(site_url, max_pages=500, is_local=None):
+    """Create (or extend) a site. Local sites get a search boost automatically.
+
+    Returns the site id, or None when the URL is unusable.
+    """
     site_url = normalize_url(site_url)
     if not site_url:
         return None
+
+    if is_local is None:
+        is_local = is_local_url(site_url)
+    is_local = bool(is_local)
+    multiplier = LOCAL_SITE_PRIORITY_MULTIPLIER if is_local else PUBLIC_SITE_PRIORITY_MULTIPLIER
+    if is_local:
+        print(f"Detected local site: {site_url}")
+
     domain = get_domain(site_url)
     result = execute_db_fetchone(
         "SELECT id, canonical_url, aliases FROM sites WHERE canonical_url = ? OR aliases LIKE ?",
@@ -685,16 +807,24 @@ def add_site(site_url, max_pages=500):
         aliases = json.loads(aliases_str) if aliases_str else []
         if site_url not in aliases and site_url != existing_canonical:
             aliases.append(site_url)
-            execute_db(
-                "UPDATE sites SET aliases = ? WHERE id = ?",
-                (json.dumps(aliases), site_id), commit=True
-            )
+        # Never downgrade a local site: MAX() keeps the strongest flag/boost.
+        execute_db(
+            """UPDATE sites
+               SET aliases = ?, is_local = MAX(is_local, ?),
+                   search_priority_multiplier = MAX(search_priority_multiplier, ?)
+               WHERE id = ?""",
+            (json.dumps(aliases), int(is_local), multiplier, site_id), commit=True
+        )
         return site_id
-    
+
     crawl_delay = get_crawl_delay(site_url)
     execute_db(
-        "INSERT INTO sites (canonical_url, aliases, status, max_pages, crawl_delay) VALUES (?, ?, 'active', ?, ?)",
-        (domain, json.dumps([site_url]), max_pages, crawl_delay), commit=True
+        """INSERT INTO sites
+           (canonical_url, aliases, status, max_pages, crawl_delay, is_local,
+            search_priority_multiplier)
+           VALUES (?, ?, 'active', ?, ?, ?, ?)""",
+        (domain, json.dumps([site_url]), max_pages, crawl_delay,
+         int(is_local), multiplier), commit=True
     )
     return execute_db_fetchone("SELECT last_insert_rowid()")[0]
 
@@ -713,21 +843,30 @@ def format_timestamp(ts):
         return 'Neznámý datum'
 
 
+def _decorate_site(site):
+    """Add derived display fields (stats, parsed aliases, local flag) to a site."""
+    site['last_crawled_str'] = format_timestamp(site['last_crawled'])
+    site.update(get_source_stats(site['id']))
+    site['indexed_count'] = site['indexed']
+    site['pending_count'] = site['pending']
+    site['is_local'] = bool(site.get('is_local'))
+    try:
+        site['search_priority_multiplier'] = float(
+            site.get('search_priority_multiplier') or PUBLIC_SITE_PRIORITY_MULTIPLIER)
+    except (TypeError, ValueError):
+        site['search_priority_multiplier'] = PUBLIC_SITE_PRIORITY_MULTIPLIER
+    try:
+        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+    except Exception:
+        site['aliases_list'] = []
+    return site
+
+
 def get_all_sites():
-    results = execute_db_fetchall("SELECT * FROM sites ORDER BY created_at DESC")
-    sites = []
-    for row in results:
-        site = dict(row)
-        site['last_crawled_str'] = format_timestamp(site['last_crawled'])
-        # Templates read indexed/pending/errors/sources, so reuse the same
-        # aggregation the filtered list and detail view use.
-        site.update(get_source_stats(site['id']))
-        try:
-            site['aliases_list'] = json.loads(site.get('aliases') or '[]')
-        except Exception:
-            site['aliases_list'] = []
-        sites.append(site)
-    return sites
+    # Local sites first so they are easy to find in the admin overview.
+    results = execute_db_fetchall(
+        "SELECT * FROM sites ORDER BY is_local DESC, created_at DESC")
+    return [_decorate_site(dict(row)) for row in results]
 
 
 def delete_site(site_id):
@@ -750,19 +889,30 @@ def get_db_stats():
 # ============================================================================
 
 def validate_url(value):
-    """Return (ok, message). Accepts bare domains and full URLs."""
+    """Return (ok, message). Accepts bare domains, local addresses and full URLs."""
     if not value or not value.strip():
         return False, 'URL je povinná'
     candidate = value.strip()
     if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', candidate):
-        candidate = f"https://{candidate}"
-    parsed = urlparse(candidate)
+        scheme = 'http' if is_local_url(candidate) else 'https'
+        candidate = f"{scheme}://{candidate}"
+    try:
+        parsed = urlparse(candidate)
+        host = parsed.hostname or ''
+        port = parsed.port
+    except ValueError:
+        return False, 'Neplatný formát URL'
     if parsed.scheme not in ('http', 'https'):
         return False, 'Povolena je pouze adresa http nebo https'
-    host = parsed.hostname or ''
-    if not host or '.' not in host or host.startswith('.') or host.endswith('.'):
+    if port is not None and not (0 < port <= 65535):
+        return False, 'Neplatné číslo portu'
+    if not host or host.startswith('.') or host.endswith('.'):
         return False, 'Neplatný formát URL'
     if any(ch.isspace() for ch in host):
+        return False, 'Neplatný formát URL'
+    # Single-label hosts ("nas") and local suffixes (".local") are valid
+    # inside a LAN even though they carry no dot / a non-public suffix.
+    if '.' not in host and not is_local_host(host):
         return False, 'Neplatný formát URL'
     return True, ''
 
@@ -787,6 +937,18 @@ def validate_priority(value):
     if number < 1 or number > 10:
         return False, 'Priorita musí být 1–10', None
     return True, '', number
+
+
+def validate_priority_multiplier(value):
+    """Return (ok, message, float_value) for the search boost multiplier."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False, 'Násobek priority musí být číslo', None
+    if number < PRIORITY_MULTIPLIER_MIN or number > PRIORITY_MULTIPLIER_MAX:
+        return False, (f'Násobek priority musí být {PRIORITY_MULTIPLIER_MIN:g}–'
+                       f'{PRIORITY_MULTIPLIER_MAX:g}'), None
+    return True, '', round(number, 2)
 
 
 def detect_source_type(url, fallback='url'):
@@ -818,7 +980,7 @@ def get_source_by_id(source_id):
     return dict(row) if row else None
 
 
-def add_source(site_id, url, source_type='url', priority=5, notes=''):
+def add_source(site_id, url, source_type='url', priority=5, notes='', is_local=None):
     """Add a source under a site. Returns (source_id, error_message)."""
     if source_type not in VALID_SOURCE_TYPES:
         return None, f'Nepodporovaný typ zdroje: {source_type}'
@@ -831,6 +993,14 @@ def add_source(site_id, url, source_type='url', priority=5, notes=''):
     if not ok:
         return None, message
 
+    if is_local and site_id:
+        # Adding any local source to a domain promotes that domain, so the
+        # boost and robots.txt bypass apply site-wide.
+        parent = get_site_by_id(site_id)
+        if parent and not parent.get('is_local'):
+            update_site(site_id, is_local=True,
+                        search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
+
     if source_type == 'domain':
         normalized = normalize_url(url)
         domain = get_domain(normalized)
@@ -839,8 +1009,11 @@ def add_source(site_id, url, source_type='url', priority=5, notes=''):
         )
         if existing:
             site_id = existing[0]
+            if is_local is not None and bool(is_local) and not get_site_by_id(site_id).get('is_local'):
+                update_site(site_id, is_local=True,
+                            search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
         else:
-            site_id = add_site(normalized, 500)
+            site_id = add_site(normalized, 500, is_local=is_local)
             if not site_id:
                 return None, 'Doménu nebylo možné vytvořit'
 
@@ -1042,6 +1215,26 @@ def update_site(site_id, **kwargs):
         updates.append("aliases = ?")
         params.append(json.dumps(aliases))
 
+    if kwargs.get('is_local') is not None:
+        value = kwargs['is_local']
+        if isinstance(value, str):
+            value = value.strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+        value = bool(value)
+        updates.append("is_local = ?")
+        params.append(int(value))
+        # Unmarking a site should also drop the boost it inherited, unless the
+        # caller passes an explicit multiplier alongside.
+        if not value and kwargs.get('search_priority_multiplier') is None:
+            updates.append("search_priority_multiplier = ?")
+            params.append(PUBLIC_SITE_PRIORITY_MULTIPLIER)
+
+    if kwargs.get('search_priority_multiplier') is not None:
+        ok, message, multiplier = validate_priority_multiplier(kwargs['search_priority_multiplier'])
+        if not ok:
+            return False, message
+        updates.append("search_priority_multiplier = ?")
+        params.append(multiplier)
+
     if not updates:
         return True, 'Nic ke změně'
 
@@ -1090,7 +1283,7 @@ def get_recent_pages(site_id, limit=10):
     return pages
 
 
-def get_filtered_sites(search='', status='', source_type=''):
+def get_filtered_sites(search='', status='', source_type='', local_only=False):
     """Return sites with stats, optionally filtered."""
     query = "SELECT * FROM sites WHERE 1=1"
     params = []
@@ -1103,22 +1296,11 @@ def get_filtered_sites(search='', status='', source_type=''):
     if source_type:
         query += " AND id IN (SELECT site_id FROM site_sources WHERE source_type = ?)"
         params.append(source_type)
-    query += " ORDER BY created_at DESC"
+    if local_only:
+        query += " AND is_local = 1"
+    query += " ORDER BY is_local DESC, created_at DESC"
 
-    sites = []
-    for row in execute_db_fetchall(query, tuple(params)):
-        site = dict(row)
-        site['last_crawled_str'] = format_timestamp(site['last_crawled'])
-        stats = get_source_stats(site['id'])
-        site.update(stats)
-        site['indexed_count'] = stats['indexed']
-        site['pending_count'] = stats['pending']
-        try:
-            site['aliases_list'] = json.loads(site.get('aliases') or '[]')
-        except Exception:
-            site['aliases_list'] = []
-        sites.append(site)
-    return sites
+    return [_decorate_site(dict(row)) for row in execute_db_fetchall(query, tuple(params))]
 
 
 def recrawl_site(site_id):
@@ -1271,16 +1453,16 @@ def calculate_seo_score(page_data):
 
 
 def hybrid_search(query, limit=25, filter_type=None):
-    """Hybrid search: 60% vector + 35% FTS5 + 5% SEO."""
+    """Hybrid search: 60% vector + 35% FTS5 + 5% SEO, times the site boost."""
     # Vector search (60%)
     vector_results = vector_search(query, limit=limit * 2, filter_type=None)
-    
+
     # FTS5 search (35%)
     fts_results = fts_search(query, limit=limit * 2)
-    
+
     # Combine results
     combined = {}
-    
+
     # Add vector results
     for i, result in enumerate(vector_results):
         result_id = result['id']
@@ -1289,7 +1471,7 @@ def hybrid_search(query, limit=25, filter_type=None):
                 'page': result,
                 'vector_score': (1 - (i / (len(vector_results) + 1))) * 60
             }
-    
+
     # Add FTS5 results
     for i, result in enumerate(fts_results):
         result_id = result['id']
@@ -1301,22 +1483,23 @@ def hybrid_search(query, limit=25, filter_type=None):
             }
         else:
             combined[result_id]['fts_score'] = (1 - (i / (len(fts_results) + 1))) * 35
-    
+
     # Calculate final scores
     final_results = []
     for result_id, data in combined.items():
-        page = data['page']
+        page = _attach_priority(data['page'])
         vector_score = data.get('vector_score', 0)
         fts_score = data.get('fts_score', 0)
         seo_score = page.get('seo_score', 0) * 0.05  # 5%
-        
-        final_score = vector_score + fts_score + seo_score
+
+        multiplier = page['search_priority_multiplier']
+        final_score = (vector_score + fts_score + seo_score) * multiplier
         page['relevance'] = round(final_score, 1)
         final_results.append(page)
-    
+
     # Sort by final score
     final_results.sort(key=lambda x: x['relevance'], reverse=True)
-    
+
     # Apply filter
     if filter_type == 'articles':
         final_results = [r for r in final_results if r.get('schema_type') in ('Article', 'BlogPosting', 'NewsArticle')]
@@ -1326,7 +1509,7 @@ def hybrid_search(query, limit=25, filter_type=None):
         final_results = [r for r in final_results if r.get('has_audio') == 1]
     elif filter_type == 'price':
         final_results = [r for r in final_results if 'price' in json.loads(r.get('schema_details') or '{}')]
-    
+
     # Deduplication
     seen_texts = []
     deduplicated = []
@@ -1337,12 +1520,25 @@ def hybrid_search(query, limit=25, filter_type=None):
             deduplicated.append(r)
         if len(deduplicated) >= limit:
             break
-    
+
     return deduplicated
 
 
+def _site_priority_multiplier(site_id):
+    """Search boost for a site (3x by default for local sites, 1x otherwise)."""
+    if not site_id:
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+    site = get_site_by_id(site_id)
+    if not site:
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+    try:
+        return float(site.get('search_priority_multiplier') or PUBLIC_SITE_PRIORITY_MULTIPLIER)
+    except (TypeError, ValueError):
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+
+
 def vector_search(query, limit=25, filter_type=None):
-    """Search with hnswlib."""
+    """Search with hnswlib; local sites are boosted by their multiplier."""
     idx = get_hnsw_index()
     if idx.element_count == 0:
         return []
@@ -1364,13 +1560,17 @@ def vector_search(query, limit=25, filter_type=None):
             continue
         page = dict(page)
 
-        relevance = (1 - distance) * 100
+        multiplier = _site_priority_multiplier(page.get('site_id'))
+        page['search_priority_multiplier'] = multiplier
+        page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
+
+        relevance = (1 - distance) * 100 * multiplier
         if query.lower() in (page.get('og_title', '') + page.get('title', '')).lower():
-            relevance += 10
+            relevance += 10 * multiplier
         if page.get('schema_type'):
-            relevance += 5
+            relevance += 5 * multiplier
         if page.get('published_timestamp', 0) > int((datetime.now() - timedelta(days=30)).timestamp()):
-            relevance += 3
+            relevance += 3 * multiplier
 
         page['relevance'] = round(relevance, 1)
 
@@ -1392,9 +1592,19 @@ def vector_search(query, limit=25, filter_type=None):
     elif filter_type == 'price':
         results = [r for r in results if 'price' in json.loads(r.get('schema_details') or '{}')]
 
-    return results
+    # The multiplier can push a later neighbour above an earlier one, so sort
+    # again after scoring rather than trusting the approximate-index order.
+    results.sort(key=lambda x: x['relevance'], reverse=True)
+    return results[:limit]
 
 
+def _attach_priority(page):
+    """Make sure a page carries its site's search boost for hybrid scoring."""
+    if 'search_priority_multiplier' not in page or page.get('search_priority_multiplier') is None:
+        multiplier = _site_priority_multiplier(page.get('site_id'))
+        page['search_priority_multiplier'] = multiplier
+        page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
+    return page
 def fts_search(query, limit=25):
     """Search using FTS5 full-text search."""
     results = []
@@ -1428,8 +1638,8 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
     parsed = urlparse(site_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    # Check robots.txt first
-    if not is_allowed(site_url):
+    # Check robots.txt first (skipped automatically for local sites)
+    if not is_allowed(site_url, site_id=site_id):
         print(f"Robots.txt disallows crawling {site_url}")
         return []
 
@@ -1460,8 +1670,8 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
         if len(discovered) >= max_pages:
             break
         try:
-            # Check robots.txt for this URL
-            if not is_allowed(url):
+            # Check robots.txt for this URL (skipped for local sites)
+            if not is_allowed(url, site_id=site_id):
                 continue
                 
             resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
@@ -1571,22 +1781,35 @@ def crawl_homepage_for_links(site_url, max_pages):
     return urls
 
 
-def _queue_url(site_id, url, priority):
-    """Add URL to queue if allowed by robots.txt and not already queued/indexed."""
-    if not url or not is_allowed(url):
+def _queue_url(site_id, url, priority=None):
+    """Queue a URL for crawling unless it is disallowed or already known.
+
+    Local sites ignore robots.txt and their URLs are queued with the most
+    urgent priority so the user sees results quickly.
+    """
+    if not url:
         return
-    
+    site = get_site_by_id(site_id) if site_id else None
+    is_local = bool(site and site.get('is_local'))
+    if not is_allowed(url, site_id=site_id, is_local=is_local):
+        return
+
+    if priority is None:
+        priority = LOCAL_QUEUE_PRIORITY if is_local else DEFAULT_QUEUE_PRIORITY
+    elif is_local:
+        priority = min(priority, LOCAL_QUEUE_PRIORITY)
+
     # Check if already indexed
     url_h = url_hash(url)
     existing_page = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
     if existing_page:
         return
-    
+
     # Check if already in queue
     existing = execute_db_fetchone("SELECT id FROM crawl_queue WHERE url = ?", (url,))
     if existing:
         return
-    
+
     try:
         execute_db(
             "INSERT INTO crawl_queue (site_id, url, status, priority, scheduled_at) VALUES (?, ?, 'pending', ?, 0)",
@@ -2266,10 +2489,18 @@ def _source_from_form(payload, require_site=True):
         if not ok:
             return None, message
         data['max_pages'] = max_pages
+    # ``is_local`` is tri-state: absent means "detect from the URL", while an
+    # explicit checkbox value forces the flag.
+    if payload.get('is_local') not in (None, ''):
+        value = payload['is_local']
+        if isinstance(value, str):
+            value = value.strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+        data['is_local'] = bool(value)
     return data, None
 
 
 @app.route('/admin')
+@app.route('/admin/')
 def admin_index():
     message, ok = _admin_message()
     return render_template(
@@ -2288,8 +2519,10 @@ def admin_sites():
     search = request.args.get('q', '').strip()
     status = request.args.get('status', '').strip()
     source_type = request.args.get('source_type', '').strip()
+    local_only = request.args.get('local') == '1'
 
-    all_sites = get_filtered_sites(search=search, status=status, source_type=source_type)
+    all_sites = get_filtered_sites(search=search, status=status,
+                                   source_type=source_type, local_only=local_only)
     total = len(all_sites)
 
     try:
@@ -2312,6 +2545,7 @@ def admin_sites():
         query=search,
         status=status,
         source_type=source_type,
+        local_only=local_only,
         build_page_url=_page_url,
         message=message,
         message_ok=ok,
@@ -2324,11 +2558,7 @@ def admin_site_detail(site_id):
     if not site:
         return redirect('/admin/sites?error=Web nenalezen')
 
-    try:
-        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
-    except Exception:
-        site['aliases_list'] = []
-    site['last_crawled_str'] = format_timestamp(site['last_crawled'])
+    _decorate_site(site)
 
     errors = [
         dict(row) for row in execute_db_fetchall(
@@ -2364,15 +2594,16 @@ def admin_site_edit(site_id):
             max_pages=request.form.get('max_pages'),
             status=request.form.get('status'),
             aliases=request.form.get('aliases', ''),
+            # A checkbox only appears in the payload when ticked, so read it
+            # from the raw form to make unticking work too.
+            is_local='is_local' in request.form,
+            search_priority_multiplier=request.form.get('search_priority_multiplier'),
         )
         if ok:
             return redirect(f'/admin/sites/{site_id}?success={message}')
         return redirect(f'/admin/sites/{site_id}/edit?error={message}')
 
-    try:
-        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
-    except Exception:
-        site['aliases_list'] = []
+    _decorate_site(site)
 
     message, ok = _admin_message()
     return render_template(
@@ -2512,16 +2743,21 @@ def api_sources_create():
     site_id = data.pop('site_id', None)
     max_pages = data.pop('max_pages', None)
 
+    is_local = data.pop('is_local', None)
     if site_id is None:
         if data['source_type'] != 'domain':
             # Auto-create the parent domain from the supplied URL
-            site_id = add_site(data['url'], 500)
+            site_id = add_site(data['url'], 500, is_local=is_local)
             if not site_id:
                 return jsonify({'error': 'Doménu nebylo možné vytvořit'}), 400
         else:
             site_id = 0
+    elif is_local:
+        # An explicit "local" tick on an existing domain upgrades that domain.
+        update_site(site_id, is_local=True,
+                    search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
 
-    source_id, error = add_source(site_id, **data)
+    source_id, error = add_source(site_id, is_local=is_local, **data)
     if error:
         return jsonify({'error': error}), 400
 
@@ -2588,7 +2824,7 @@ def api_site_get(site_id):
 @app.route('/admin/api/sites/<int:site_id>', methods=['PUT', 'PATCH'])
 def api_site_update(site_id):
     payload = request.get_json(silent=True) or request.form.to_dict()
-    allowed = ('max_pages', 'status', 'aliases')
+    allowed = ('max_pages', 'status', 'aliases', 'is_local', 'search_priority_multiplier')
     kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
     ok, message = update_site(site_id, **kwargs)
     if not ok:
@@ -2668,7 +2904,7 @@ def admin_update_status():
 
 if __name__ == '__main__':
     print('=' * 70)
-    print('Mini Search v7.3 - Hybrid Search Engine')
+    print('Mini Search v7.4 - Hybrid Search Engine')
     print('=' * 70)
 
     get_db()

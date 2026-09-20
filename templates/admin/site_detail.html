@@ -5,10 +5,14 @@
 <div class="card">
     <div class="card-header">
         <div>
-            <h2>{{ site.canonical_url }}</h2>
+            <h2>{{ site.canonical_url }}
+                {% if site.is_local %}<span class="badge local-badge" title="Lokální web">🏠 Lokální</span>{% endif %}
+            </h2>
             <div class="meta muted" style="font-size:.85rem">
                 Kanonická URL: {{ site.canonical_url }}
                 {% if site.aliases_list %} · Aliasy: {{ site.aliases_list | join(', ') }}{% endif %}
+                · Priorita ve vyhledávání: {{ '%g×'|format(site.search_priority_multiplier) }}
+                {% if site.is_local %} · robots.txt ignorováno{% endif %}
             </div>
         </div>
         <span class="badge status-{{ site.status }}">
