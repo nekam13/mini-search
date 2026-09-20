@@ -249,6 +249,7 @@ python3 tests/test_discovery_integration.py  # napojení zdrojů na discovery a 
 python3 tests/test_search_page.py            # vyhledávací stránka, filtry, XSS, našeptávač
 python3 tests/test_source_indexing.py        # auto-indexace nových zdrojů a data dashboardu
 python3 tests/test_local_sites.py            # lokální sítě: detekce, robots.txt, boost
+python3 tests/test_local_indexing_smoke.py   # živý lokální HTTP server: crawl a indexace
 ```
 
 ## Lokální weby (místní síť)

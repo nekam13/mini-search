@@ -17,6 +17,7 @@ python3 tests/test_discovery_integration.py  # sources -> discovery + scheduler
 python3 tests/test_search_page.py            # public search page, filters, XSS, pagination
 python3 tests/test_source_indexing.py        # new-source auto-indexing + dashboard data
 python3 tests/test_local_sites.py            # local-network detection, robots bypass, boost
+python3 tests/test_local_indexing_smoke.py   # live local HTTP server: crawl + index end to end
 ```
 
 `tests/test_search_page.py` prints `PASS:` lines and an `ALL ... PASSED` summary;
