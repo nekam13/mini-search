@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Mini Search - Kombinovana aplikace v6.1
-Opravy oproti v6.0:
-- Deadlock v execute_db (dvojite zamykani _db_lock)
-- Nekonecna rekurze get_hnsw_index <-> rebuild_hnsw_index
-- hnswlib: element_count misto neexistujiciho .ef
-- get_db_stats() vraci completed count
-- published_date jako atribut result objektu, ne globalni promenna
-- HEAD -> GET v discover_sitemaps_and_feeds (HEAD vrati 405 na mnoha serverech)
-- /autocomplete endpoint
-- robots.txt Disallow kontrola pred pridanim URL do fronty
-- 429/403 handling v process_url
-- Deduplication vysledku (Jaccard > 90%)
+Mini Search - Complete Implementation v7.4
+Hybrid Search: 60% hnswlib vector + 35% FTS5 full-text + 5% SEO scoring
+Database migration without deleting console.db
+FTS5 backfill for existing pages with triggers
+GitHub update checking with .commit_sha, .update_available, update_log
+Gzip sitemap support, recursion limits, max_pages enforcement
+Per-domain shared Crawl-delay enforcement
+Correct 429 rate_limited scheduling
+Non-destructive scheduled recrawl
+Robots checks before fetching discovery candidates
+Clay design system shared by the public search page and the admin panel
+Local-network (LAN) indexing: auto-detected private hosts skip robots.txt and
+receive a 3x search boost, tunable per site in the admin panel
 """
 
 import sqlite3
@@ -23,19 +24,31 @@ import sys
 import os
 import hashlib
 import re
+import gzip
+import io
+import socket
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse, urljoin
+from ipaddress import ip_address
+from urllib.parse import urlparse, urlunparse, urljoin, urlencode
 from urllib.robotparser import RobotFileParser
 
-from flask import Flask, render_template_string, request, redirect, jsonify
+from flask import (Flask, render_template, request, redirect, jsonify)
+from markupsafe import escape
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
+import requests.packages.urllib3.util.connection as urllib3_cn
 from bs4 import BeautifulSoup
 import feedparser
 import extruct
 import numpy as np
 import hnswlib
+
+
+# Some local networks resolve a hostname to both IPv4 and IPv6, and a stalled
+# IPv6 route makes requests hang until the timeout. Prefer IPv4 everywhere.
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
 
 # ============================================================================
 # GLOBAL CONFIG
@@ -45,8 +58,27 @@ DB_PATH = "console.db"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 MIN_DELAY = 1.0
-USER_AGENT = "MiniSearchBot/1.0 (+http://localhost/bot)"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MiniSearchBot/1.0")
 SHUTDOWN_FLAG = False
+MAX_SITEMAP_RECURSION = 5
+MAX_SITEMAP_URLS = 5000
+
+# Local (private-network) sites are trusted: we skip robots.txt for them and
+# boost them in search results. The multiplier is stored per site so the admin
+# can tune it.
+LOCAL_SITE_PRIORITY_MULTIPLIER = 3.0
+PUBLIC_SITE_PRIORITY_MULTIPLIER = 1.0
+PRIORITY_MULTIPLIER_MIN = 1.0
+PRIORITY_MULTIPLIER_MAX = 10.0
+# The crawl worker selects by ``ORDER BY priority ASC``, so a *lower* number is
+# crawled sooner. Local pages therefore get the most urgent priority.
+LOCAL_QUEUE_PRIORITY = 1
+DEFAULT_QUEUE_PRIORITY = 5
+
+# Suffixes that only ever resolve inside a private network.
+LOCAL_HOST_SUFFIXES = ('.local', '.localhost', '.internal', '.lan', '.home.arpa')
+
 
 _db_lock = threading.Lock()
 _db_conn = None
@@ -54,11 +86,22 @@ _hnsw_index = None
 _model = None
 _scheduler = None
 _worker_threads = []
-_robots_cache = {}   # domain -> RobotFileParser
+_robots_cache = {}
 _robots_lock = threading.Lock()
+_domain_crawl_delay = {}
+_domain_delay_lock = threading.Lock()
+
+# Update tracking
+COMMIT_SHA_PATH = ".commit_sha"
+UPDATE_AVAILABLE_PATH = ".update_available"
+UPDATE_LOG_PATH = "update_log"
+REPO_OWNER = "nekam13"
+REPO_NAME = "mini-search"
+BRANCH = "beta-optimized"
+
 
 # ============================================================================
-# DATABASE SCHEMA
+# DATABASE SCHEMA - Extended with FTS5
 # ============================================================================
 
 DB_SCHEMA = {
@@ -71,6 +114,9 @@ DB_SCHEMA = {
             error_count INTEGER DEFAULT 0,
             last_crawled INTEGER DEFAULT 0,
             max_pages INTEGER DEFAULT 500,
+            crawl_delay REAL DEFAULT 1.0,
+            is_local INTEGER DEFAULT 0,
+            search_priority_multiplier REAL DEFAULT 1.0,
             created_at INTEGER DEFAULT (strftime('%s','now'))
         )
     ''',
@@ -84,6 +130,7 @@ DB_SCHEMA = {
             error_reason TEXT DEFAULT '',
             retry_count INTEGER DEFAULT 0,
             priority INTEGER DEFAULT 5,
+            scheduled_at INTEGER DEFAULT 0,
             created_at INTEGER DEFAULT (strftime('%s','now')),
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
@@ -95,6 +142,7 @@ DB_SCHEMA = {
             url TEXT,
             type TEXT,
             last_checked INTEGER DEFAULT 0,
+            recursion_depth INTEGER DEFAULT 0,
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''',
@@ -118,20 +166,99 @@ DB_SCHEMA = {
             published_timestamp INTEGER DEFAULT 0,
             embedding BLOB,
             indexed_at INTEGER DEFAULT 0,
+            seo_score REAL DEFAULT 0.0,
+            FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )
+    ''',
+    'pages_fts': '''
+        CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
+            page_id,
+            title,
+            body_text,
+            og_title,
+            og_description,
+            url,
+            schema_type
+        )
+    ''',
+    'update_status': '''
+        CREATE TABLE IF NOT EXISTS update_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            last_check INTEGER DEFAULT 0,
+            current_commit TEXT DEFAULT '',
+            latest_commit TEXT DEFAULT '',
+            update_available INTEGER DEFAULT 0,
+            last_update_time INTEGER DEFAULT 0,
+            last_update_result TEXT DEFAULT ''
+        )
+    ''',
+    'site_sources': '''
+        CREATE TABLE IF NOT EXISTS site_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            source_type TEXT NOT NULL CHECK(source_type IN ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')),
+            priority INTEGER DEFAULT 5,
+            notes TEXT DEFAULT '',
+            last_checked INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            created_at INTEGER DEFAULT (strftime('%s','now')),
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     '''
 }
 
+VALID_SOURCE_TYPES = ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')
+FEED_SOURCE_TYPES = ('feed', 'rss', 'atom')
+VALID_SITE_STATUSES = ('active', 'blocked', 'paused')
+MAX_PAGES_MIN = 1
+MAX_PAGES_MAX = 10000
+ERROR_LOG_PATH = "logs/errors.log"
+
 DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status)",
+    "CREATE INDEX IF NOT EXISTS idx_sites_local ON sites(is_local)",
     "CREATE INDEX IF NOT EXISTS idx_queue_status ON crawl_queue(status)",
     "CREATE INDEX IF NOT EXISTS idx_queue_priority ON crawl_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_queue_site ON crawl_queue(site_id)",
+    "CREATE INDEX IF NOT EXISTS idx_queue_scheduled ON crawl_queue(scheduled_at)",
     "CREATE INDEX IF NOT EXISTS idx_pages_site ON pages(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)"
+    "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
+    "CREATE INDEX IF NOT EXISTS idx_pages_indexed ON pages(indexed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sources_site ON site_sources(site_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sources_type ON site_sources(source_type)",
 ]
+
+DB_TRIGGERS = [
+    '''
+    CREATE TRIGGER IF NOT EXISTS pages_after_insert AFTER INSERT ON pages
+    BEGIN
+        INSERT INTO pages_fts(page_id, title, body_text, og_title, og_description, url, schema_type)
+        VALUES (NEW.id, NEW.title, NEW.body_text, NEW.og_title, NEW.og_description, NEW.url, NEW.schema_type);
+    END
+    ''',
+    '''
+    CREATE TRIGGER IF NOT EXISTS pages_after_update AFTER UPDATE ON pages
+    BEGIN
+        UPDATE pages_fts SET 
+            title = NEW.title,
+            body_text = NEW.body_text,
+            og_title = NEW.og_title,
+            og_description = NEW.og_description,
+            url = NEW.url,
+            schema_type = NEW.schema_type
+        WHERE page_id = NEW.id;
+    END
+    ''',
+    '''
+    CREATE TRIGGER IF NOT EXISTS pages_after_delete AFTER DELETE ON pages
+    BEGIN
+        DELETE FROM pages_fts WHERE page_id = OLD.id;
+    END
+    '''
+]
+
 
 # ============================================================================
 # DATABASE
@@ -156,16 +283,156 @@ def get_db():
             _db_conn.execute("PRAGMA synchronous=NORMAL")
             _db_conn.row_factory = sqlite3.Row
             _init_schema(_db_conn)
+            _migrate_db(_db_conn)
+            _backfill_fts(_db_conn)
+            _migrate_sources(_db_conn)
     return _db_conn
 
 
 def _init_schema(conn):
+    """Initialize database schema - non-destructive."""
     cursor = conn.cursor()
     for schema in DB_SCHEMA.values():
         cursor.execute(schema)
     for idx in DB_INDEXES:
-        cursor.execute(idx)
+        try:
+            cursor.execute(idx)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
+
+
+def _migrate_db(conn):
+    """Migrate existing database to new schema without deleting data."""
+    cursor = conn.cursor()
+    
+    # Add crawl_delay column to sites if not exists
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN crawl_delay REAL DEFAULT 1.0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Add is_local column to sites if not exists (marks private-network sites)
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN is_local INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add search_priority_multiplier column to sites if not exists
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN search_priority_multiplier REAL DEFAULT 1.0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add scheduled_at column to crawl_queue if not exists
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN scheduled_at INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Add seo_score column to pages if not exists
+    try:
+        cursor.execute("ALTER TABLE pages ADD COLUMN seo_score REAL DEFAULT 0.0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Add recursion_depth column to sitemaps_feeds if not exists
+    try:
+        cursor.execute("ALTER TABLE sitemaps_feeds ADD COLUMN recursion_depth INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Create pages_fts table if not exists
+    try:
+        cursor.execute(DB_SCHEMA['pages_fts'])
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Create update_status table if not exists
+    try:
+        cursor.execute(DB_SCHEMA['update_status'])
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Create site_sources table if not exists
+    try:
+        cursor.execute(DB_SCHEMA['site_sources'])
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Create triggers if not exists
+    for trigger in DB_TRIGGERS:
+        try:
+            cursor.execute(trigger)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+
+def _backfill_fts(conn):
+    """Backfill FTS5 table with existing pages data."""
+    cursor = conn.cursor()
+    
+    # Check if pages_fts is empty
+    cursor.execute("SELECT COUNT(*) FROM pages_fts")
+    if cursor.fetchone()[0] == 0:
+        # Copy data from pages to pages_fts
+        cursor.execute("""
+            INSERT INTO pages_fts(page_id, title, body_text, og_title, og_description, url, schema_type)
+            SELECT id, title, body_text, og_title, og_description, url, schema_type FROM pages
+        """)
+        conn.commit()
+        print("FTS5 table backfilled with existing pages data")
+
+
+def _migrate_sources(conn):
+    """Seed site_sources from existing sites and sitemaps_feeds (idempotent)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+            SELECT s.id, s.canonical_url, 'domain', 5, '', 0, 'active'
+            FROM sites s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM site_sources ss
+                WHERE ss.site_id = s.id AND ss.source_type = 'domain'
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+            SELECT sf.site_id, sf.url,
+                   CASE WHEN sf.type IN ('rss','atom') THEN sf.type ELSE 'sitemap' END,
+                   CASE WHEN sf.type IN ('rss','atom') THEN 1 ELSE 3 END,
+                   '', COALESCE(sf.last_checked, 0), 'active'
+            FROM sitemaps_feeds sf
+            WHERE NOT EXISTS (
+                SELECT 1 FROM site_sources ss
+                WHERE ss.site_id = sf.site_id AND ss.url = sf.url
+            )
+        """)
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        print(f"Source migration skipped: {e}")
+
+
+def log_error(message, exc=None):
+    """Append an error line to logs/errors.log (best effort)."""
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH) or '.', exist_ok=True)
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            detail = f" | {type(exc).__name__}: {exc}" if exc is not None else ""
+            f.write(f"{datetime.now().isoformat()} - {message}{detail}\n")
+    except Exception:
+        pass
 
 
 def close_db():
@@ -178,7 +445,7 @@ def close_db():
 
 def execute_db(query, params=(), commit=False):
     """Execute a query. Uses a single lock acquisition (no nested locking)."""
-    conn = get_db()   # does NOT acquire _db_lock after first init
+    conn = get_db()
     with _db_lock:
         try:
             cursor = conn.cursor()
@@ -205,17 +472,208 @@ def execute_db_fetchall(query, params=()):
     return execute_db(query, params).fetchall()
 
 
+def init_db():
+    """Public function to initialize database (for setup.sh)."""
+    get_db()
+    print("Database initialized successfully")
+
+
+# ============================================================================
+# UPDATE SYSTEM
+# ============================================================================
+
+def _get_current_commit():
+    """Get current commit SHA from file or git."""
+    if os.path.exists(COMMIT_SHA_PATH):
+        with open(COMMIT_SHA_PATH, 'r') as f:
+            return f.read().strip()
+    try:
+        import subprocess
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            with open(COMMIT_SHA_PATH, 'w') as f:
+                f.write(sha)
+            return sha
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _get_latest_commit_from_github():
+    """Get latest commit SHA from GitHub API."""
+    try:
+        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BRANCH}"
+        resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get('sha', '')
+    except Exception as e:
+        print(f"Error fetching latest commit: {e}")
+    return ""
+
+
+def check_for_update():
+    """Check if there's a new version available on GitHub."""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    current_commit = _get_current_commit()
+    latest_commit = _get_latest_commit_from_github()
+    
+    if not latest_commit:
+        return False, "Cannot reach GitHub API"
+    
+    update_available = current_commit != latest_commit
+    
+    # Update database
+    cursor.execute("""
+        INSERT OR REPLACE INTO update_status 
+        (id, last_check, current_commit, latest_commit, update_available, last_update_result)
+        VALUES (1, strftime('%s','now'), ?, ?, ?, ?)
+    """, (current_commit, latest_commit, 1 if update_available else 0, "OK"))
+    conn.commit()
+    
+    # Update files
+    with open(COMMIT_SHA_PATH, 'w') as f:
+        f.write(latest_commit)
+    
+    with open(UPDATE_AVAILABLE_PATH, 'w') as f:
+        f.write('1' if update_available else '0')
+    
+    # Log
+    with open(UPDATE_LOG_PATH, 'a') as f:
+        f.write(f"{datetime.now().isoformat()} - Check: current={current_commit}, latest={latest_commit}, available={update_available}\n")
+    
+    return update_available, f"Current: {current_commit[:8]}, Latest: {latest_commit[:8]}"
+
+
+def get_update_status():
+    result = execute_db_fetchone("SELECT * FROM update_status WHERE id=1")
+    if result:
+        status = dict(result)
+        status['last_check_str'] = format_timestamp(status.get('last_check', 0))
+        return status
+    return {
+        'last_check': 0,
+        'last_check_str': 'Nikdy',
+        'current_commit': _get_current_commit(),
+        'latest_commit': '',
+        'update_available': 0,
+        'last_update_time': 0,
+        'last_update_result': 'Not checked yet'
+    }
+
+
+def apply_update():
+    """Apply update by pulling from GitHub."""
+    import subprocess
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("UPDATE update_status SET last_update_time=strftime('%s','now'), last_update_result='In progress' WHERE id=1")
+        conn.commit()
+        
+        # Stop workers
+        global SHUTDOWN_FLAG
+        SHUTDOWN_FLAG = True
+        time.sleep(2)
+        
+        # Git pull
+        result = subprocess.run(
+            ['git', 'pull', 'origin', BRANCH],
+            capture_output=True, text=True, timeout=60, cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        if result.returncode == 0:
+            # Restart application
+            cursor.execute("UPDATE update_status SET last_update_result='Success - Restart required' WHERE id=1")
+            conn.commit()
+            
+            with open(UPDATE_LOG_PATH, 'a') as f:
+                f.write(f"{datetime.now().isoformat()} - Update: SUCCESS\n{result.stdout}\n")
+            
+            return True, "Update successful. Please restart the application."
+        else:
+            cursor.execute("UPDATE update_status SET last_update_result='Failed' WHERE id=1")
+            conn.commit()
+            
+            with open(UPDATE_LOG_PATH, 'a') as f:
+                f.write(f"{datetime.now().isoformat()} - Update: FAILED\n{result.stderr}\n")
+            
+            return False, f"Update failed: {result.stderr}"
+            
+    except Exception as e:
+        cursor.execute("UPDATE update_status SET last_update_result='Error: ' || ? WHERE id=1", (str(e),))
+        conn.commit()
+        return False, f"Update error: {str(e)}"
+    finally:
+        SHUTDOWN_FLAG = False
+
+
 # ============================================================================
 # URL HELPERS
 # ============================================================================
 
+def extract_host(value):
+    """Best-effort host extraction from a URL, ``host:port`` or bare hostname."""
+    if not value:
+        return ''
+    candidate = value.strip()
+    if '://' not in candidate:
+        # urlparse("localhost:8000") reports scheme='localhost', so force a
+        # scheme for anything that has no explicit one.
+        candidate = f"http://{candidate}"
+    try:
+        host = urlparse(candidate).hostname or ''
+    except ValueError:
+        return ''
+    return host.lower().rstrip('.')
+
+
+def is_local_host(host):
+    """True for loopback, link-local and RFC 1918 hosts, plus mDNS style names."""
+    if not host:
+        return False
+    host = host.lower().rstrip('.')
+    if host in ('localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'):
+        return True
+    if host.endswith(LOCAL_HOST_SUFFIXES):
+        return True
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        # A single-label name like "nas" can never be a public DNS name.
+        return '.' not in host
+    # is_private covers 10/8, 172.16/12, 192.168/16, 169.254/16 and their IPv6
+    # counterparts; is_global additionally catches CGNAT (100.64/10) and other
+    # ranges that cannot be reached from the public internet.
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or not ip.is_global)
+
+
+def is_local_url(url):
+    """Detect whether a URL points into the local network (ports are ignored)."""
+    return is_local_host(extract_host(url))
+
+
 def normalize_url(url):
+    """Normalize a URL, keeping the port for local sites.
+
+    A bare local address gets ``http://`` (private servers rarely serve TLS),
+    a bare public hostname keeps ``https://``.
+    """
     if not url:
         return ""
+    url = url.strip()
     parsed = urlparse(url)
-    if not parsed.scheme:
-        url = f"https://{url}"
-        parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        # A bare "localhost:8000" parses with scheme='localhost', so re-parse
+        # after forcing a scheme rather than trusting the first split.
+        scheme = 'http' if is_local_url(url) else 'https'
+        parsed = urlparse(f"{scheme}://{url}")
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
@@ -227,9 +685,9 @@ def normalize_url(url):
 
 def get_domain(url):
     parsed = urlparse(url)
-    if not parsed.scheme:
-        url = f"https://{url}"
-        parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        scheme = 'http' if is_local_url(url) else 'https'
+        parsed = urlparse(f"{scheme}://{url}")
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
@@ -262,8 +720,20 @@ def _get_robots(base_url):
     return rp
 
 
-def is_allowed(url):
-    """Return True if MiniSearchBot is allowed to fetch url."""
+def is_allowed(url, site_id=None, is_local=None):
+    """Return True if MiniSearchBot may fetch url.
+
+    Local sites bypass robots.txt: they live on the user's own network, often
+    ship no robots.txt at all, and when one exists it is typically misconfigured
+    (a blanket ``Disallow: /`` from a dev server) which would block indexing.
+    """
+    if is_local is None and site_id:
+        site = get_site_by_id(site_id)
+        is_local = bool(site and site.get('is_local'))
+    if is_local:
+        return True
+    if is_local_url(url):
+        return True
     try:
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
@@ -275,24 +745,58 @@ def is_allowed(url):
 
 def get_crawl_delay(base_url):
     """Return crawl-delay for domain (minimum MIN_DELAY)."""
-    try:
-        rp = _get_robots(base_url)
-        delay = rp.crawl_delay(USER_AGENT) or rp.crawl_delay('*')
-        if delay:
-            return max(MIN_DELAY, float(delay))
-    except Exception:
-        pass
-    return MIN_DELAY
+    domain = get_domain(base_url)
+    with _domain_delay_lock:
+        if domain in _domain_crawl_delay:
+            return _domain_crawl_delay[domain]
+
+    if is_local_url(base_url):
+        # No robots.txt to consult on a private LAN; stay a good citizen anyway.
+        delay = MIN_DELAY
+    else:
+        try:
+            rp = _get_robots(base_url)
+            delay = rp.crawl_delay(USER_AGENT) or rp.crawl_delay('*')
+            if delay:
+                delay = max(MIN_DELAY, float(delay))
+            else:
+                delay = MIN_DELAY
+        except Exception:
+            delay = MIN_DELAY
+
+    with _domain_delay_lock:
+        _domain_crawl_delay[domain] = delay
+    return delay
+
+
+def update_crawl_delay(site_id, delay):
+    """Update crawl delay for a site."""
+    execute_db(
+        "UPDATE sites SET crawl_delay = ? WHERE id = ?",
+        (delay, site_id), commit=True
+    )
 
 
 # ============================================================================
 # SITE MANAGEMENT
 # ============================================================================
 
-def add_site(site_url, max_pages=500):
+def add_site(site_url, max_pages=500, is_local=None):
+    """Create (or extend) a site. Local sites get a search boost automatically.
+
+    Returns the site id, or None when the URL is unusable.
+    """
     site_url = normalize_url(site_url)
     if not site_url:
         return None
+
+    if is_local is None:
+        is_local = is_local_url(site_url)
+    is_local = bool(is_local)
+    multiplier = LOCAL_SITE_PRIORITY_MULTIPLIER if is_local else PUBLIC_SITE_PRIORITY_MULTIPLIER
+    if is_local:
+        print(f"Detected local site: {site_url}")
+
     domain = get_domain(site_url)
     result = execute_db_fetchone(
         "SELECT id, canonical_url, aliases FROM sites WHERE canonical_url = ? OR aliases LIKE ?",
@@ -303,14 +807,24 @@ def add_site(site_url, max_pages=500):
         aliases = json.loads(aliases_str) if aliases_str else []
         if site_url not in aliases and site_url != existing_canonical:
             aliases.append(site_url)
-            execute_db(
-                "UPDATE sites SET aliases = ? WHERE id = ?",
-                (json.dumps(aliases), site_id), commit=True
-            )
+        # Never downgrade a local site: MAX() keeps the strongest flag/boost.
+        execute_db(
+            """UPDATE sites
+               SET aliases = ?, is_local = MAX(is_local, ?),
+                   search_priority_multiplier = MAX(search_priority_multiplier, ?)
+               WHERE id = ?""",
+            (json.dumps(aliases), int(is_local), multiplier, site_id), commit=True
+        )
         return site_id
+
+    crawl_delay = get_crawl_delay(site_url)
     execute_db(
-        "INSERT INTO sites (canonical_url, aliases, status, max_pages) VALUES (?, ?, 'active', ?)",
-        (domain, json.dumps([site_url]), max_pages), commit=True
+        """INSERT INTO sites
+           (canonical_url, aliases, status, max_pages, crawl_delay, is_local,
+            search_priority_multiplier)
+           VALUES (?, ?, 'active', ?, ?, ?, ?)""",
+        (domain, json.dumps([site_url]), max_pages, crawl_delay,
+         int(is_local), multiplier), commit=True
     )
     return execute_db_fetchone("SELECT last_insert_rowid()")[0]
 
@@ -320,23 +834,39 @@ def get_site_by_id(site_id):
     return dict(result) if result else None
 
 
+def format_timestamp(ts):
+    if not ts or ts <= 0:
+        return 'Nikdy'
+    try:
+        return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return 'Neznámý datum'
+
+
+def _decorate_site(site):
+    """Add derived display fields (stats, parsed aliases, local flag) to a site."""
+    site['last_crawled_str'] = format_timestamp(site['last_crawled'])
+    site.update(get_source_stats(site['id']))
+    site['indexed_count'] = site['indexed']
+    site['pending_count'] = site['pending']
+    site['is_local'] = bool(site.get('is_local'))
+    try:
+        site['search_priority_multiplier'] = float(
+            site.get('search_priority_multiplier') or PUBLIC_SITE_PRIORITY_MULTIPLIER)
+    except (TypeError, ValueError):
+        site['search_priority_multiplier'] = PUBLIC_SITE_PRIORITY_MULTIPLIER
+    try:
+        site['aliases_list'] = json.loads(site.get('aliases') or '[]')
+    except Exception:
+        site['aliases_list'] = []
+    return site
+
+
 def get_all_sites():
-    results = execute_db_fetchall("SELECT * FROM sites ORDER BY created_at DESC")
-    sites = []
-    for row in results:
-        site = dict(row)
-        site['last_crawled_str'] = (
-            datetime.fromtimestamp(site['last_crawled']).strftime('%Y-%m-%d %H:%M:%S')
-            if site['last_crawled'] > 0 else 'Nikdy'
-        )
-        site['indexed_count'] = execute_db_fetchone(
-            "SELECT COUNT(*) FROM pages WHERE site_id = ?", (site['id'],)
-        )[0]
-        site['pending_count'] = execute_db_fetchone(
-            "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'pending'", (site['id'],)
-        )[0]
-        sites.append(site)
-    return sites
+    # Local sites first so they are easy to find in the admin overview.
+    results = execute_db_fetchall(
+        "SELECT * FROM sites ORDER BY is_local DESC, created_at DESC")
+    return [_decorate_site(dict(row)) for row in results]
 
 
 def delete_site(site_id):
@@ -346,16 +876,459 @@ def delete_site(site_id):
 
 def get_db_stats():
     return {
-        'sites':     execute_db_fetchone("SELECT COUNT(*) FROM sites")[0],
-        'pages':     execute_db_fetchone("SELECT COUNT(*) FROM pages")[0],
-        'pending':   execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='pending'")[0],
+        'sites': execute_db_fetchone("SELECT COUNT(*) FROM sites")[0],
+        'pages': execute_db_fetchone("SELECT COUNT(*) FROM pages")[0],
+        'pending': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='pending'")[0],
         'completed': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='completed'")[0],
-        'errors':    execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='error'")[0],
+        'errors': execute_db_fetchone("SELECT COUNT(*) FROM crawl_queue WHERE status='error'")[0],
+        'sources': execute_db_fetchone("SELECT COUNT(*) FROM site_sources")[0],
+    }
+
+# ============================================================================
+# SOURCE MANAGEMENT (domain / url / sitemap / feed)
+# ============================================================================
+
+def validate_url(value):
+    """Return (ok, message). Accepts bare domains, local addresses and full URLs."""
+    if not value or not value.strip():
+        return False, 'URL je povinná'
+    candidate = value.strip()
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', candidate):
+        scheme = 'http' if is_local_url(candidate) else 'https'
+        candidate = f"{scheme}://{candidate}"
+    try:
+        parsed = urlparse(candidate)
+        host = parsed.hostname or ''
+        port = parsed.port
+    except ValueError:
+        return False, 'Neplatný formát URL'
+    if parsed.scheme not in ('http', 'https'):
+        return False, 'Povolena je pouze adresa http nebo https'
+    if port is not None and not (0 < port <= 65535):
+        return False, 'Neplatné číslo portu'
+    if not host or host.startswith('.') or host.endswith('.'):
+        return False, 'Neplatný formát URL'
+    if any(ch.isspace() for ch in host):
+        return False, 'Neplatný formát URL'
+    # Single-label hosts ("nas") and local suffixes (".local") are valid
+    # inside a LAN even though they carry no dot / a non-public suffix.
+    if '.' not in host and not is_local_host(host):
+        return False, 'Neplatný formát URL'
+    return True, ''
+
+
+def validate_max_pages(value):
+    """Return (ok, message, int_value)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False, 'Max. stránek musí být číslo', None
+    if number < MAX_PAGES_MIN or number > MAX_PAGES_MAX:
+        return False, f'Max. stránek musí být {MAX_PAGES_MIN}–{MAX_PAGES_MAX}', None
+    return True, '', number
+
+
+def validate_priority(value):
+    """Return (ok, message, int_value)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False, 'Priorita musí být číslo', None
+    if number < 1 or number > 10:
+        return False, 'Priorita musí být 1–10', None
+    return True, '', number
+
+
+def validate_priority_multiplier(value):
+    """Return (ok, message, float_value) for the search boost multiplier."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False, 'Násobek priority musí být číslo', None
+    if number < PRIORITY_MULTIPLIER_MIN or number > PRIORITY_MULTIPLIER_MAX:
+        return False, (f'Násobek priority musí být {PRIORITY_MULTIPLIER_MIN:g}–'
+                       f'{PRIORITY_MULTIPLIER_MAX:g}'), None
+    return True, '', round(number, 2)
+
+
+def detect_source_type(url, fallback='url'):
+    """Guess source_type from URL shape."""
+    lower = (url or '').lower()
+    if lower.endswith('.xml') or lower.endswith('.xml.gz') or 'sitemap' in lower:
+        return 'sitemap'
+    if (lower.endswith('.rss') or lower.endswith('.atom') or '/rss' in lower
+            or '/feed' in lower or '/atom' in lower or 'feed' in lower):
+        return 'rss'
+    return fallback
+
+
+def get_site_sources(site_id):
+    rows = execute_db_fetchall(
+        "SELECT * FROM site_sources WHERE site_id = ? ORDER BY source_type, priority, id",
+        (site_id,)
+    )
+    sources = []
+    for row in rows:
+        source = dict(row)
+        source['last_checked_str'] = format_timestamp(source.get('last_checked', 0))
+        sources.append(source)
+    return sources
+
+
+def get_source_by_id(source_id):
+    row = execute_db_fetchone("SELECT * FROM site_sources WHERE id = ?", (source_id,))
+    return dict(row) if row else None
+
+
+def add_source(site_id, url, source_type='url', priority=5, notes='', is_local=None):
+    """Add a source under a site. Returns (source_id, error_message)."""
+    if source_type not in VALID_SOURCE_TYPES:
+        return None, f'Nepodporovaný typ zdroje: {source_type}'
+
+    ok, message = validate_url(url)
+    if not ok:
+        return None, message
+
+    ok, message, priority = validate_priority(priority)
+    if not ok:
+        return None, message
+
+    if is_local and site_id:
+        # Adding any local source to a domain promotes that domain, so the
+        # boost and robots.txt bypass apply site-wide.
+        parent = get_site_by_id(site_id)
+        if parent and not parent.get('is_local'):
+            update_site(site_id, is_local=True,
+                        search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
+
+    if source_type == 'domain':
+        normalized = normalize_url(url)
+        domain = get_domain(normalized)
+        existing = execute_db_fetchone(
+            "SELECT id FROM sites WHERE canonical_url = ?", (domain,)
+        )
+        if existing:
+            site_id = existing[0]
+            if is_local is not None and bool(is_local) and not get_site_by_id(site_id).get('is_local'):
+                update_site(site_id, is_local=True,
+                            search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
+        else:
+            site_id = add_site(normalized, 500, is_local=is_local)
+            if not site_id:
+                return None, 'Doménu nebylo možné vytvořit'
+
+    normalized = normalize_url(url)
+    if source_type == 'domain':
+        normalized = get_domain(normalized)
+
+    duplicate = execute_db_fetchone(
+        "SELECT id FROM site_sources WHERE site_id = ? AND url = ?",
+        (site_id, normalized)
+    )
+    if duplicate:
+        return None, 'Tento zdroj je již pod doménou zaregistrován'
+
+    execute_db(
+        """INSERT INTO site_sources (site_id, url, source_type, priority, notes, last_checked, status)
+           VALUES (?, ?, ?, ?, ?, 0, 'active')""",
+        (site_id, normalized, source_type, priority, notes or ''), commit=True
+    )
+    source_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
+
+    if source_type in ('sitemap', 'feed', 'rss', 'atom'):
+        _mirror_source_to_legacy(site_id, normalized, source_type)
+
+    return source_id, None
+
+
+def _mirror_source_to_legacy(site_id, url, source_type):
+    """Keep sitemaps_feeds in sync so existing schedulers keep working."""
+    legacy_type = source_type if source_type in ('rss', 'atom') else 'sitemap'
+    try:
+        existing = execute_db_fetchone(
+            "SELECT id FROM sitemaps_feeds WHERE site_id = ? AND url = ?",
+            (site_id, url)
+        )
+        if not existing:
+            execute_db(
+                "INSERT INTO sitemaps_feeds (site_id, url, type, last_checked) VALUES (?, ?, ?, 0)",
+                (site_id, url, legacy_type), commit=True
+            )
+    except Exception as e:
+        log_error(f"Could not mirror source {url} to sitemaps_feeds", e)
+
+
+def update_source(source_id, **kwargs):
+    """Update fields of a source. Returns (ok, message)."""
+    source = get_source_by_id(source_id)
+    if not source:
+        return False, 'Zdroj nenalezen'
+
+    updates = []
+    params = []
+
+    if kwargs.get('url') is not None:
+        ok, message = validate_url(kwargs['url'])
+        if not ok:
+            return False, message
+        new_url = normalize_url(kwargs['url'])
+        if source['source_type'] == 'domain':
+            new_url = get_domain(new_url)
+        if new_url != source['url']:
+            duplicate = execute_db_fetchone(
+                "SELECT id FROM site_sources WHERE site_id = ? AND url = ? AND id != ?",
+                (source['site_id'], new_url, source_id)
+            )
+            if duplicate:
+                return False, 'Tento zdroj je již pod doménou zaregistrován'
+        updates.append("url = ?")
+        params.append(new_url)
+
+    if kwargs.get('source_type') is not None:
+        if kwargs['source_type'] not in VALID_SOURCE_TYPES:
+            return False, f"Nepodporovaný typ zdroje: {kwargs['source_type']}"
+        updates.append("source_type = ?")
+        params.append(kwargs['source_type'])
+
+    if kwargs.get('priority') is not None:
+        ok, message, priority = validate_priority(kwargs['priority'])
+        if not ok:
+            return False, message
+        updates.append("priority = ?")
+        params.append(priority)
+
+    if kwargs.get('notes') is not None:
+        updates.append("notes = ?")
+        params.append(str(kwargs['notes']))
+
+    if kwargs.get('status') is not None:
+        if kwargs['status'] not in VALID_SITE_STATUSES:
+            return False, 'Neplatný stav zdroje'
+        updates.append("status = ?")
+        params.append(kwargs['status'])
+
+    if kwargs.get('max_pages') is not None:
+        ok, message, max_pages = validate_max_pages(kwargs['max_pages'])
+        if not ok:
+            return False, message
+        execute_db(
+            "UPDATE sites SET max_pages = ? WHERE id = ?",
+            (max_pages, source['site_id']), commit=True
+        )
+
+    if not updates:
+        return True, 'Nic ke změně'
+
+    params.append(source_id)
+    try:
+        execute_db(
+            f"UPDATE site_sources SET {', '.join(updates)} WHERE id = ?",
+            tuple(params), commit=True
+        )
+    except sqlite3.IntegrityError as e:
+        log_error(f"Update source {source_id} failed", e)
+        return False, 'Aktualizace zdroje selhala'
+
+    if kwargs.get('url') is not None:
+        _sync_legacy_source(source, kwargs['url'])
+    return True, 'Zdroj byl upraven'
+
+
+def _sync_legacy_source(source, new_url):
+    try:
+        execute_db(
+            "UPDATE sitemaps_feeds SET url = ? WHERE site_id = ? AND url = ?",
+            (normalize_url(new_url), source['site_id'], source['url']), commit=True
+        )
+    except Exception as e:
+        log_error(f"Could not sync legacy source {source['id']}", e)
+
+
+def delete_source(source_id):
+    """Delete a source. Domains delete the whole site (cascade)."""
+    source = get_source_by_id(source_id)
+    if not source:
+        return False, 'Zdroj nenalezen'
+    if source['source_type'] == 'domain':
+        delete_site(source['site_id'])
+        return True, 'Doména byla smazána'
+    execute_db("DELETE FROM site_sources WHERE id = ?", (source_id,), commit=True)
+    execute_db(
+        "DELETE FROM sitemaps_feeds WHERE site_id = ? AND url = ?",
+        (source['site_id'], source['url']), commit=True
+    )
+    return True, 'Zdroj byl smazán'
+
+
+def get_source_stats(site_id):
+    """Aggregate stats for a site (used by cards and detail view)."""
+    indexed = execute_db_fetchone(
+        "SELECT COUNT(*) FROM pages WHERE site_id = ?", (site_id,)
+    )[0]
+    pending = execute_db_fetchone(
+        "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'pending'",
+        (site_id,)
+    )[0]
+    errors = execute_db_fetchone(
+        "SELECT COUNT(*) FROM crawl_queue WHERE site_id = ? AND status = 'error'",
+        (site_id,)
+    )[0]
+    sources = execute_db_fetchone(
+        "SELECT COUNT(*) FROM site_sources WHERE site_id = ?", (site_id,)
+    )[0]
+    return {
+        'indexed': indexed,
+        'pending': pending,
+        'errors': errors,
+        'sources': sources,
+        'total': indexed + pending,
     }
 
 
+def update_site(site_id, **kwargs):
+    """Update editable site fields. Returns (ok, message)."""
+    site = get_site_by_id(site_id)
+    if not site:
+        return False, 'Web nenalezen'
+
+    updates = []
+    params = []
+
+    if kwargs.get('max_pages') is not None:
+        ok, message, max_pages = validate_max_pages(kwargs['max_pages'])
+        if not ok:
+            return False, message
+        updates.append("max_pages = ?")
+        params.append(max_pages)
+
+    if kwargs.get('status') is not None:
+        status = kwargs['status']
+        if status not in VALID_SITE_STATUSES:
+            return False, 'Neplatný stav webu'
+        updates.append("status = ?")
+        params.append(status)
+
+    if kwargs.get('aliases') is not None:
+        aliases = kwargs['aliases']
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(',') if a.strip()]
+        updates.append("aliases = ?")
+        params.append(json.dumps(aliases))
+
+    if kwargs.get('is_local') is not None:
+        value = kwargs['is_local']
+        if isinstance(value, str):
+            value = value.strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+        value = bool(value)
+        updates.append("is_local = ?")
+        params.append(int(value))
+        # Unmarking a site should also drop the boost it inherited, unless the
+        # caller passes an explicit multiplier alongside.
+        if not value and kwargs.get('search_priority_multiplier') is None:
+            updates.append("search_priority_multiplier = ?")
+            params.append(PUBLIC_SITE_PRIORITY_MULTIPLIER)
+
+    if kwargs.get('search_priority_multiplier') is not None:
+        ok, message, multiplier = validate_priority_multiplier(kwargs['search_priority_multiplier'])
+        if not ok:
+            return False, message
+        updates.append("search_priority_multiplier = ?")
+        params.append(multiplier)
+
+    if not updates:
+        return True, 'Nic ke změně'
+
+    params.append(site_id)
+    execute_db(f"UPDATE sites SET {', '.join(updates)} WHERE id = ?", tuple(params), commit=True)
+    return True, 'Web byl upraven'
+
+
+def pause_site(site_id):
+    return update_site(site_id, status='paused')
+
+
+def resume_site(site_id):
+    return update_site(site_id, status='active')
+
+
+def get_all_sources():
+    """Flat list of every source enriched with its site (for API)."""
+    rows = execute_db_fetchall("""
+        SELECT ss.*, s.canonical_url AS site_domain, s.status AS site_status,
+               s.max_pages AS max_pages
+        FROM site_sources ss
+        JOIN sites s ON ss.site_id = s.id
+        ORDER BY s.created_at DESC, ss.source_type, ss.priority
+    """)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item['last_checked_str'] = format_timestamp(item.get('last_checked', 0))
+        result.append(item)
+    return result
+
+
+def get_recent_pages(site_id, limit=10):
+    rows = execute_db_fetchall(
+        """SELECT id, url, og_title, title, schema_type, indexed_at, seo_score
+           FROM pages WHERE site_id = ? ORDER BY indexed_at DESC LIMIT ?""",
+        (site_id, limit)
+    )
+    pages = []
+    for row in rows:
+        page = dict(row)
+        page['title'] = page['og_title'] or page['title'] or page['url']
+        page['indexed_at_str'] = format_timestamp(page['indexed_at'])
+        pages.append(page)
+    return pages
+
+
+def get_filtered_sites(search='', status='', source_type='', local_only=False):
+    """Return sites with stats, optionally filtered."""
+    query = "SELECT * FROM sites WHERE 1=1"
+    params = []
+    if search:
+        query += " AND (canonical_url LIKE ? OR aliases LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if source_type:
+        query += " AND id IN (SELECT site_id FROM site_sources WHERE source_type = ?)"
+        params.append(source_type)
+    if local_only:
+        query += " AND is_local = 1"
+    query += " ORDER BY is_local DESC, created_at DESC"
+
+    return [_decorate_site(dict(row)) for row in execute_db_fetchall(query, tuple(params))]
+
+
+def recrawl_site(site_id):
+    """Queue every domain/url/sitemap/feed source belonging to a site."""
+    site = get_site_by_id(site_id)
+    if not site:
+        return False, 'Web nenalezen'
+    try:
+        site_id_result, added = phase_1_discovery(site['canonical_url'], site['max_pages'])
+        return True, f"Re-crawl zahájen ({added} URL ve frontě)"
+    except Exception as e:
+        log_error(f"Recrawl failed for site {site_id}", e)
+        return False, f"Re-crawl selhal: {e}"
+
+
+def recrawl_async(site_id):
+    """Run recrawl_site in the background (discovery hits the network)."""
+
+    def _run():
+        try:
+            recrawl_site(site_id)
+        except Exception as e:
+            log_error(f"Background recrawl of site {site_id} failed", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # ============================================================================
-# VECTOR SEARCH (hnswlib) - bez rekurze
+# VECTOR SEARCH (hnswlib)
 # ============================================================================
 
 def _init_hnsw(dim=384):
@@ -415,7 +1388,7 @@ def get_model():
             from sentence_transformers import SentenceTransformer
             _model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         except Exception as e:
-            print(f"⚠️  Model nelze nacist: {e}")
+            print(f"Model nelze nacist: {e}")
             class DummyModel:
                 def get_sentence_embedding_dimension(self): return 384
                 def encode(self, text): return np.zeros(384, dtype=np.float32)
@@ -439,8 +1412,133 @@ def _jaccard(a, b):
     return len(sa & sb) / len(sa | sb)
 
 
+def calculate_seo_score(page_data):
+    """Calculate SEO score for a page (0-100)."""
+    score = 0.0
+    
+    # Title presence
+    if page_data.get('og_title') or page_data.get('title'):
+        score += 10
+    
+    # Description presence
+    if page_data.get('og_description'):
+        score += 10
+    
+    # Image presence
+    if page_data.get('og_image'):
+        score += 5
+    
+    # Schema markup
+    if page_data.get('schema_type'):
+        score += 15
+    
+    # Audio content
+    if page_data.get('has_audio') == 1:
+        score += 10
+    
+    # Published date
+    if page_data.get('published_timestamp', 0) > 0:
+        score += 5
+    
+    # Body text length
+    body_len = len(page_data.get('body_text', ''))
+    if body_len > 100:
+        score += min(20, body_len / 50)
+    
+    # Recent content
+    if page_data.get('published_timestamp', 0) > int((datetime.now() - timedelta(days=30)).timestamp()):
+        score += 10
+    
+    return min(100.0, score)
+
+
+def hybrid_search(query, limit=25, filter_type=None):
+    """Hybrid search: 60% vector + 35% FTS5 + 5% SEO, times the site boost."""
+    # Vector search (60%)
+    vector_results = vector_search(query, limit=limit * 2, filter_type=None)
+
+    # FTS5 search (35%)
+    fts_results = fts_search(query, limit=limit * 2)
+
+    # Combine results
+    combined = {}
+
+    # Add vector results
+    for i, result in enumerate(vector_results):
+        result_id = result['id']
+        if result_id not in combined:
+            combined[result_id] = {
+                'page': result,
+                'vector_score': (1 - (i / (len(vector_results) + 1))) * 60
+            }
+
+    # Add FTS5 results
+    for i, result in enumerate(fts_results):
+        result_id = result['id']
+        if result_id not in combined:
+            combined[result_id] = {
+                'page': result,
+                'vector_score': 0,
+                'fts_score': (1 - (i / (len(fts_results) + 1))) * 35
+            }
+        else:
+            combined[result_id]['fts_score'] = (1 - (i / (len(fts_results) + 1))) * 35
+
+    # Calculate final scores
+    final_results = []
+    for result_id, data in combined.items():
+        page = _attach_priority(data['page'])
+        vector_score = data.get('vector_score', 0)
+        fts_score = data.get('fts_score', 0)
+        seo_score = page.get('seo_score', 0) * 0.05  # 5%
+
+        multiplier = page['search_priority_multiplier']
+        final_score = (vector_score + fts_score + seo_score) * multiplier
+        page['relevance'] = round(final_score, 1)
+        final_results.append(page)
+
+    # Sort by final score
+    final_results.sort(key=lambda x: x['relevance'], reverse=True)
+
+    # Apply filter
+    if filter_type == 'articles':
+        final_results = [r for r in final_results if r.get('schema_type') in ('Article', 'BlogPosting', 'NewsArticle')]
+    elif filter_type == 'podcasts':
+        final_results = [r for r in final_results if r.get('schema_type') == 'PodcastEpisode']
+    elif filter_type == 'audio':
+        final_results = [r for r in final_results if r.get('has_audio') == 1]
+    elif filter_type == 'price':
+        final_results = [r for r in final_results if 'price' in json.loads(r.get('schema_details') or '{}')]
+
+    # Deduplication
+    seen_texts = []
+    deduplicated = []
+    for r in final_results:
+        snippet = (r.get('body_text') or '')[:300]
+        if not any(_jaccard(snippet, seen) > 0.9 for seen in seen_texts):
+            seen_texts.append(snippet)
+            deduplicated.append(r)
+        if len(deduplicated) >= limit:
+            break
+
+    return deduplicated
+
+
+def _site_priority_multiplier(site_id):
+    """Search boost for a site (3x by default for local sites, 1x otherwise)."""
+    if not site_id:
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+    site = get_site_by_id(site_id)
+    if not site:
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+    try:
+        return float(site.get('search_priority_multiplier') or PUBLIC_SITE_PRIORITY_MULTIPLIER)
+    except (TypeError, ValueError):
+        return PUBLIC_SITE_PRIORITY_MULTIPLIER
+
+
 def vector_search(query, limit=25, filter_type=None):
-    """Search with hnswlib; deduplicates results with Jaccard > 0.9."""
+    """Search with hnswlib; local sites are boosted by their multiplier."""
     idx = get_hnsw_index()
     if idx.element_count == 0:
         return []
@@ -462,26 +1560,22 @@ def vector_search(query, limit=25, filter_type=None):
             continue
         page = dict(page)
 
-        relevance = (1 - distance) * 100
+        multiplier = _site_priority_multiplier(page.get('site_id'))
+        page['search_priority_multiplier'] = multiplier
+        page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
+
+        relevance = (1 - distance) * 100 * multiplier
         if query.lower() in (page.get('og_title', '') + page.get('title', '')).lower():
-            relevance += 10
+            relevance += 10 * multiplier
         if page.get('schema_type'):
-            relevance += 5
+            relevance += 5 * multiplier
         if page.get('published_timestamp', 0) > int((datetime.now() - timedelta(days=30)).timestamp()):
-            relevance += 3
+            relevance += 3 * multiplier
 
         page['relevance'] = round(relevance, 1)
 
-        # published_date as page attribute (not global template var)
-        if page.get('published_timestamp', 0) > 0:
-            try:
-                page['published_date'] = datetime.fromtimestamp(page['published_timestamp']).strftime('%Y-%m-%d')
-            except Exception:
-                page['published_date'] = ''
-        else:
-            page['published_date'] = ''
+        page['published_date'] = format_timestamp(page.get('published_timestamp', 0))
 
-        # Deduplication
         snippet = (page.get('body_text') or '')[:300]
         if any(_jaccard(snippet, seen) > 0.9 for seen in seen_texts):
             continue
@@ -489,7 +1583,6 @@ def vector_search(query, limit=25, filter_type=None):
 
         results.append(page)
 
-    # Filter
     if filter_type == 'articles':
         results = [r for r in results if r.get('schema_type') in ('Article', 'BlogPosting', 'NewsArticle')]
     elif filter_type == 'podcasts':
@@ -499,6 +1592,40 @@ def vector_search(query, limit=25, filter_type=None):
     elif filter_type == 'price':
         results = [r for r in results if 'price' in json.loads(r.get('schema_details') or '{}')]
 
+    # The multiplier can push a later neighbour above an earlier one, so sort
+    # again after scoring rather than trusting the approximate-index order.
+    results.sort(key=lambda x: x['relevance'], reverse=True)
+    return results[:limit]
+
+
+def _attach_priority(page):
+    """Make sure a page carries its site's search boost for hybrid scoring."""
+    if 'search_priority_multiplier' not in page or page.get('search_priority_multiplier') is None:
+        multiplier = _site_priority_multiplier(page.get('site_id'))
+        page['search_priority_multiplier'] = multiplier
+        page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
+    return page
+def fts_search(query, limit=25):
+    """Search using FTS5 full-text search."""
+    results = []
+    try:
+        # Use FTS5 with unicode61 tokenizer for Czech support
+        rows = execute_db_fetchall("""
+            SELECT p.* FROM pages_fts fts
+            JOIN pages p ON fts.page_id = p.id
+            WHERE pages_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """, (query, limit * 2))
+        
+        for row in rows:
+            page = dict(row)
+            # Calculate relevance from FTS5 rank
+            # For simplicity, use position in results as proxy
+            results.append(page)
+    except Exception as e:
+        print(f"FTS5 search error: {e}")
+    
     return results
 
 
@@ -506,10 +1633,15 @@ def vector_search(query, limit=25, filter_type=None):
 # CRAWLING
 # ============================================================================
 
-def discover_sitemaps_and_feeds(site_url, site_id):
-    """Phase 1: detect sitemaps/feeds via GET (HEAD returns 405 on many servers)."""
+def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
+    """Phase 1: detect sitemaps/feeds via GET with robots.txt check."""
     parsed = urlparse(site_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Check robots.txt first (skipped automatically for local sites)
+    if not is_allowed(site_url, site_id=site_id):
+        print(f"Robots.txt disallows crawling {site_url}")
+        return []
 
     # Collect candidate URLs
     candidate_urls = []
@@ -519,7 +1651,8 @@ def discover_sitemaps_and_feeds(site_url, site_id):
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith('sitemap:'):
-                    candidate_urls.append(line.split(':', 1)[1].strip())
+                    sitemap_url = line.split(':', 1)[1].strip()
+                    candidate_urls.append(sitemap_url)
     except Exception:
         pass
 
@@ -534,12 +1667,26 @@ def discover_sitemaps_and_feeds(site_url, site_id):
 
     discovered = []
     for url in candidate_urls:
+        if len(discovered) >= max_pages:
+            break
         try:
+            # Check robots.txt for this URL (skipped for local sites)
+            if not is_allowed(url, site_id=site_id):
+                continue
+                
             resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
             if resp.status_code != 200:
                 continue
             ct = resp.headers.get('Content-Type', '')
-            body_start = resp.text[:500]
+            body_start = resp.text[:500] if isinstance(resp.text, str) else resp.content[:500].decode('utf-8', errors='ignore')
+            
+            # Handle gzip content
+            if ct == 'application/gzip' or url.endswith('.gz'):
+                try:
+                    body_start = gzip.decompress(resp.content[:1000]).decode('utf-8', errors='ignore')[:500]
+                except Exception:
+                    pass
+            
             if '<urlset' in body_start or '<sitemapindex' in body_start or 'xml' in ct:
                 item_type = 'sitemap'
             elif '<rss' in body_start or '<feed' in body_start or 'rss' in ct or 'atom' in ct:
@@ -561,25 +1708,42 @@ def discover_sitemaps_and_feeds(site_url, site_id):
     return discovered
 
 
-def parse_sitemap(url):
+def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
+    """Parse sitemap with gzip support and recursion limit."""
+    if current_depth > max_depth:
+        return []
+    
     urls = []
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, 'lxml')
-            if soup.find('sitemapindex'):
-                for s in soup.find_all('sitemap'):
-                    loc = s.find('loc')
-                    if loc:
-                        urls.extend(parse_sitemap(loc.text))
-            else:
-                for u in soup.find_all('url'):
-                    loc = u.find('loc')
-                    if loc:
-                        urls.append(loc.text)
-    except Exception:
-        pass
-    return urls
+        if resp.status_code != 200:
+            return []
+        
+        content = resp.content
+        ct = resp.headers.get('Content-Type', '')
+        
+        # Handle gzip
+        if ct == 'application/gzip' or url.endswith('.gz'):
+            try:
+                content = gzip.decompress(content)
+            except Exception:
+                pass
+        
+        soup = BeautifulSoup(content, 'lxml')
+        if soup.find('sitemapindex'):
+            for s in soup.find_all('sitemap'):
+                loc = s.find('loc')
+                if loc:
+                    urls.extend(parse_sitemap(loc.text, max_depth, current_depth + 1))
+        else:
+            for u in soup.find_all('url'):
+                loc = u.find('loc')
+                if loc:
+                    urls.append(loc.text)
+    except Exception as e:
+        print(f"Error parsing sitemap {url}: {e}")
+    
+    return urls[:MAX_SITEMAP_URLS]
 
 
 def parse_feed(url):
@@ -600,6 +1764,9 @@ def crawl_homepage_for_links(site_url, max_pages):
     urls = []
     domain = get_domain(site_url)
     try:
+        if not is_allowed(site_url):
+            return []
+            
         resp = requests.get(site_url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content, 'lxml')
@@ -614,33 +1781,141 @@ def crawl_homepage_for_links(site_url, max_pages):
     return urls
 
 
-def _queue_url(site_id, url, priority):
-    """Add URL to queue if allowed by robots.txt and not already queued."""
-    if not url or not is_allowed(url):
+def _queue_url(site_id, url, priority=None):
+    """Queue a URL for crawling unless it is disallowed or already known.
+
+    Local sites ignore robots.txt and their URLs are queued with the most
+    urgent priority so the user sees results quickly.
+    """
+    if not url:
         return
+    site = get_site_by_id(site_id) if site_id else None
+    is_local = bool(site and site.get('is_local'))
+    if not is_allowed(url, site_id=site_id, is_local=is_local):
+        return
+
+    if priority is None:
+        priority = LOCAL_QUEUE_PRIORITY if is_local else DEFAULT_QUEUE_PRIORITY
+    elif is_local:
+        priority = min(priority, LOCAL_QUEUE_PRIORITY)
+
+    # Check if already indexed
+    url_h = url_hash(url)
+    existing_page = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
+    if existing_page:
+        return
+
+    # Check if already in queue
     existing = execute_db_fetchone("SELECT id FROM crawl_queue WHERE url = ?", (url,))
     if existing:
         return
+
     try:
         execute_db(
-            "INSERT INTO crawl_queue (site_id, url, status, priority) VALUES (?, ?, 'pending', ?)",
+            "INSERT INTO crawl_queue (site_id, url, status, priority, scheduled_at) VALUES (?, ?, 'pending', ?, 0)",
             (site_id, url, priority), commit=True
         )
     except Exception:
         pass
 
 
+def index_source(source_id):
+    """Queue every URL a single non-domain source contributes.
+
+    Returns the number of URLs considered. Safe to call from a worker thread.
+    """
+    source = get_source_by_id(source_id)
+    if not source:
+        return 0
+    if source['status'] != 'active':
+        return 0
+
+    site_id = source['site_id']
+    url = source['url']
+    source_type = source['source_type']
+    priority = source['priority'] or 5
+    queued = 0
+
+    try:
+        if source_type == 'url':
+            _queue_url(site_id, normalize_url(url), priority)
+            queued = 1
+        elif source_type == 'sitemap':
+            for u in parse_sitemap(url):
+                n = normalize_url(u)
+                if n:
+                    _queue_url(site_id, n, 3)
+                    queued += 1
+        elif source_type in FEED_SOURCE_TYPES:
+            for u in parse_feed(url):
+                n = normalize_url(u)
+                if n:
+                    _queue_url(site_id, n, 1)
+                    queued += 1
+        execute_db(
+            "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
+            (source_id,), commit=True
+        )
+    except Exception as e:
+        log_error(f"Indexing source {source_id} ({url}) failed", e)
+
+    return queued
+
+
+def index_source_async(source_id):
+    """Run index_source off the request path so adding a source never blocks."""
+
+    def _run():
+        try:
+            index_source(source_id)
+        except Exception as e:
+            log_error(f"Background indexing of source {source_id} failed", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def phase_1_discovery(site_url, max_pages=500):
     site_url = normalize_url(site_url)
     if not site_url:
         return None, 0
-    site_id = add_site(site_url, max_pages)
-    if not site_id:
-        return None, 0
 
-    execute_db("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,), commit=True)
+    # Check if site already exists
+    domain = get_domain(site_url)
+    existing = execute_db_fetchone("SELECT id FROM sites WHERE canonical_url = ?", (domain,))
+    if existing:
+        site_id = existing[0]
+        execute_db("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,), commit=True)
+    else:
+        site_id = add_site(site_url, max_pages)
+        if not site_id:
+            return None, 0
+    
+    # Update site max_pages
+    execute_db("UPDATE sites SET max_pages = ? WHERE id = ?", (max_pages, site_id), commit=True)
 
-    discovered = discover_sitemaps_and_feeds(site_url, site_id)
+    # Ensure a domain source row exists for this site
+    if not execute_db_fetchone(
+        "SELECT id FROM site_sources WHERE site_id = ? AND source_type = 'domain'", (site_id,)
+    ):
+        try:
+            execute_db(
+                """INSERT INTO site_sources (site_id, url, source_type, priority, notes, status)
+                   VALUES (?, ?, 'domain', 5, '', 'active')""",
+                (site_id, domain), commit=True
+            )
+        except Exception as e:
+            log_error(f"Could not create domain source for site {site_id}", e)
+
+    # Manually registered sources take priority over auto-discovery
+    manual_sources = execute_db_fetchall(
+        "SELECT id FROM site_sources "
+        "WHERE site_id = ? AND source_type != 'domain' AND status = 'active'",
+        (site_id,)
+    )
+    for (source_id,) in manual_sources:
+        index_source(source_id)
+
+    discovered = discover_sitemaps_and_feeds(site_url, site_id, max_pages)
     urls_to_add = []
 
     for item in discovered:
@@ -661,6 +1936,8 @@ def phase_1_discovery(site_url, max_pages=500):
 
     added = 0
     for url, priority in urls_to_add:
+        if len(urls_to_add) > max_pages:
+            break
         _queue_url(site_id, url, priority)
         added += 1
 
@@ -677,7 +1954,7 @@ def extract_page_content(url, site_id):
         'title': '', 'og_title': '', 'og_description': '', 'og_image': '',
         'favicon_url': '', 'body_text': '', 'images': [],
         'schema_type': '', 'schema_details': {}, 'audio_url': '',
-        'has_audio': 0, 'published_timestamp': 0
+        'has_audio': 0, 'published_timestamp': 0, 'seo_score': 0.0
     }
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
@@ -736,10 +2013,16 @@ def extract_page_content(url, site_id):
                         try:
                             page_data['published_timestamp'] = int(datetime.fromisoformat(dp[:10]).timestamp())
                         except Exception:
-                            pass
+                            try:
+                                page_data['published_timestamp'] = int(datetime.strptime(dp[:19], '%Y-%m-%dT%H:%M:%S').timestamp())
+                            except Exception:
+                                pass
                     break
         except Exception:
             pass
+
+        # Calculate SEO score
+        page_data['seo_score'] = calculate_seo_score(page_data)
 
         embed_text = (
             (page_data['og_title'] or page_data['title']) + ' ' +
@@ -760,8 +2043,8 @@ def process_url(queue_id, site_id, url):
         if resp.status_code == 429:
             retry_after = int(resp.headers.get('Retry-After', 60))
             execute_db(
-                "UPDATE crawl_queue SET status='pending', locked_by='' WHERE id=?",
-                (queue_id,), commit=True
+                "UPDATE crawl_queue SET status='pending', locked_by='', scheduled_at=? WHERE id=?",
+                (int(time.time()) + retry_after, queue_id), commit=True
             )
             time.sleep(min(retry_after, 300))
             return
@@ -790,89 +2073,28 @@ def process_url(queue_id, site_id, url):
                 )
             return
 
-        # Re-use already-downloaded content
-        content = resp.content
-        soup = BeautifulSoup(content, 'lxml')
+        page_data = extract_page_content(url, site_id)
+        if page_data is None:
+            execute_db(
+                "UPDATE crawl_queue SET retry_count=retry_count+1, status='pending', locked_by='' WHERE id=?",
+                (queue_id,), commit=True
+            )
+            return
 
-        page_data = {
-            'url': url, 'site_id': site_id, 'url_hash': url_hash(url),
-            'title': '', 'og_title': '', 'og_description': '', 'og_image': '',
-            'favicon_url': '', 'body_text': '', 'images': [],
-            'schema_type': '', 'schema_details': {}, 'audio_url': '',
-            'has_audio': 0, 'published_timestamp': 0
-        }
-
-        def meta(prop):
-            tag = soup.find('meta', attrs={'property': prop}) or soup.find('meta', attrs={'name': prop})
-            return tag.get('content', '') if tag else ''
-
-        page_data['og_title'] = meta('og:title')
-        page_data['og_description'] = meta('og:description')
-        page_data['og_image'] = meta('og:image')
-        t = soup.find('title')
-        page_data['title'] = t.text.strip() if t else ''
-        if not page_data['og_title']:
-            page_data['og_title'] = page_data['title']
-
-        fav = soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')
-        page_data['favicon_url'] = urljoin(url, fav['href']) if (fav and fav.get('href')) else urljoin(url, '/favicon.ico')
-
-        body_parts = []
-        for sel in ['article', 'main', 'p', 'h1', 'h2', 'h3']:
-            for el in soup.select(sel):
-                text = el.get_text().strip()
-                if text:
-                    body_parts.append(text)
-        page_data['body_text'] = ' '.join(body_parts)[:3500]
-        page_data['images'] = [
-            {'url': urljoin(url, img['src']), 'alt': img.get('alt', '')}
-            for img in soup.find_all('img', src=True)
-        ]
-        audio = soup.find('audio', src=True)
-        if audio:
-            page_data['audio_url'] = urljoin(url, audio['src'])
-            page_data['has_audio'] = 1
-        else:
-            for a in soup.find_all('a', href=True):
-                if any(a['href'].lower().endswith(ext) for ext in ('.mp3', '.m4a', '.wav', '.ogg')):
-                    page_data['audio_url'] = urljoin(url, a['href'])
-                    page_data['has_audio'] = 1
-                    break
-        try:
-            data = extruct.extract(content, uniform=True)
-            for schema in data.get('json-ld', []):
-                if isinstance(schema, dict) and '@type' in schema:
-                    page_data['schema_type'] = schema['@type']
-                    page_data['schema_details'] = schema
-                    dp = schema.get('datePublished', '')
-                    if dp:
-                        try:
-                            page_data['published_timestamp'] = int(datetime.fromisoformat(dp[:10]).timestamp())
-                        except Exception:
-                            pass
-                    break
-        except Exception:
-            pass
-
-        embed_text = (
-            (page_data['og_title'] or page_data['title']) + ' ' +
-            page_data['og_description'] + ' ' + page_data['body_text']
-        )
-        page_data['embedding'] = generate_embedding(embed_text).tobytes()
-
+        # Check if already indexed (race condition)
         existing = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (page_data['url_hash'],))
         if existing:
             execute_db(
                 """UPDATE pages SET title=?,og_title=?,og_description=?,og_image=?,
                    favicon_url=?,body_text=?,images=?,schema_type=?,schema_details=?,
-                   audio_url=?,has_audio=?,published_timestamp=?,embedding=?,
+                   audio_url=?,has_audio=?,published_timestamp=?,embedding=?,seo_score=?,
                    indexed_at=strftime('%s','now') WHERE url_hash=?""",
                 (page_data['title'], page_data['og_title'], page_data['og_description'],
                  page_data['og_image'], page_data['favicon_url'], page_data['body_text'],
                  json.dumps(page_data['images']), page_data['schema_type'],
                  json.dumps(page_data['schema_details']), page_data['audio_url'],
                  page_data['has_audio'], page_data['published_timestamp'],
-                 page_data['embedding'], page_data['url_hash']),
+                 page_data['embedding'], page_data['seo_score'], page_data['url_hash']),
                 commit=True
             )
             page_id = existing[0]
@@ -880,14 +2102,15 @@ def process_url(queue_id, site_id, url):
             execute_db(
                 """INSERT INTO pages (site_id,url,url_hash,title,og_title,og_description,og_image,
                    favicon_url,body_text,images,schema_type,schema_details,audio_url,has_audio,
-                   published_timestamp,embedding,indexed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
+                   published_timestamp,embedding,seo_score,indexed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
                 (page_data['site_id'], page_data['url'], page_data['url_hash'],
                  page_data['title'], page_data['og_title'], page_data['og_description'],
                  page_data['og_image'], page_data['favicon_url'], page_data['body_text'],
                  json.dumps(page_data['images']), page_data['schema_type'],
                  json.dumps(page_data['schema_details']), page_data['audio_url'],
-                 page_data['has_audio'], page_data['published_timestamp'], page_data['embedding']),
+                 page_data['has_audio'], page_data['published_timestamp'], page_data['embedding'],
+                 page_data['seo_score']),
                 commit=True
             )
             page_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
@@ -913,30 +2136,39 @@ def process_url(queue_id, site_id, url):
 # ============================================================================
 
 def _worker_loop(name):
-    print(f"✅ Worker {name} spusten")
+    print(f"Worker {name} spusten")
     while not SHUTDOWN_FLAG:
         try:
+            # Get domain crawl delay
+            domain_delay = MIN_DELAY
+            
             rows = execute_db_fetchall(
-                "SELECT id,site_id,url FROM crawl_queue "
-                "WHERE status='pending' AND retry_count<? "
-                "ORDER BY priority ASC LIMIT 3",
+                """SELECT cq.id, cq.site_id, cq.url, s.crawl_delay 
+                   FROM crawl_queue cq
+                   JOIN sites s ON cq.site_id = s.id
+                   WHERE cq.status='pending' AND cq.retry_count<? 
+                   ORDER BY cq.priority ASC, cq.scheduled_at ASC LIMIT 3""",
                 (MAX_RETRIES,)
             )
             if not rows:
                 time.sleep(5)
                 continue
-            for row_id, site_id, url in rows:
+            
+            for row_id, site_id, url, site_delay in rows:
+                domain_delay = max(MIN_DELAY, site_delay or MIN_DELAY)
                 execute_db(
-                    "UPDATE crawl_queue SET status='locked',locked_by=? WHERE id=?",
+                    "UPDATE crawl_queue SET status='locked',locked_by=?, scheduled_at=0 WHERE id=?",
                     (name, row_id), commit=True
                 )
-            for row_id, site_id, url in rows:
+            
+            for row_id, site_id, url, site_delay in rows:
                 if SHUTDOWN_FLAG:
                     break
                 process_url(row_id, site_id, url)
-                time.sleep(MIN_DELAY)
+                time.sleep(domain_delay)
+                
         except Exception as e:
-            print(f"⚠️  Worker {name} error: {e}")
+            print(f"Worker {name} error: {e}")
             time.sleep(5)
 
 
@@ -946,7 +2178,7 @@ def start_workers():
         t = threading.Thread(target=_worker_loop, args=(name,), daemon=True)
         t.start()
         _worker_threads.append(t)
-    print("✅ Workers spusteny (worker_a, worker_b)")
+    print("Workers spusteny (worker_a, worker_b)")
 
 
 # ============================================================================
@@ -967,8 +2199,13 @@ def check_feeds():
                 "UPDATE sitemaps_feeds SET last_checked=strftime('%s','now') WHERE id=?",
                 (feed_id,), commit=True
             )
+            execute_db(
+                "UPDATE site_sources SET last_checked=strftime('%s','now') WHERE site_id=? AND url=?",
+                (site_id, url), commit=True
+            )
         except Exception as e:
             print(f"Feed check error {url}: {e}")
+            log_error(f"Feed check error {url}", e)
 
 
 def check_sitemaps():
@@ -985,8 +2222,13 @@ def check_sitemaps():
                 "UPDATE sitemaps_feeds SET last_checked=strftime('%s','now') WHERE id=?",
                 (sm_id,), commit=True
             )
+            execute_db(
+                "UPDATE site_sources SET last_checked=strftime('%s','now') WHERE site_id=? AND url=?",
+                (site_id, url), commit=True
+            )
         except Exception as e:
             print(f"Sitemap check error {url}: {e}")
+            log_error(f"Sitemap check error {url}", e)
 
 
 def recrawl_all_sites():
@@ -1001,6 +2243,17 @@ def recrawl_all_sites():
             print(f"Recrawl error {row[1]}: {e}")
 
 
+def check_for_updates_scheduled():
+    if SHUTDOWN_FLAG:
+        return
+    try:
+        available, msg = check_for_update()
+        if available:
+            print(f"Update available: {msg}")
+    except Exception as e:
+        print(f"Update check error: {e}")
+
+
 # ============================================================================
 # SHUTDOWN
 # ============================================================================
@@ -1008,7 +2261,7 @@ def recrawl_all_sites():
 def handle_shutdown(signum, frame):
     global SHUTDOWN_FLAG
     SHUTDOWN_FLAG = True
-    print(f"\n⚠️  Signal {signum}, shutting down...")
+    print(f"Signal {signum}, shutting down...")
     close_db()
     if _scheduler:
         _scheduler.shutdown(wait=False)
@@ -1020,289 +2273,145 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 # ============================================================================
-# FLASK
+# FLASK ROUTES
 # ============================================================================
+
+def _plural_cz(count, one, few, many):
+    """Czech plural form: the last significant digit decides, except for teens."""
+    count = abs(int(count))
+    if count == 1:
+        return one
+    if 2 <= count <= 4:
+        return few
+    if count >= 5 and count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return few
+    return many
+
 
 app = Flask(__name__)
 app.secret_key = 'mini-search-secret-key'
+app.jinja_env.filters['plural_cz'] = _plural_cz
 
-SEARCH_HTML = """
-<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mini Search</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-             background:#1a1a2e;color:#e0e0e0;line-height:1.6;padding:20px}
-        .container{max-width:1200px;margin:0 auto}
-        h1{color:#e94560;margin-bottom:10px;font-size:2em}
-        .card{background:#16213e;border-radius:10px;padding:20px;margin-bottom:20px}
-        .search-wrap{display:flex;gap:10px;margin-bottom:10px;position:relative}
-        .search-wrap input{flex:1;padding:15px;border-radius:8px;border:1px solid #333;
-                           background:#1a1a2e;color:#e0e0e0;font-size:1.1em}
-        .search-wrap button{background:#e94560;color:#fff;border:none;padding:15px 30px;
-                            border-radius:8px;cursor:pointer;font-size:1.1em;font-weight:bold}
-        .search-wrap button:hover{background:#c81e45}
-        #acDropdown{position:absolute;top:58px;left:0;right:60px;background:#16213e;
-                    border:1px solid #333;border-radius:0 0 8px 8px;z-index:100;display:none}
-        #acDropdown div{padding:10px 15px;cursor:pointer;border-bottom:1px solid #222}
-        #acDropdown div:hover{background:#1f2b4a}
-        .result-item{background:#16213e;border-radius:8px;padding:20px;margin-bottom:15px;
-                     border-left:4px solid #e94560;display:flex;gap:15px}
-        .result-item:hover{background:#1f2b4a}
-        .result-content{flex:1}
-        .result-title a{color:#e94560;text-decoration:none;font-size:1.2em}
-        .result-title a:hover{text-decoration:underline}
-        .result-url{color:#2196f3;font-size:.9em;margin:4px 0;word-break:break-all}
-        .result-snippet{color:#aaa;margin-bottom:8px}
-        .result-meta{color:#666;font-size:.85em;display:flex;gap:10px;flex-wrap:wrap}
-        .result-image{max-width:120px;max-height:80px;border-radius:5px}
-        .schema-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75em;
-                      background:#2196f320;color:#2196f3;margin-right:6px}
-        .relevance-badge{display:inline-block;padding:2px 6px;background:#4caf5020;
-                         color:#4caf50;border-radius:5px;font-size:.85em;font-weight:bold}
-        .filter-buttons{display:flex;gap:10px;margin-bottom:15px;flex-wrap:wrap}
-        .filter-btn{padding:5px 12px;background:#333;border:none;border-radius:5px;
-                    color:#e0e0e0;cursor:pointer;font-size:.9em}
-        .filter-btn.active{background:#e94560}
-        .no-results{text-align:center;color:#666;padding:40px}
-        .nav a{color:#2196f3;margin-right:20px;text-decoration:none}
-        audio{max-width:300px}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="nav" style="margin-bottom:20px">
-        <a href="/">🔍 Vyhledavani</a>
-        <a href="/admin">🔧 Sprava</a>
-    </div>
-    <h1>🔍 Mini Search</h1>
-    <div class="card">
-        <div class="filter-buttons">
-            <button class="filter-btn{% if current_filter=='all' %} active{% endif %}" onclick="setFilter('all')">Vse</button>
-            <button class="filter-btn{% if current_filter=='articles' %} active{% endif %}" onclick="setFilter('articles')">Clanky</button>
-            <button class="filter-btn{% if current_filter=='podcasts' %} active{% endif %}" onclick="setFilter('podcasts')">Podcasty</button>
-            <button class="filter-btn{% if current_filter=='audio' %} active{% endif %}" onclick="setFilter('audio')">Audio</button>
-            <button class="filter-btn{% if current_filter=='price' %} active{% endif %}" onclick="setFilter('price')">Ceny</button>
-        </div>
-        <form id="searchForm" action="/" method="get">
-            <div class="search-wrap">
-                <input type="text" name="q" id="searchInput" placeholder="Zadejte hledany text..."
-                       value="{{ query }}" autocomplete="off">
-                <input type="hidden" name="filter" id="filterInput" value="{{ current_filter }}">
-                <button type="submit">Hledat</button>
-                <div id="acDropdown"></div>
-            </div>
-        </form>
-    </div>
-    {% if query %}
-    <div class="card">
-        <h2>Vysledky pro: &quot;{{ query }}&quot;</h2>
-        <div style="color:#666;font-size:.9em;margin-top:5px">Nalezeno: {{ total_results }} vysledku</div>
-        {% if results %}
-        {% for r in results %}
-        <div class="result-item">
-            {% if r.og_image or r.favicon_url %}
-            <img src="{{ r.og_image or r.favicon_url }}" class="result-image" onerror="this.style.display='none'" alt="">
-            {% endif %}
-            <div class="result-content">
-                <div class="result-title">
-                    {% if r.schema_type %}<span class="schema-badge">{{ r.schema_type }}</span>{% endif %}
-                    <a href="{{ r.url }}" target="_blank">{{ r.og_title or r.title or r.url }}</a>
-                </div>
-                <div class="result-url">{{ r.url }}</div>
-                <div class="result-snippet">{{ (r.og_description or r.body_text)[:200] }}...</div>
-                <div class="result-meta">
-                    {% if r.published_date %}📅 {{ r.published_date }}{% endif %}
-                    {% if r.has_audio == 1 %}🎵{% endif %}
-                    {% if r.relevance %}<span class="relevance-badge">{{ r.relevance }}%</span>{% endif %}
-                </div>
-                {% if r.audio_url and r.has_audio == 1 %}
-                <div style="margin-top:10px">
-                    <audio controls><source src="{{ r.audio_url }}" type="audio/mpeg"></audio>
-                </div>
-                {% endif %}
-            </div>
-        </div>
-        {% endfor %}
-        {% else %}
-        <div class="no-results">
-            <p>🔍 Zadne vysledky nenalezeny</p>
-            <p style="font-size:.9em;color:#666">Zkuste jine slovo nebo pridejte stranky pres spravce.</p>
-        </div>
-        {% endif %}
-    </div>
-    {% endif %}
-</div>
-<script>
-    function setFilter(f){
-        document.getElementById('filterInput').value=f;
-        document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-        event.target.classList.add('active');
-        document.getElementById('searchForm').submit();
-    }
-    let acTimer;
-    document.getElementById('searchInput').addEventListener('input',function(){
-        clearTimeout(acTimer);
-        const q=this.value.trim();
-        if(q.length<2){document.getElementById('acDropdown').style.display='none';return;}
-        acTimer=setTimeout(()=>{
-            fetch('/autocomplete?q='+encodeURIComponent(q))
-                .then(r=>r.json())
-                .then(data=>{
-                    const dd=document.getElementById('acDropdown');
-                    dd.innerHTML='';
-                    if(!data.results||!data.results.length){dd.style.display='none';return;}
-                    data.results.forEach(item=>{
-                        const d=document.createElement('div');
-                        d.textContent=item;
-                        d.onclick=()=>{document.getElementById('searchInput').value=item;
-                                        dd.style.display='none';
-                                        document.getElementById('searchForm').submit();};
-                        dd.appendChild(d);
-                    });
-                    dd.style.display='block';
-                });
-        },280);
-    });
-    document.addEventListener('click',e=>{
-        if(!e.target.closest('.search-wrap'))
-            document.getElementById('acDropdown').style.display='none';
-    });
-</script>
-</body>
-</html>
-"""
+SEARCH_PAGE_SIZE = 25
+# Hard ceiling on how many results a single query may pull from the index.
+# Also bounds how deep pagination can go (page * SEARCH_PAGE_SIZE).
+SEARCH_MAX_RESULTS = 500
 
-ADMIN_HTML = """
-<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mini Search - Admin</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-             background:#1a1a2e;color:#e0e0e0;line-height:1.6;padding:20px}
-        .container{max-width:1200px;margin:0 auto}
-        h1{color:#e94560;margin-bottom:10px;font-size:1.8em}
-        .card{background:#16213e;border-radius:10px;padding:20px;margin-bottom:20px}
-        .card h3{color:#0f3460;margin-bottom:15px}
-        .btn{background:#e94560;color:#fff;border:none;padding:10px 20px;
-             border-radius:5px;cursor:pointer;font-size:1em;text-decoration:none;display:inline-block}
-        .btn:hover{background:#c81e45}
-        .btn-green{background:#4caf50}.btn-green:hover{background:#388e3c}
-        .btn-orange{background:#ff9800}.btn-orange:hover{background:#e68a00}
-        .btn-gray{background:#666}.btn-gray:hover{background:#555}
-        .form-group{margin-bottom:15px}
-        .form-group label{display:block;margin-bottom:5px;color:#0f3460}
-        .form-group input{width:100%;padding:10px;border-radius:5px;border:1px solid #333;
-                          background:#1a1a2e;color:#e0e0e0;font-size:1em}
-        table{width:100%;border-collapse:collapse}
-        th,td{padding:12px;text-align:left;border-bottom:1px solid #333}
-        th{background:#0f3460;color:#fff}
-        tr:hover{background:#1f2b4a}
-        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:15px}
-        .stat-card{background:#1a1a2e;padding:15px;border-radius:8px;text-align:center}
-        .stat-value{font-size:2em;font-weight:bold;color:#e94560}
-        .stat-label{color:#0f3460;font-size:.9em;margin-top:5px}
-        .nav a{color:#2196f3;margin-right:20px;text-decoration:none}
-        .msg{padding:10px 15px;border-radius:5px;margin-bottom:15px}
-        .msg-ok{background:#4caf5020;color:#4caf50}
-        .msg-err{background:#e9456020;color:#e94560}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="nav" style="margin-bottom:20px">
-        <a href="/">🔍 Vyhledavani</a>
-        <a href="/admin">🔧 Sprava</a>
-    </div>
-    <h1>🔧 Spravce</h1>
-    {% if request.args.get('success') %}
-    <div class="msg msg-ok">✅ {{ request.args.get('success') }}</div>
-    {% endif %}
-    {% if request.args.get('error') %}
-    <div class="msg msg-err">❌ {{ request.args.get('error') }}</div>
-    {% endif %}
-    <div class="card">
-        <h3>📊 Prehled</h3>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">{{ stats.sites }}</div><div class="stat-label">Weby</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.pages }}</div><div class="stat-label">Indexovano</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.pending }}</div><div class="stat-label">Ceka</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.completed }}</div><div class="stat-label">Dokonceno</div></div>
-            <div class="stat-card"><div class="stat-value">{{ stats.errors }}</div><div class="stat-label">Chyby</div></div>
-        </div>
-    </div>
-    <div class="card">
-        <h3>➕ Pridat stranku</h3>
-        <form action="/admin/add" method="post">
-            <div class="form-group"><label>URL:</label>
-                <input type="url" name="url" placeholder="https://priklad.cz" required></div>
-            <div class="form-group"><label>Max. stranek (default 500):</label>
-                <input type="number" name="max_pages" value="500" min="1" max="10000"></div>
-            <button type="submit" class="btn btn-green">Pridat</button>
-        </form>
-    </div>
-    <div class="card">
-        <h3>🌐 Sledovane stranky</h3>
-        {% if sites %}
-        <table>
-            <thead><tr><th>ID</th><th>URL</th><th>Stav</th><th>Indexovano</th><th>Ceka</th><th>Posledni crawl</th><th>Akce</th></tr></thead>
-            <tbody>
-            {% for site in sites %}
-            <tr>
-                <td>{{ site.id }}</td>
-                <td>{{ site.canonical_url }}</td>
-                <td>{{ site.status }}</td>
-                <td>{{ site.indexed_count }}</td>
-                <td>{{ site.pending_count }}</td>
-                <td>{{ site.last_crawled_str }}</td>
-                <td>
-                    <a href="/admin/recrawl/{{ site.id }}" class="btn btn-orange" style="padding:5px 10px;font-size:.9em">Recrawl</a>
-                    <a href="/admin/delete/{{ site.id }}" class="btn btn-gray" style="padding:5px 10px;font-size:.9em"
-                       onclick="return confirm('Opravdu smazat?')">Smazat</a>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p style="color:#666">Zadne stranky. Pridejte prvni stranku vyse.</p>
-        {% endif %}
-    </div>
-</div>
-<script>
-    function checkPending(){
-        fetch('/admin/stats').then(r=>r.json()).then(d=>{
-            if(d.pending>0) setTimeout(()=>location.reload(),5000);
-        });
-    }
-    setInterval(checkPending,30000);
-    checkPending();
-</script>
-</body>
-</html>
-"""
+
+def _result_domain(url):
+    """Hostname for the breadcrumb line under a result title."""
+    try:
+        return (urlparse(url).hostname or '').replace('www.', '')
+    except Exception:
+        return ''
+
+
+def _result_url_path(url):
+    """Path portion shown after the domain in the breadcrumb line."""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or '/'
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return path
+    except Exception:
+        return url or ''
+
+
+def _result_snippet(page, query, length=240):
+    """Body text windowed around the first query match so the hit is visible."""
+    text = (page.get('og_description') or page.get('body_text') or '').strip()
+    if not text:
+        return ''
+    text = re.sub(r'\s+', ' ', text)
+
+    lowered = text.lower()
+    position = -1
+    for term in (query or '').lower().split():
+        position = lowered.find(term)
+        if position != -1:
+            break
+
+    if position > length // 2:
+        start = max(position - length // 3, 0)
+        prefix = '… '
+        text = text[start:start + length]
+    else:
+        prefix = ''
+        text = text[:length]
+
+    suffix = '…' if len(text) >= length else ''
+    return f"{prefix}{text.strip()}{suffix}"
+
+
+def _highlight_snippet(snippet, query):
+    """Wrap query terms in <mark>. Escaping happens before the markup is added."""
+    escaped = escape(snippet)
+    terms = {t for t in (query or '').lower().split() if len(t) > 2}
+    if not terms:
+        return escaped
+
+    pattern = '|'.join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
+
+    def replace(match):
+        return f'<mark>{match.group(0)}</mark>'
+
+    try:
+        return re.sub(f'({pattern})', replace, escaped, flags=re.IGNORECASE)
+    except re.error:
+        return escaped
+
+
+def prepare_results(results, query):
+    """Attach display-only fields so the template stays free of logic."""
+    prepared = []
+    for page in results:
+        item = dict(page)
+        item['domain'] = _result_domain(item.get('url', ''))
+        item['display_url_path'] = _result_url_path(item.get('url', ''))
+        item['snippet_html'] = _highlight_snippet(_result_snippet(item, query), query)
+        item['relevance_pct'] = int(round(float(item.get('relevance') or 0)))
+        item['display_title'] = item.get('og_title') or item.get('title') or item.get('url', '')
+        item['display_date'] = item.get('published_date') or ''
+        item['thumb'] = item.get('og_image') or item.get('favicon_url') or ''
+        prepared.append(item)
+    return prepared
 
 
 @app.route('/')
 def search_index():
     query = request.args.get('q', '').strip()
     filter_type = request.args.get('filter', 'all')
+    try:
+        page = max(int(request.args.get('page', 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+
+    results = []
+    has_next = False
     if query:
-        results = vector_search(query, limit=25, filter_type=filter_type if filter_type != 'all' else None)
-        return render_template_string(
-            SEARCH_HTML, query=query, results=results,
-            total_results=len(results), current_filter=filter_type
+        # hybrid_search has no offset, so fetch the window for the requested
+        # page plus one peek row (to detect a next page) and slice it. The cap
+        # bounds how deep pagination can reach into the index.
+        fetch_limit = min(page * SEARCH_PAGE_SIZE + 1, SEARCH_MAX_RESULTS)
+        window = hybrid_search(
+            query, limit=fetch_limit,
+            filter_type=filter_type if filter_type != 'all' else None
         )
-    return render_template_string(
-        SEARCH_HTML, query='', results=[], total_results=0, current_filter='all'
+        start = (page - 1) * SEARCH_PAGE_SIZE
+        results = window[start:start + SEARCH_PAGE_SIZE]
+        has_next = len(window) > start + SEARCH_PAGE_SIZE
+
+    return render_template(
+        'search.html',
+        active_page='search',
+        query=query,
+        results=prepare_results(results, query),
+        total_results=len(results),
+        current_filter=filter_type,
+        page=page,
+        has_prev=page > 1,
+        has_next=has_next,
     )
 
 
@@ -1322,40 +2431,433 @@ def autocomplete():
     return jsonify({'results': [row[0] for row in rows]})
 
 
+# ============================================================================
+# ADMIN UI (Clay panel, Google Search Console style)
+# ============================================================================
+
+ADMIN_PAGE_SIZE = 10
+
+
+def _admin_message():
+    """Read flash message from query string."""
+    if request.args.get('success'):
+        return request.args.get('success'), True
+    if request.args.get('error'):
+        return request.args.get('error'), False
+    return '', True
+
+
+def _page_url(page_number):
+    args = request.args.to_dict()
+    args['page'] = page_number
+    return '/admin/sites?' + urlencode(args)
+
+
+def _source_from_form(payload, require_site=True):
+    """Extract and coerce a source payload. Returns (data, error)."""
+    source_type = (payload.get('source_type') or '').strip()
+    if source_type not in VALID_SOURCE_TYPES:
+        return None, 'Neplatný typ zdroje'
+    url = (payload.get('url') or '').strip()
+    ok, message = validate_url(url)
+    if not ok:
+        return None, message
+    ok, message, priority = validate_priority(payload.get('priority', 5))
+    if not ok:
+        return None, message
+    data = {
+        'url': url,
+        'source_type': source_type,
+        'priority': priority,
+        'notes': (payload.get('notes') or '').strip(),
+    }
+    if require_site:
+        site_id = payload.get('site_id')
+        if not site_id:
+            return None, 'Vyberte doménu'
+        try:
+            data['site_id'] = int(site_id)
+        except (TypeError, ValueError):
+            return None, 'Neplatná doména'
+    elif payload.get('site_id'):
+        try:
+            data['site_id'] = int(payload['site_id'])
+        except (TypeError, ValueError):
+            return None, 'Neplatná doména'
+    if payload.get('max_pages') not in (None, ''):
+        ok, message, max_pages = validate_max_pages(payload['max_pages'])
+        if not ok:
+            return None, message
+        data['max_pages'] = max_pages
+    # ``is_local`` is tri-state: absent means "detect from the URL", while an
+    # explicit checkbox value forces the flag.
+    if payload.get('is_local') not in (None, ''):
+        value = payload['is_local']
+        if isinstance(value, str):
+            value = value.strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+        data['is_local'] = bool(value)
+    return data, None
+
+
 @app.route('/admin')
+@app.route('/admin/')
 def admin_index():
-    return render_template_string(ADMIN_HTML, stats=get_db_stats(), sites=get_all_sites())
+    message, ok = _admin_message()
+    return render_template(
+        'admin/dashboard.html',
+        active_page='dashboard',
+        stats=get_db_stats(),
+        sites=get_all_sites()[:6],
+        update_status=get_update_status(),
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/add', methods=['POST'])
-def admin_add_site():
-    url = request.form.get('url', '').strip()
-    max_pages = int(request.form.get('max_pages', 500))
-    if not url:
-        return redirect('/admin?error=URL je povinna')
-    site_id, added = phase_1_discovery(url, max_pages)
-    if site_id:
-        return redirect(f'/admin?success=Stranka pridana! {added} URL k prozkoumani')
-    return redirect('/admin?error=Chyba pri pridavani stranky')
+@app.route('/admin/sites')
+def admin_sites():
+    search = request.args.get('q', '').strip()
+    status = request.args.get('status', '').strip()
+    source_type = request.args.get('source_type', '').strip()
+    local_only = request.args.get('local') == '1'
+
+    all_sites = get_filtered_sites(search=search, status=status,
+                                   source_type=source_type, local_only=local_only)
+    total = len(all_sites)
+
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (TypeError, ValueError):
+        page = 1
+    pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = min(page, pages)
+    start = (page - 1) * ADMIN_PAGE_SIZE
+    page_sites = all_sites[start:start + ADMIN_PAGE_SIZE]
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/sites.html',
+        active_page='sites',
+        sites=page_sites,
+        total=total,
+        page=page,
+        pages=pages,
+        query=search,
+        status=status,
+        source_type=source_type,
+        local_only=local_only,
+        build_page_url=_page_url,
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/recrawl/<int:site_id>')
-def admin_recrawl_site(site_id):
+@app.route('/admin/sites/<int:site_id>')
+def admin_site_detail(site_id):
     site = get_site_by_id(site_id)
-    if site:
-        phase_1_discovery(site['canonical_url'], site['max_pages'])
-    return redirect('/admin?success=Re-crawl zahajen')
+    if not site:
+        return redirect('/admin/sites?error=Web nenalezen')
+
+    _decorate_site(site)
+
+    errors = [
+        dict(row) for row in execute_db_fetchall(
+            "SELECT url, error_reason, retry_count FROM crawl_queue "
+            "WHERE site_id = ? AND status = 'error' ORDER BY id DESC LIMIT 50",
+            (site_id,)
+        )
+    ]
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/site_detail.html',
+        active_page='sites',
+        site=site,
+        stats=get_source_stats(site_id),
+        sources=get_site_sources(site_id),
+        recent_pages=get_recent_pages(site_id, limit=15),
+        errors=errors,
+        message=message,
+        message_ok=ok,
+    )
 
 
-@app.route('/admin/delete/<int:site_id>')
-def admin_delete_site(site_id):
+@app.route('/admin/sites/<int:site_id>/edit', methods=['GET', 'POST'])
+def admin_site_edit(site_id):
+    site = get_site_by_id(site_id)
+    if not site:
+        return redirect('/admin/sites?error=Web nenalezen')
+
+    if request.method == 'POST':
+        ok, message = update_site(
+            site_id,
+            max_pages=request.form.get('max_pages'),
+            status=request.form.get('status'),
+            aliases=request.form.get('aliases', ''),
+            # A checkbox only appears in the payload when ticked, so read it
+            # from the raw form to make unticking work too.
+            is_local='is_local' in request.form,
+            search_priority_multiplier=request.form.get('search_priority_multiplier'),
+        )
+        if ok:
+            return redirect(f'/admin/sites/{site_id}?success={message}')
+        return redirect(f'/admin/sites/{site_id}/edit?error={message}')
+
+    _decorate_site(site)
+
+    message, ok = _admin_message()
+    return render_template(
+        'admin/edit_site.html',
+        active_page='sites',
+        site=site,
+        max_pages_min=MAX_PAGES_MIN,
+        max_pages_max=MAX_PAGES_MAX,
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sites/<int:site_id>/recrawl')
+def admin_site_recrawl(site_id):
+    ok, message = recrawl_site(site_id)
+    key = 'success' if ok else 'error'
+    return redirect(f'/admin/sites/{site_id}?{key}={message}')
+
+
+@app.route('/admin/sites/<int:site_id>/delete')
+def admin_site_delete(site_id):
     delete_site(site_id)
-    return redirect('/admin?success=Stranka smazana')
+    return redirect('/admin/sites?success=Web byl smazán')
+
+
+@app.route('/admin/sources/new', methods=['GET'])
+def admin_source_new():
+    message, ok = _admin_message()
+    preselect = request.args.get('site_id', type=int)
+    return render_template(
+        'admin/add_source.html',
+        active_page='add',
+        sites=get_all_sites(),
+        preselect_site=preselect,
+        redirect_to=f'/admin/sites/{preselect}' if preselect else '/admin/sites',
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sites/<int:site_id>/sources/new', methods=['GET'])
+def admin_site_source_new(site_id):
+    message, ok = _admin_message()
+    return render_template(
+        'admin/add_source.html',
+        active_page='sites',
+        sites=get_all_sites(),
+        preselect_site=site_id,
+        redirect_to=f'/admin/sites/{site_id}',
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/sources/<int:source_id>/edit', methods=['GET'])
+def admin_source_edit(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return redirect('/admin/sites?error=Zdroj nenalezen')
+    site = get_site_by_id(source['site_id']) or {}
+    message, ok = _admin_message()
+    return render_template(
+        'admin/edit_source.html',
+        active_page='sites',
+        source=source,
+        max_pages=site.get('max_pages', 500),
+        message=message,
+        message_ok=ok,
+    )
+
+
+@app.route('/admin/recrawl-all')
+def admin_recrawl_all():
+    count = 0
+    for site in get_all_sites():
+        if site['status'] == 'active':
+            recrawl_site(site['id'])
+            count += 1
+    return redirect(f'/admin?success=Recrawl zahájen pro {count} webů')
+
+
+@app.route('/admin/pause-all')
+def admin_pause_all():
+    execute_db("UPDATE sites SET status='paused' WHERE status='active'", commit=True)
+    return redirect('/admin?success=Všechny aktivní weby byly pozastaveny')
+
+
+@app.route('/admin/resume-all')
+def admin_resume_all():
+    execute_db("UPDATE sites SET status='active' WHERE status='paused'", commit=True)
+    return redirect('/admin?success=Všechny pozastavené weby byly obnoveny')
+
+
+@app.route('/admin/search')
+def admin_search():
+    query = request.args.get('q', '').strip()
+    filter_type = request.args.get('filter', 'all')
+    results = []
+    if query:
+        results = hybrid_search(query, limit=50,
+                                filter_type=filter_type if filter_type != 'all' else None)
+    message, ok = _admin_message()
+    return render_template(
+        'admin/search.html',
+        active_page='index_search',
+        query=query,
+        results=results,
+        current_filter=filter_type,
+        message=message,
+        message_ok=ok,
+    )
+
+
+# ---------------------------- JSON API ------------------------------------
+
+@app.route('/admin/api/sources', methods=['GET'])
+def api_sources_list():
+    site_id = request.args.get('site_id', type=int)
+    source_type = request.args.get('source_type', '').strip()
+    if site_id:
+        sources = get_site_sources(site_id)
+    else:
+        sources = get_all_sources()
+    if source_type:
+        sources = [s for s in sources if s.get('source_type') == source_type]
+    return jsonify({'sources': sources, 'count': len(sources)})
+
+
+@app.route('/admin/api/sources', methods=['POST'])
+def api_sources_create():
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    data, error = _source_from_form(payload, require_site=False)
+    if error:
+        return jsonify({'error': error}), 400
+
+    site_id = data.pop('site_id', None)
+    max_pages = data.pop('max_pages', None)
+
+    is_local = data.pop('is_local', None)
+    if site_id is None:
+        if data['source_type'] != 'domain':
+            # Auto-create the parent domain from the supplied URL
+            site_id = add_site(data['url'], 500, is_local=is_local)
+            if not site_id:
+                return jsonify({'error': 'Doménu nebylo možné vytvořit'}), 400
+        else:
+            site_id = 0
+    elif is_local:
+        # An explicit "local" tick on an existing domain upgrades that domain.
+        update_site(site_id, is_local=True,
+                    search_priority_multiplier=LOCAL_SITE_PRIORITY_MULTIPLIER)
+
+    source_id, error = add_source(site_id, is_local=is_local, **data)
+    if error:
+        return jsonify({'error': error}), 400
+
+    source = get_source_by_id(source_id)
+    if max_pages is not None and source:
+        update_site(source['site_id'], max_pages=max_pages)
+
+    # Actually index the new source instead of waiting for a manual recrawl.
+    if source:
+        index_source_async(source_id)
+        if source['source_type'] == 'domain':
+            # A bare domain has no sitemap/feed to walk yet, so discover the
+            # links reachable from the homepage to give the queue something.
+            recrawl_async(source['site_id'])
+
+    return jsonify({'id': source_id, 'message': 'Zdroj byl přidán a zařazen k indexaci'}), 201
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['GET'])
+def api_source_get(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return jsonify({'error': 'Zdroj nenalezen'}), 404
+    return jsonify(source)
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['PUT', 'PATCH'])
+def api_source_update(source_id):
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    allowed = ('url', 'source_type', 'priority', 'notes', 'status', 'max_pages')
+    kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
+    ok, message = update_source(source_id, **kwargs)
+    if not ok:
+        return jsonify({'error': message}), 400
+    return jsonify({'message': message, 'source': get_source_by_id(source_id)})
+
+
+@app.route('/admin/api/sources/<int:source_id>', methods=['DELETE'])
+def api_source_delete(source_id):
+    ok, message = delete_source(source_id)
+    if not ok:
+        return jsonify({'error': message}), 404
+    return jsonify({'message': message})
+
+
+@app.route('/admin/api/sites', methods=['GET'])
+def api_sites_list():
+    search = request.args.get('q', '').strip()
+    status = request.args.get('status', '').strip()
+    source_type = request.args.get('source_type', '').strip()
+    return jsonify({'sites': get_filtered_sites(search, status, source_type)})
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['GET'])
+def api_site_get(site_id):
+    site = get_site_by_id(site_id)
+    if not site:
+        return jsonify({'error': 'Web nenalezen'}), 404
+    site['stats'] = get_source_stats(site_id)
+    site['sources'] = get_site_sources(site_id)
+    return jsonify(site)
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['PUT', 'PATCH'])
+def api_site_update(site_id):
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    allowed = ('max_pages', 'status', 'aliases', 'is_local', 'search_priority_multiplier')
+    kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
+    ok, message = update_site(site_id, **kwargs)
+    if not ok:
+        return jsonify({'error': message}), 400
+    return jsonify({'message': message, 'site': get_site_by_id(site_id)})
+
+
+@app.route('/admin/api/sites/<int:site_id>', methods=['DELETE'])
+def api_site_delete(site_id):
+    if not get_site_by_id(site_id):
+        return jsonify({'error': 'Web nenalezen'}), 404
+    delete_site(site_id)
+    return jsonify({'message': 'Web byl smazán'})
+
+
+@app.route('/admin/api/stats')
+def api_stats():
+    stats = get_db_stats()
+    stats['sources'] = execute_db_fetchone("SELECT COUNT(*) FROM site_sources")[0]
+    return jsonify(stats)
+
+
+@app.route('/admin/api/sources/<int:source_id>/stats')
+def api_source_stats(source_id):
+    source = get_source_by_id(source_id)
+    if not source:
+        return jsonify({'error': 'Zdroj nenalezen'}), 404
+    return jsonify(get_source_stats(source['site_id']))
 
 
 @app.route('/admin/stats')
 def admin_stats():
-    return jsonify(get_db_stats())
+    return api_stats()
 
 
 @app.route('/admin/errors/<int:site_id>')
@@ -1367,36 +2869,66 @@ def admin_errors(site_id):
     return jsonify([{'url': r[0], 'error': r[1]} for r in rows])
 
 
+@app.route('/admin/check-update')
+def admin_check_update():
+    try:
+        available, msg = check_for_update()
+        if available:
+            return redirect('/admin?success=Aktualizace je dostupná! ' + msg)
+        return redirect('/admin?success=Žádná aktualizace není dostupná. ' + msg)
+    except Exception as e:
+        log_error('Update check failed', e)
+        return redirect(f'/admin?error=Chyba při kontrole aktualizace: {str(e)}')
+
+
+@app.route('/admin/apply-update')
+def admin_apply_update():
+    try:
+        success, msg = apply_update()
+        key = 'success' if success else 'error'
+        return redirect(f'/admin?{key}={msg}')
+    except Exception as e:
+        log_error('Apply update failed', e)
+        return redirect(f'/admin?error=Chyba při aktualizaci: {str(e)}')
+
+
+@app.route('/admin/update-status')
+def admin_update_status():
+    return jsonify(get_update_status())
+
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == '__main__':
     print('=' * 70)
-    print('Mini Search v6.1')
+    print('Mini Search v7.4 - Hybrid Search Engine')
     print('=' * 70)
 
     get_db()
-    print('✅ Databaze inicializovana')
+    print('Database initialized')
 
     get_hnsw_index()
-    print('✅ hnswlib index inicializovan')
+    print('hnswlib index initialized')
 
     get_model()
-    print('✅ Model nacten')
+    print('Model loaded')
 
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(check_feeds,      IntervalTrigger(hours=1),  id='check_feeds')
     _scheduler.add_job(check_sitemaps,   IntervalTrigger(hours=24), id='check_sitemaps')
-    _scheduler.add_job(recrawl_all_sites,IntervalTrigger(hours=12), id='recrawl_all')
+    _scheduler.add_job(recrawl_all_sites, IntervalTrigger(hours=12), id='recrawl_all')
+    _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
     _scheduler.start()
-    print('✅ Scheduler spusten')
+    print('Scheduler started')
 
     start_workers()
 
     print()
     print('http://0.0.0.0:8070')
-    print('Ctrl+C pro ukonceni')
+    print('Ctrl+C to stop')
     print('=' * 70)
 
     app.run(host='0.0.0.0', port=8070, debug=False, threaded=True)

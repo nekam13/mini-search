@@ -1,25 +1,26 @@
 #!/bin/bash
 
-# Mini Search - Start skript v6.0
+# Mini Search - Start skript v7.0
 
 set -e
 
 echo "=========================================="
-echo "Mini Search - Spouštění v6.0"
+echo "Mini Search - Spousteni v7.0"
 echo "=========================================="
 echo ""
 
 # Kontrola setupu
 if [ ! -f ".setup_done" ]; then
-    echo "[!] Setup nebyl proveden, spouštím setup.sh..."
+    echo "[!] Setup nebyl proveden, spoustim setup.sh..."
     ./setup.sh
+    exit 0
 fi
 
 echo ""
 
-# Ukonči staré procesy
+# Ukonceni starych procesu
 if [ -f "app.pid" ]; then
-    echo "[*] Ukončování starého procesu..."
+    echo "[*] Ukoncuji stary proces..."
     kill $(cat app.pid) 2>/dev/null || true
     rm -f app.pid
 fi
@@ -27,17 +28,23 @@ fi
 fuser -k 8070/tcp 2>/dev/null || true
 sleep 1
 
-# Vytvoř logs adresář
+# Vytvoreni adresaru pro logy
 mkdir -p logs
 
-# Spusť aplikaci
-echo "[*] Spouštím Mini Search..."
+# Aktivace virtualniho prostredi a spusteni
+if [ -d "venv" ]; then
+    echo "[*] Aktivuji virtualni prostredi..."
+    source venv/bin/activate
+fi
+
+echo "[*] Spoustim Mini Search..."
 nohup python3 app_combined.py > logs/app.log 2>&1 &
 echo $! > app.pid
 
 echo ""
-echo "✅ Mini Search spuštěn na http://localhost:8070"
+echo "Mini Search spusten na http://localhost:8070"
 echo "   PID: $(cat app.pid)"
 echo "   Logy: tail -f logs/app.log"
 echo ""
-echo "Pro zastavení: ./stop.sh"
+echo "Pro zastaveni: ./stop.sh"
+echo "Pro aktualizaci: ./update.sh"

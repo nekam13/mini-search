@@ -1,0 +1,13 @@
+/* Mini Search - admin panel. Shared design tokens live in clay.css, loaded first. */
+
+/* ---------------- Site cards ---------------- */
+.site-grid { display: grid; grid-template-columns: 1fr; gap: 4px; }
+.site-card .meta { color: var(--text-light); font-size: 0.85rem; display: flex; gap: 14px; flex-wrap: wrap; }
+.aliases { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.source-list { display: flex; flex-direction: column; gap: 8px; }
+.source-row {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 12px; border-radius: 8px; background: #fafafa;
+    border: 1px solid #f0f0f0;
+}
+.source-row .url { flex: 1; min-width: 200px; word-break: break-all; font-size: 0.9rem; }

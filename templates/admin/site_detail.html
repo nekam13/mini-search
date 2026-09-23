@@ -1,0 +1,111 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ site.canonical_url }}{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <div>
+            <h2>{{ site.canonical_url }}
+                {% if site.is_local %}<span class="badge local-badge" title="Lokální web">🏠 Lokální</span>{% endif %}
+            </h2>
+            <div class="meta muted" style="font-size:.85rem">
+                Kanonická URL: {{ site.canonical_url }}
+                {% if site.aliases_list %} · Aliasy: {{ site.aliases_list | join(', ') }}{% endif %}
+                · Priorita ve vyhledávání: {{ '%g×'|format(site.search_priority_multiplier) }}
+                {% if site.is_local %} · robots.txt ignorováno{% endif %}
+            </div>
+        </div>
+        <span class="badge status-{{ site.status }}">
+            {% if site.status == 'active' %}Aktivní{% elif site.status == 'blocked' %}Blokováno{% else %}Pozastaveno{% endif %}
+        </span>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value">{{ stats.indexed }}</div><div class="stat-label">Indexované stránky</div></div>
+        <div class="stat-card secondary"><div class="stat-value">{{ stats.pending }}</div><div class="stat-label">Čekající v frontě</div></div>
+        <div class="stat-card accent"><div class="stat-value">{{ stats.total }}</div><div class="stat-label">Celkem stránek</div></div>
+        <div class="stat-card danger"><div class="stat-value">{{ stats.errors }}</div><div class="stat-label">Chyby</div></div>
+        <div class="stat-card"><div class="stat-value">{{ stats.sources }}</div><div class="stat-label">Zdroje</div></div>
+        <div class="stat-card"><div class="stat-value" style="font-size:1rem">{{ site.last_crawled_str }}</div><div class="stat-label">Poslední crawl</div></div>
+    </div>
+
+    <div class="actions">
+        <a href="/admin/sites/{{ site.id }}/edit" class="btn btn-secondary">Editovat</a>
+        <a href="/admin/sites/{{ site.id }}/recrawl" class="btn btn-primary">Recrawl</a>
+        {% if site.status == 'active' %}
+        <button class="btn btn-accent" data-toggle-status="paused" data-site-id="{{ site.id }}">Pauza</button>
+        {% else %}
+        <button class="btn btn-accent" data-toggle-status="active" data-site-id="{{ site.id }}">Obnovit</button>
+        {% endif %}
+        <a href="/admin/sites/{{ site.id }}/delete" class="btn btn-danger"
+           onclick="return confirm('Smazat web včetně všech stránek?')">Smazat</a>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>Zdroje pod doménou</h3>
+        <a href="/admin/sites/{{ site.id }}/sources/new" class="btn btn-primary btn-sm">Přidat zdroj</a>
+    </div>
+    {% if sources %}
+    <div class="source-list">
+        {% for source in sources %}
+        <div class="source-row">
+            <span class="badge badge-type">{{ source.source_type }}</span>
+            <span class="url">{{ source.url }}</span>
+            <span class="badge badge-accent">Priorita {{ source.priority }}</span>
+            {% if source.notes %}<span class="muted" style="font-size:.82rem">{{ source.notes }}</span>{% endif %}
+            <span class="muted" style="font-size:.78rem">Kontrolováno: {{ source.last_checked_str }}</span>
+            <span class="badge status-{{ source.status }}">{{ source.status }}</span>
+            <a href="/admin/sources/{{ source.id }}/edit" class="btn btn-secondary btn-sm">Editovat</a>
+            <button class="btn btn-danger btn-sm" data-delete-source="{{ source.id }}">Smazat</button>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="table-empty">Žádné zdroje. Přidejte URL, sitemapu nebo feed.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <div class="card-header"><h3>Naposledy indexované stránky</h3></div>
+    {% if recent_pages %}
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Titulek</th><th>URL</th><th>Typ</th><th>SEO</th><th>Indexováno</th></tr></thead>
+            <tbody>
+            {% for page in recent_pages %}
+            <tr>
+                <td>{{ page.title }}</td>
+                <td><a href="{{ page.url }}" target="_blank" rel="noopener">{{ page.url }}</a></td>
+                <td>{% if page.schema_type %}<span class="badge badge-type">{{ page.schema_type }}</span>{% endif %}</td>
+                <td>{{ '%.0f' | format(page.seo_score or 0) }}</td>
+                <td>{{ page.indexed_at_str }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="table-empty">Zatím nejsou indexované žádné stránky.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <div class="card-header"><h3>Chyby crawlování</h3></div>
+    {% if errors %}
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>URL</th><th>Důvod</th><th>Pokusů</th></tr></thead>
+            <tbody>
+            {% for error in errors %}
+            <tr><td>{{ error.url }}</td><td>{{ error.error_reason }}</td><td>{{ error.retry_count }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="table-empty">Žádné chyby.</p>
+    {% endif %}
+</div>
+{% endblock %}

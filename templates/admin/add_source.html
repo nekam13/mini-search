@@ -1,0 +1,80 @@
+{% extends "admin/base.html" %}
+{% block title %}Přidat zdroj{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header"><h2>Přidat web nebo zdroj</h2></div>
+    <form id="source-form"
+          data-endpoint="/admin/api/sources"
+          data-method="POST"
+          data-redirect="{{ redirect_to or '/admin/sites' }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label for="site_id">Doména (rodič)</label>
+                <select id="site_id" name="site_id">
+                    <option value="">— nová doména —</option>
+                    {% for site in sites %}
+                    <option value="{{ site.id }}" {% if preselect_site == site.id %}selected{% endif %}>
+                        {{ site.canonical_url }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <div class="hint">Vyberte existující doménu nebo ponechte prázdné pro vytvoření nové.</div>
+            </div>
+            <div class="form-group">
+                <label for="source_type">Typ zdroje</label>
+                <select id="source_type" name="source_type">
+                    <option value="domain">Doména</option>
+                    <option value="url" selected>Konkrétní URL</option>
+                    <option value="sitemap">Sitemap</option>
+                    <option value="rss">RSS feed</option>
+                    <option value="atom">Atom feed</option>
+                    <option value="feed">Feed (obecný)</option>
+                </select>
+                <div class="hint">Typ se předvyplní automaticky podle zadané adresy.</div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="url">URL zdroje</label>
+            <input type="text" id="url" name="url" required
+                   placeholder="https://example.com/sitemap.xml">
+            <div class="hint">Povinné. Přijímá doménu i plnou adresu včetně https.</div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="priority">Priorita (1–10)</label>
+                <input type="number" id="priority" name="priority" value="5" min="1" max="10">
+            </div>
+            <div class="form-group">
+                <label for="max_pages">Max. stránek (1–10000)</label>
+                <input type="number" id="max_pages" name="max_pages" value="500" min="1" max="10000">
+                <div class="hint">Vztahuje se na celou doménu.</div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="is_local" name="is_local" value="1">
+                Lokální web (místní síť)
+            </label>
+            <div class="hint">
+                Ponechte nezaškrtnuté pro automatickou detekci. Lokální weby
+                (localhost, 192.168.x.x, 10.x.x.x, …) se indexují bez ohledu na
+                robots.txt a mají 3× vyšší prioritu ve vyhledávání.
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="notes">Poznámka</label>
+            <textarea id="notes" name="notes" placeholder="Volitelná poznámka ke zdroji"></textarea>
+        </div>
+
+        <div class="actions">
+            <button type="submit" class="btn btn-primary">Přidat zdroj</button>
+            <a href="/admin/sites" class="btn btn-ghost">Zpět</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
