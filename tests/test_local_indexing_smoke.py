@@ -1,11 +1,13 @@
 """Smoke test: index a real page served from a local HTTP server."""
 import functools
 import http.server
+from http.client import RemoteDisconnected
 import os
 import socketserver
 import sys
 import tempfile
 import threading
+import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -70,6 +72,58 @@ assert m.execute_db_fetchone(
 res = m.hybrid_search("lokalni", 5)
 print(f"search hits: {len(res)}")
 assert res, "local page not returned by search"
+
+# Retryable network failures should stay pending (up to MAX_RETRIES) with detail.
+flaky_url = f"http://127.0.0.1:{port}/flaky"
+m._queue_url(site_id, flaky_url)
+flaky_row = m.execute_db_fetchone(
+    "SELECT id FROM crawl_queue WHERE url = ?", (flaky_url,))
+assert flaky_row, "flaky URL was not queued"
+
+orig_http_get = m._http_get
+try:
+    def _raise_retryable(target_url, **kwargs):
+        raise m.FetchError(
+            target_url,
+            "queue-fetch: RemoteDisconnected: Remote end closed connection without response",
+            retryable=True,
+            attempts=1,
+            exc=RemoteDisconnected("Remote end closed connection without response"),
+        )
+    m._http_get = _raise_retryable
+    m.process_url(flaky_row["id"], site_id, flaky_url)
+finally:
+    m._http_get = orig_http_get
+
+flaky_status = m.execute_db_fetchone(
+    "SELECT status, retry_count, error_reason, scheduled_at FROM crawl_queue WHERE id = ?",
+    (flaky_row["id"],))
+assert flaky_status["status"] == "pending"
+assert flaky_status["retry_count"] == 1
+assert "RemoteDisconnected" in flaky_status["error_reason"]
+assert flaky_status["scheduled_at"] >= int(time.time())
+
+# Non-retryable fetch errors should become permanent queue errors immediately.
+bad_url = f"http://127.0.0.1:{port}/bad"
+m._queue_url(site_id, bad_url)
+bad_row = m.execute_db_fetchone(
+    "SELECT id FROM crawl_queue WHERE url = ?", (bad_url,))
+assert bad_row, "bad URL was not queued"
+
+try:
+    def _raise_non_retryable(target_url, **kwargs):
+        raise m.FetchError(target_url, "Unsupported URL scheme: ftp", retryable=False, attempts=1)
+    m._http_get = _raise_non_retryable
+    m.process_url(bad_row["id"], site_id, bad_url)
+finally:
+    m._http_get = orig_http_get
+
+bad_status = m.execute_db_fetchone(
+    "SELECT status, retry_count, error_reason FROM crawl_queue WHERE id = ?",
+    (bad_row["id"],))
+assert bad_status["status"] == "error"
+assert bad_status["retry_count"] == 0
+assert "Unsupported URL scheme" in bad_status["error_reason"]
 
 srv.shutdown()
 print("\nLOCAL INDEXING SMOKE TEST PASSED")

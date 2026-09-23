@@ -103,6 +103,27 @@ def main():
         check("discovery queued feed urls", any('from-feed' in u for u in urls), str(urls))
         check("discovery queued manual url", any('manual-page' in u for u in urls), str(urls))
 
+        # Recrawl should be non-destructive: preserve active/locked/completed work.
+        m.execute_db("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,), commit=True)
+        m.execute_db(
+            """INSERT INTO crawl_queue (site_id, url, url_hash, status, locked_by, priority)
+               VALUES (?, ?, ?, 'locked', 'worker_a', 2)""",
+            (site_id, f"{base}/locked", m.url_hash(f"{base}/locked")), commit=True
+        )
+        m.execute_db(
+            """INSERT INTO crawl_queue (site_id, url, url_hash, status, priority)
+               VALUES (?, ?, ?, 'completed', 4)""",
+            (site_id, f"{base}/done", m.url_hash(f"{base}/done")), commit=True
+        )
+        m.phase_1_discovery(f"{base}/", 50, allow_indexed_refresh=True)
+        preserved = m.execute_db_fetchall(
+            "SELECT url, status FROM crawl_queue WHERE site_id = ? AND url IN (?, ?)",
+            (site_id, f"{base}/locked", f"{base}/done")
+        )
+        preserved_set = {(row[0], row[1]) for row in preserved}
+        check("recrawl keeps locked rows", (f"{base}/locked", "locked") in preserved_set, str(preserved_set))
+        check("recrawl keeps completed rows", (f"{base}/done", "completed") in preserved_set, str(preserved_set))
+
         checked = m.execute_db_fetchall(
             "SELECT last_checked FROM site_sources WHERE id IN (?, ?)", (sm_id, rss_id))
         check("last_checked updated", all(r[0] > 0 for r in checked), str(checked))
