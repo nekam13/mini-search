@@ -27,6 +27,7 @@ import re
 import gzip
 import io
 import socket
+from http.client import RemoteDisconnected
 from datetime import datetime, timedelta
 from ipaddress import ip_address
 from urllib.parse import urlparse, urlunparse, urljoin, urlencode
@@ -38,6 +39,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
 import requests.packages.urllib3.util.connection as urllib3_cn
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 import feedparser
 import extruct
@@ -57,12 +59,16 @@ urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 DB_PATH = "console.db"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
+DISCOVERY_TIMEOUT = 10
+DISCOVERY_MAX_RETRIES = 2
+HTTP_FETCH_RETRY_BASE_DELAY = 1.0
 MIN_DELAY = 1.0
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MiniSearchBot/1.0")
 SHUTDOWN_FLAG = False
 MAX_SITEMAP_RECURSION = 5
 MAX_SITEMAP_URLS = 5000
+RECRAWL_STALE_AFTER_SECONDS = 3 * 24 * 3600
 
 # Local (private-network) sites are trusted: we skip robots.txt for them and
 # boost them in search results. The multiplier is stored per site so the admin
@@ -90,6 +96,9 @@ _robots_cache = {}
 _robots_lock = threading.Lock()
 _domain_crawl_delay = {}
 _domain_delay_lock = threading.Lock()
+_http_local = threading.local()
+_active_recrawls = set()
+_recrawl_lock = threading.Lock()
 
 # Update tracking
 COMMIT_SHA_PATH = ".commit_sha"
@@ -125,6 +134,7 @@ DB_SCHEMA = {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             site_id INTEGER,
             url TEXT,
+            url_hash TEXT DEFAULT '',
             status TEXT DEFAULT 'pending',
             locked_by TEXT DEFAULT '',
             error_reason TEXT DEFAULT '',
@@ -222,6 +232,7 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_queue_priority ON crawl_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_queue_site ON crawl_queue(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_queue_scheduled ON crawl_queue(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_queue_url_hash ON crawl_queue(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_site ON pages(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
@@ -330,6 +341,13 @@ def _migrate_db(conn):
     # Add scheduled_at column to crawl_queue if not exists
     try:
         cursor.execute("ALTER TABLE crawl_queue ADD COLUMN scheduled_at INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add url_hash column to crawl_queue if not exists (robust deduplication)
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN url_hash TEXT DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -504,7 +522,8 @@ def _get_latest_commit_from_github():
     """Get latest commit SHA from GitHub API."""
     try:
         url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BRANCH}"
-        resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=DISCOVERY_TIMEOUT, max_retries=DISCOVERY_MAX_RETRIES,
+                         purpose='github-commit-check')
         if resp.status_code == 200:
             data = resp.json()
             return data.get('sha', '')
@@ -696,6 +715,98 @@ def get_domain(url):
 
 def url_hash(url):
     return hashlib.md5(normalize_url(url).encode('utf-8')).hexdigest()
+
+
+class FetchError(Exception):
+    """HTTP fetch failed before receiving a usable response."""
+
+    def __init__(self, url, message, retryable=False, attempts=1, exc=None):
+        super().__init__(message)
+        self.url = url
+        self.message = message
+        self.retryable = retryable
+        self.attempts = attempts
+        self.exc = exc
+
+
+def _get_http_session():
+    """Thread-local requests session with stable headers for flaky local servers."""
+    session = getattr(_http_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': USER_AGENT,
+            'Connection': 'close',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        _http_local.session = session
+    return session
+
+
+def _exception_chain(exc):
+    """Yield exception plus chained causes/contexts."""
+    current = exc
+    seen = set()
+    while current and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_retryable_network_error(exc):
+    """True for transient connection-level failures."""
+    if isinstance(exc, (RemoteDisconnected, ConnectionResetError, TimeoutError,
+                        requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    for item in _exception_chain(exc):
+        if isinstance(item, (RemoteDisconnected, ConnectionResetError, TimeoutError,
+                             requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        text = str(item).lower()
+        if ('remote end closed connection without response' in text
+                or 'connection aborted' in text
+                or 'connection reset' in text
+                or 'timed out' in text):
+            return True
+    return False
+
+
+def _format_network_error(exc):
+    """Compact error for queue.error_reason and logs."""
+    parts = []
+    for item in _exception_chain(exc):
+        parts.append(f"{type(item).__name__}: {item}")
+    text = " | ".join(parts) if parts else f"{type(exc).__name__}: {exc}"
+    return text[:500]
+
+
+def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fetch', **kwargs):
+    """Centralized HTTP GET with finite retries for transient network errors."""
+    parsed = urlparse(url or '')
+    if parsed.scheme not in ('http', 'https'):
+        raise FetchError(url, f"Unsupported URL scheme: {parsed.scheme or 'missing'}", retryable=False)
+
+    attempts = max(1, int(max_retries or 1))
+    session = _get_http_session()
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return session.get(url, timeout=timeout, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_network_error(exc)
+            if retryable and attempt < attempts:
+                delay = min(5.0, HTTP_FETCH_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                time.sleep(delay)
+                continue
+            msg = (f"{purpose}: {_format_network_error(exc)} "
+                   f"(attempt {attempt}/{attempts})")
+            raise FetchError(url, msg, retryable=retryable, attempts=attempt, exc=exc) from exc
+    raise FetchError(url, f"{purpose}: unknown network error", retryable=True,
+                     attempts=attempts, exc=last_exc)
 
 
 # ============================================================================
@@ -1303,29 +1414,65 @@ def get_filtered_sites(search='', status='', source_type='', local_only=False):
     return [_decorate_site(dict(row)) for row in execute_db_fetchall(query, tuple(params))]
 
 
+def _begin_site_recrawl(site_id):
+    """Guard against overlapping recrawls for one site."""
+    with _recrawl_lock:
+        if site_id in _active_recrawls:
+            return False
+        _active_recrawls.add(site_id)
+        return True
+
+
+def _finish_site_recrawl(site_id):
+    with _recrawl_lock:
+        _active_recrawls.discard(site_id)
+
+
 def recrawl_site(site_id):
     """Queue every domain/url/sitemap/feed source belonging to a site."""
     site = get_site_by_id(site_id)
     if not site:
         return False, 'Web nenalezen'
+    if not _begin_site_recrawl(site_id):
+        return False, 'Re-crawl tohoto webu právě běží'
     try:
-        site_id_result, added = phase_1_discovery(site['canonical_url'], site['max_pages'])
+        site_id_result, added = phase_1_discovery(
+            site['canonical_url'],
+            site['max_pages'],
+            allow_indexed_refresh=True
+        )
         return True, f"Re-crawl zahájen ({added} URL ve frontě)"
     except Exception as e:
         log_error(f"Recrawl failed for site {site_id}", e)
         return False, f"Re-crawl selhal: {e}"
+    finally:
+        _finish_site_recrawl(site_id)
 
 
 def recrawl_async(site_id):
     """Run recrawl_site in the background (discovery hits the network)."""
+    if not get_site_by_id(site_id):
+        return False, 'Web nenalezen'
+    if not _begin_site_recrawl(site_id):
+        return False, 'Re-crawl tohoto webu právě běží'
 
     def _run():
         try:
-            recrawl_site(site_id)
+            site = get_site_by_id(site_id)
+            if not site:
+                return
+            phase_1_discovery(
+                site['canonical_url'],
+                site['max_pages'],
+                allow_indexed_refresh=True
+            )
         except Exception as e:
             log_error(f"Background recrawl of site {site_id} failed", e)
+        finally:
+            _finish_site_recrawl(site_id)
 
     threading.Thread(target=_run, daemon=True).start()
+    return True, 'Re-crawl spuštěn na pozadí'
 
 # ============================================================================
 # VECTOR SEARCH (hnswlib)
@@ -1646,15 +1793,17 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
     # Collect candidate URLs
     candidate_urls = []
     try:
-        resp = requests.get(urljoin(base_url, '/robots.txt'), timeout=10,
-                            headers={'User-Agent': USER_AGENT})
+        resp = _http_get(urljoin(base_url, '/robots.txt'),
+                         timeout=DISCOVERY_TIMEOUT,
+                         max_retries=DISCOVERY_MAX_RETRIES,
+                         purpose='robots-discovery')
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith('sitemap:'):
                     sitemap_url = line.split(':', 1)[1].strip()
                     candidate_urls.append(sitemap_url)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Could not probe robots.txt for {base_url}", e)
 
     for path in [
         '/sitemap.xml', '/sitemap_index.xml', '/sitemap.xml.gz',
@@ -1673,8 +1822,11 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
             # Check robots.txt for this URL (skipped for local sites)
             if not is_allowed(url, site_id=site_id):
                 continue
-                
-            resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
+
+            resp = _http_get(url,
+                             timeout=DISCOVERY_TIMEOUT,
+                             max_retries=DISCOVERY_MAX_RETRIES,
+                             purpose='source-discovery')
             if resp.status_code != 200:
                 continue
             ct = resp.headers.get('Content-Type', '')
@@ -1694,8 +1846,8 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
             else:
                 continue
             discovered.append({'url': url, 'type': item_type})
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"Could not probe discovered source {url}", e)
 
     for item in discovered:
         try:
@@ -1715,7 +1867,8 @@ def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
     
     urls = []
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='sitemap-fetch')
         if resp.status_code != 200:
             return []
         
@@ -1749,14 +1902,18 @@ def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
 def parse_feed(url):
     urls = []
     try:
-        feed = feedparser.parse(url)
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='feed-fetch')
+        if resp.status_code != 200:
+            return []
+        feed = feedparser.parse(resp.content)
         for entry in feed.entries:
             if hasattr(entry, 'link'):
                 urls.append(entry.link)
             elif hasattr(entry, 'links') and entry.links:
                 urls.append(entry.links[0].get('href', ''))
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Error parsing feed {url}", e)
     return urls
 
 
@@ -1766,8 +1923,9 @@ def crawl_homepage_for_links(site_url, max_pages):
     try:
         if not is_allowed(site_url):
             return []
-            
-        resp = requests.get(site_url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+
+        resp = _http_get(site_url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='homepage-crawl')
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content, 'lxml')
             for a in soup.find_all('a', href=True):
@@ -1776,50 +1934,96 @@ def crawl_homepage_for_links(site_url, max_pages):
                     urls.append(full_url)
                 if len(urls) >= max_pages:
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Homepage crawl failed for {site_url}", e)
     return urls
 
 
-def _queue_url(site_id, url, priority=None):
+def _queue_url(site_id, url, priority=None, allow_indexed_refresh=False,
+               stale_after_seconds=None, revive_error=True):
     """Queue a URL for crawling unless it is disallowed or already known.
 
     Local sites ignore robots.txt and their URLs are queued with the most
     urgent priority so the user sees results quickly.
     """
     if not url:
-        return
+        return False
+    url = normalize_url(url)
+    if not url:
+        return False
     site = get_site_by_id(site_id) if site_id else None
     is_local = bool(site and site.get('is_local'))
     if not is_allowed(url, site_id=site_id, is_local=is_local):
-        return
+        return False
 
     if priority is None:
         priority = LOCAL_QUEUE_PRIORITY if is_local else DEFAULT_QUEUE_PRIORITY
     elif is_local:
         priority = min(priority, LOCAL_QUEUE_PRIORITY)
 
-    # Check if already indexed
-    url_h = url_hash(url)
-    existing_page = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
-    if existing_page:
-        return
+    now = int(time.time())
+    stale_cutoff = None
+    if stale_after_seconds and stale_after_seconds > 0:
+        stale_cutoff = now - int(stale_after_seconds)
 
-    # Check if already in queue
-    existing = execute_db_fetchone("SELECT id FROM crawl_queue WHERE url = ?", (url,))
-    if existing:
-        return
+    normalized_hash = url_hash(url)
+
+    # If this URL already sits in the queue, avoid duplicate rows.
+    existing_q = execute_db_fetchone(
+        """SELECT id, status, retry_count, created_at
+           FROM crawl_queue
+           WHERE site_id = ? AND (url = ? OR url_hash = ?)
+           ORDER BY id DESC LIMIT 1""",
+        (site_id, url, normalized_hash)
+    )
+    if existing_q:
+        row_id, status, retry_count, created_at = existing_q
+        if status in ('pending', 'locked', 'completed'):
+            return False
+        if status == 'error' and revive_error:
+            should_revive = (retry_count < MAX_RETRIES)
+            if not should_revive and stale_cutoff is not None and (created_at or 0) <= stale_cutoff:
+                should_revive = True
+            if should_revive:
+                new_retry = retry_count if retry_count < MAX_RETRIES else 0
+                execute_db(
+                    """UPDATE crawl_queue
+                       SET status='pending', locked_by='', scheduled_at=0,
+                           retry_count=?, error_reason='', priority=MIN(priority, ?),
+                           url=?, url_hash=?
+                       WHERE id=?""",
+                    (new_retry, priority, url, normalized_hash, row_id), commit=True
+                )
+                return True
+        return False
+
+    # Check if already indexed
+    existing_page = execute_db_fetchone(
+        "SELECT id, indexed_at FROM pages WHERE url_hash=?",
+        (normalized_hash,)
+    )
+    if existing_page:
+        if not allow_indexed_refresh:
+            return False
+        indexed_at = existing_page[1] or 0
+        if stale_cutoff is None:
+            return False
+        if indexed_at >= stale_cutoff:
+            return False
 
     try:
         execute_db(
-            "INSERT INTO crawl_queue (site_id, url, status, priority, scheduled_at) VALUES (?, ?, 'pending', ?, 0)",
-            (site_id, url, priority), commit=True
+            """INSERT INTO crawl_queue (site_id, url, url_hash, status, priority, scheduled_at)
+               VALUES (?, ?, ?, 'pending', ?, 0)""",
+            (site_id, url, normalized_hash, priority), commit=True
         )
+        return True
     except Exception:
-        pass
+        return False
 
 
-def index_source(source_id):
+def index_source(source_id, allow_indexed_refresh=False, stale_after_seconds=None,
+                 queue_budget=None):
     """Queue every URL a single non-domain source contributes.
 
     Returns the number of URLs considered. Safe to call from a worker thread.
@@ -1836,22 +2040,32 @@ def index_source(source_id):
     priority = source['priority'] or 5
     queued = 0
 
+    def _enqueue(candidate_url, candidate_priority):
+        nonlocal queued
+        if queue_budget is not None and queued >= queue_budget:
+            return
+        if _queue_url(
+            site_id,
+            candidate_url,
+            candidate_priority,
+            allow_indexed_refresh=allow_indexed_refresh,
+            stale_after_seconds=stale_after_seconds
+        ):
+            queued += 1
+
     try:
         if source_type == 'url':
-            _queue_url(site_id, normalize_url(url), priority)
-            queued = 1
+            _enqueue(normalize_url(url), priority)
         elif source_type == 'sitemap':
             for u in parse_sitemap(url):
                 n = normalize_url(u)
                 if n:
-                    _queue_url(site_id, n, 3)
-                    queued += 1
+                    _enqueue(n, priority)
         elif source_type in FEED_SOURCE_TYPES:
             for u in parse_feed(url):
                 n = normalize_url(u)
                 if n:
-                    _queue_url(site_id, n, 1)
-                    queued += 1
+                    _enqueue(n, priority)
         execute_db(
             "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
             (source_id,), commit=True
@@ -1874,7 +2088,62 @@ def index_source_async(source_id):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def phase_1_discovery(site_url, max_pages=500):
+def _revive_retryable_errors(site_id, stale_after_seconds=None):
+    """Move retryable/old queue errors back to pending without touching locked work."""
+    rows = execute_db_fetchall(
+        """SELECT id, retry_count, created_at
+           FROM crawl_queue
+           WHERE site_id = ? AND status = 'error' AND locked_by = ''""",
+        (site_id,)
+    )
+    revived = 0
+    now = int(time.time())
+    stale_cutoff = None
+    if stale_after_seconds and stale_after_seconds > 0:
+        stale_cutoff = now - int(stale_after_seconds)
+
+    for row_id, retry_count, created_at in rows:
+        should_revive = retry_count < MAX_RETRIES
+        if not should_revive and stale_cutoff is not None and (created_at or 0) <= stale_cutoff:
+            should_revive = True
+        if not should_revive:
+            continue
+        new_retry = retry_count if retry_count < MAX_RETRIES else 0
+        execute_db(
+            """UPDATE crawl_queue
+               SET status='pending', locked_by='', scheduled_at=0, retry_count=?,
+                   error_reason=''
+               WHERE id = ?""",
+            (new_retry, row_id), commit=True
+        )
+        revived += 1
+    return revived
+
+
+def _queue_stale_pages(site_id, remaining, stale_after_seconds):
+    """Queue already indexed pages only when they are stale."""
+    if remaining <= 0 or stale_after_seconds <= 0:
+        return 0
+    rows = execute_db_fetchall(
+        """SELECT url
+           FROM pages
+           WHERE site_id = ?
+           ORDER BY indexed_at ASC
+           LIMIT ?""",
+        (site_id, remaining * 3)
+    )
+    added = 0
+    for (candidate_url,) in rows:
+        if added >= remaining:
+            break
+        if _queue_url(site_id, candidate_url, DEFAULT_QUEUE_PRIORITY,
+                      allow_indexed_refresh=True,
+                      stale_after_seconds=stale_after_seconds):
+            added += 1
+    return added
+
+
+def phase_1_discovery(site_url, max_pages=500, allow_indexed_refresh=False):
     site_url = normalize_url(site_url)
     if not site_url:
         return None, 0
@@ -1882,9 +2151,10 @@ def phase_1_discovery(site_url, max_pages=500):
     # Check if site already exists
     domain = get_domain(site_url)
     existing = execute_db_fetchone("SELECT id FROM sites WHERE canonical_url = ?", (domain,))
+    recrawl_mode = bool(existing or allow_indexed_refresh)
+    stale_after_seconds = RECRAWL_STALE_AFTER_SECONDS if recrawl_mode else None
     if existing:
         site_id = existing[0]
-        execute_db("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,), commit=True)
     else:
         site_id = add_site(site_url, max_pages)
         if not site_id:
@@ -1912,34 +2182,61 @@ def phase_1_discovery(site_url, max_pages=500):
         "WHERE site_id = ? AND source_type != 'domain' AND status = 'active'",
         (site_id,)
     )
+    added = 0
+    if recrawl_mode:
+        added += _revive_retryable_errors(site_id, stale_after_seconds=stale_after_seconds)
+
     for (source_id,) in manual_sources:
-        index_source(source_id)
+        remaining = max(max_pages - added, 0)
+        if remaining <= 0:
+            break
+        added += index_source(
+            source_id,
+            allow_indexed_refresh=recrawl_mode,
+            stale_after_seconds=stale_after_seconds,
+            queue_budget=remaining
+        )
 
     discovered = discover_sitemaps_and_feeds(site_url, site_id, max_pages)
     urls_to_add = []
+    seen_hashes = set()
+
+    def _remember(url, priority):
+        n = normalize_url(url)
+        if not n:
+            return
+        h = url_hash(n)
+        if h in seen_hashes:
+            return
+        seen_hashes.add(h)
+        urls_to_add.append((n, priority))
 
     for item in discovered:
         if item['type'] == 'sitemap':
             for u in parse_sitemap(item['url']):
-                n = normalize_url(u)
-                if n:
-                    urls_to_add.append((n, 3))
+                _remember(u, 3)
         elif item['type'] in ('rss', 'atom'):
             for u in parse_feed(item['url']):
-                n = normalize_url(u)
-                if n:
-                    urls_to_add.append((n, 1))
+                _remember(u, 1)
 
     if not urls_to_add:
         for u in crawl_homepage_for_links(site_url, max_pages):
-            urls_to_add.append((u, 5))
+            _remember(u, 5)
 
-    added = 0
     for url, priority in urls_to_add:
-        if len(urls_to_add) > max_pages:
+        if added >= max_pages:
             break
-        _queue_url(site_id, url, priority)
-        added += 1
+        if _queue_url(site_id, url, priority,
+                      allow_indexed_refresh=recrawl_mode,
+                      stale_after_seconds=stale_after_seconds):
+            added += 1
+
+    if recrawl_mode and added < max_pages:
+        added += _queue_stale_pages(
+            site_id,
+            max_pages - added,
+            stale_after_seconds=stale_after_seconds or 0
+        )
 
     execute_db(
         "UPDATE sites SET last_crawled = strftime('%s','now') WHERE id = ?",
@@ -1948,7 +2245,7 @@ def phase_1_discovery(site_url, max_pages=500):
     return site_id, added
 
 
-def extract_page_content(url, site_id):
+def extract_page_content(url, site_id, response=None):
     page_data = {
         'url': url, 'site_id': site_id, 'url_hash': url_hash(url),
         'title': '', 'og_title': '', 'og_description': '', 'og_image': '',
@@ -1957,7 +2254,10 @@ def extract_page_content(url, site_id):
         'has_audio': 0, 'published_timestamp': 0, 'seo_score': 0.0
     }
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+        resp = response
+        if resp is None:
+            resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                             purpose='page-extract')
         if resp.status_code != 200:
             return None
         content = resp.content
@@ -2031,14 +2331,44 @@ def extract_page_content(url, site_id):
         page_data['embedding'] = generate_embedding(embed_text).tobytes()
         return page_data
     except Exception as e:
+        log_error(f"Error extracting {url}", e)
         print(f"Error extracting {url}: {e}")
         return None
+
+
+def _set_queue_retry_or_error(queue_id, reason, retryable=True):
+    """Retry pending items with backoff, then mark as permanent error."""
+    reason = (reason or 'Unknown crawler error')[:500]
+    if not retryable:
+        execute_db(
+            "UPDATE crawl_queue SET status='error', locked_by='', error_reason=? WHERE id=?",
+            (reason, queue_id), commit=True
+        )
+        return
+
+    row = execute_db_fetchone("SELECT retry_count FROM crawl_queue WHERE id=?", (queue_id,))
+    current_retry = (row[0] if row else 0)
+    next_retry = current_retry + 1
+    delay = min(300, 5 * (2 ** max(0, next_retry - 1)))
+    scheduled_at = int(time.time()) + delay
+    execute_db(
+        """UPDATE crawl_queue
+           SET retry_count=?, status='pending', locked_by='', scheduled_at=?, error_reason=?
+           WHERE id=?""",
+        (next_retry, scheduled_at, reason, queue_id), commit=True
+    )
+    if next_retry >= MAX_RETRIES:
+        execute_db(
+            "UPDATE crawl_queue SET status='error', scheduled_at=0, error_reason=? WHERE id=?",
+            (reason, queue_id), commit=True
+        )
 
 
 def process_url(queue_id, site_id, url):
     """Fetch and index one URL. Handles 429/403 at HTTP level."""
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='queue-fetch')
 
         if resp.status_code == 429:
             retry_after = int(resp.headers.get('Retry-After', 60))
@@ -2061,24 +2391,17 @@ def process_url(queue_id, site_id, url):
             return
 
         if resp.status_code != 200:
-            execute_db(
-                "UPDATE crawl_queue SET retry_count=retry_count+1, status='pending', locked_by='' WHERE id=?",
-                (queue_id,), commit=True
+            retryable_http = resp.status_code in (408, 425, 429, 500, 502, 503, 504)
+            _set_queue_retry_or_error(
+                queue_id,
+                f"HTTP {resp.status_code}",
+                retryable=retryable_http
             )
-            retry = execute_db_fetchone("SELECT retry_count FROM crawl_queue WHERE id=?", (queue_id,))
-            if retry and retry[0] >= MAX_RETRIES:
-                execute_db(
-                    "UPDATE crawl_queue SET status='error', error_reason=? WHERE id=?",
-                    (f"HTTP {resp.status_code}", queue_id), commit=True
-                )
             return
 
-        page_data = extract_page_content(url, site_id)
+        page_data = extract_page_content(url, site_id, response=resp)
         if page_data is None:
-            execute_db(
-                "UPDATE crawl_queue SET retry_count=retry_count+1, status='pending', locked_by='' WHERE id=?",
-                (queue_id,), commit=True
-            )
+            _set_queue_retry_or_error(queue_id, "Extraction returned no content", retryable=True)
             return
 
         # Check if already indexed (race condition)
@@ -2120,14 +2443,19 @@ def process_url(queue_id, site_id, url):
         idx.add_items(emb.reshape(1, -1), np.array([page_id]))
 
         execute_db(
-            "UPDATE crawl_queue SET status='completed' WHERE id=?",
+            "UPDATE crawl_queue SET status='completed', locked_by='', scheduled_at=0, error_reason='' WHERE id=?",
             (queue_id,), commit=True
         )
 
+    except FetchError as e:
+        log_error(f"Fetch failed for queue item {queue_id} ({url})", e.exc or e)
+        _set_queue_retry_or_error(queue_id, e.message, retryable=e.retryable)
     except Exception as e:
-        execute_db(
-            "UPDATE crawl_queue SET status='error', error_reason=? WHERE id=?",
-            (str(e), queue_id), commit=True
+        log_error(f"Unexpected process_url error for {url}", e)
+        _set_queue_retry_or_error(
+            queue_id,
+            _format_network_error(e),
+            retryable=_is_retryable_network_error(e)
         )
 
 
@@ -2146,7 +2474,8 @@ def _worker_loop(name):
                 """SELECT cq.id, cq.site_id, cq.url, s.crawl_delay 
                    FROM crawl_queue cq
                    JOIN sites s ON cq.site_id = s.id
-                   WHERE cq.status='pending' AND cq.retry_count<? 
+                   WHERE cq.status='pending' AND cq.retry_count<?
+                     AND (cq.scheduled_at=0 OR cq.scheduled_at<=strftime('%s','now'))
                    ORDER BY cq.priority ASC, cq.scheduled_at ASC LIMIT 3""",
                 (MAX_RETRIES,)
             )
@@ -2154,14 +2483,19 @@ def _worker_loop(name):
                 time.sleep(5)
                 continue
             
+            locked_rows = []
             for row_id, site_id, url, site_delay in rows:
                 domain_delay = max(MIN_DELAY, site_delay or MIN_DELAY)
-                execute_db(
-                    "UPDATE crawl_queue SET status='locked',locked_by=?, scheduled_at=0 WHERE id=?",
+                locked = execute_db(
+                    """UPDATE crawl_queue
+                       SET status='locked',locked_by=?, scheduled_at=0
+                       WHERE id=? AND status='pending'""",
                     (name, row_id), commit=True
                 )
+                if locked.rowcount:
+                    locked_rows.append((row_id, site_id, url, site_delay))
             
-            for row_id, site_id, url, site_delay in rows:
+            for row_id, site_id, url, site_delay in locked_rows:
                 if SHUTDOWN_FLAG:
                     break
                 process_url(row_id, site_id, url)
@@ -2238,7 +2572,7 @@ def recrawl_all_sites():
         "SELECT id,canonical_url,max_pages FROM sites WHERE status='active'"
     ):
         try:
-            phase_1_discovery(row[1], row[2])
+            recrawl_site(row[0])
         except Exception as e:
             print(f"Recrawl error {row[1]}: {e}")
 
@@ -2619,9 +2953,10 @@ def admin_site_edit(site_id):
 
 @app.route('/admin/sites/<int:site_id>/recrawl')
 def admin_site_recrawl(site_id):
-    ok, message = recrawl_site(site_id)
+    ok, message = recrawl_async(site_id)
     key = 'success' if ok else 'error'
-    return redirect(f'/admin/sites/{site_id}?{key}={message}')
+    target = f'/admin/sites/{site_id}' if get_site_by_id(site_id) else '/admin/sites'
+    return redirect(f'{target}?{key}={message}')
 
 
 @app.route('/admin/sites/<int:site_id>/delete')

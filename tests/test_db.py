@@ -7,7 +7,7 @@ import os
 # Pouzijeme primo SQL prikazy pro testy
 DB_SCHEMA = {
     'sites': "CREATE TABLE IF NOT EXISTS sites (id INTEGER PRIMARY KEY AUTOINCREMENT, canonical_url TEXT UNIQUE, aliases TEXT DEFAULT '[]', status TEXT DEFAULT 'active', error_count INTEGER DEFAULT 0, last_crawled INTEGER DEFAULT 0, max_pages INTEGER DEFAULT 500, crawl_delay REAL DEFAULT 1.0, created_at INTEGER DEFAULT (strftime('%s','now')))",
-    'crawl_queue': "CREATE TABLE IF NOT EXISTS crawl_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT, status TEXT DEFAULT 'pending', locked_by TEXT DEFAULT '', error_reason TEXT DEFAULT '', retry_count INTEGER DEFAULT 0, priority INTEGER DEFAULT 5, scheduled_at INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')), FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
+    'crawl_queue': "CREATE TABLE IF NOT EXISTS crawl_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT, url_hash TEXT DEFAULT '', status TEXT DEFAULT 'pending', locked_by TEXT DEFAULT '', error_reason TEXT DEFAULT '', retry_count INTEGER DEFAULT 0, priority INTEGER DEFAULT 5, scheduled_at INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')), FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
     'sitemaps_feeds': "CREATE TABLE IF NOT EXISTS sitemaps_feeds (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT, type TEXT, last_checked INTEGER DEFAULT 0, recursion_depth INTEGER DEFAULT 0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
     'pages': "CREATE TABLE IF NOT EXISTS pages (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER, url TEXT UNIQUE, url_hash TEXT, title TEXT DEFAULT '', og_title TEXT DEFAULT '', og_description TEXT DEFAULT '', og_image TEXT DEFAULT '', favicon_url TEXT DEFAULT '', body_text TEXT DEFAULT '', images TEXT DEFAULT '[]', schema_type TEXT DEFAULT '', schema_details TEXT DEFAULT '{}', audio_url TEXT DEFAULT '', has_audio INTEGER DEFAULT 0, published_timestamp INTEGER DEFAULT 0, embedding BLOB, indexed_at INTEGER DEFAULT 0, seo_score REAL DEFAULT 0.0, FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE)",
     'pages_fts': "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(page_id, title, body_text, og_title, og_description, url, schema_type)",
@@ -21,6 +21,7 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_queue_priority ON crawl_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_queue_site ON crawl_queue(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_queue_scheduled ON crawl_queue(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_queue_url_hash ON crawl_queue(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_site ON pages(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
