@@ -148,6 +148,40 @@ WIKI_IMPORT_RETRIES = _env_int("MINISEARCH_WIKI_RETRIES", 3, 0, 10)
 # unset the standard ``https://<lang>.wikipedia.org`` host is used.
 WIKI_API_BASE = os.environ.get("MINISEARCH_WIKI_API_BASE", "").rstrip("/")
 
+# --- Nightly maintenance ("dreaming") -----------------------------------------
+# A single background/CLI pass that consolidates the DB, backfills missing
+# vectors, continues a slow wiki import and (optionally) checks for dead links.
+# Every stage is batched and respects the global ``SHUTDOWN_FLAG``, so it is
+# safe to interrupt. Logs go to ``logs/maintenance.log``.
+MAINTENANCE_LOG_PATH = os.environ.get("MINISEARCH_MAINTENANCE_LOG", "logs/maintenance.log")
+# Wiki import stage: how many articles one maintenance run may pull. Kept small
+# so a night's run stays light on a phone; 0 disables the stage.
+MAINTENANCE_WIKI_PAGES = _env_int("MINISEARCH_MAINT_WIKI_PAGES", 200, 0, 100000)
+# Dead-link probe: at most this many oldest pages are checked per run, and only
+# when explicitly enabled (it touches the network).
+MAINTENANCE_LINK_CHECK_LIMIT = _env_int("MINISEARCH_MAINT_LINK_CHECK", 0, 0, 100000)
+# Age (days) after which an indexed page becomes a candidate for a link probe.
+MAINTENANCE_LINK_CHECK_DAYS = _env_int("MINISEARCH_MAINT_LINK_CHECK_DAYS", 30, 0, 3650)
+# Pages returning 404/410 this many times are removed from the index.
+MAINTENANCE_DEAD_LINK_PURGE = _env_bool("MINISEARCH_MAINT_PURGE_DEAD", False)
+# A VACUUM rewrites the whole database and briefly needs roughly its size in
+# free disk space, so it only runs when that much is genuinely available.
+MAINTENANCE_VACUUM_MIN_FREE_MB = _env_int("MINISEARCH_MAINT_VACUUM_MIN_MB", 50, 0, 100000)
+# Hard cap on embedding backfill work per run (keeps a night bounded).
+MAINTENANCE_EMBED_BATCH = _env_int("MINISEARCH_MAINT_EMBED_BATCH", 200, 0, 100000)
+# Upper bound for one dead-link HEAD/GET probe.
+MAINTENANCE_LINK_TIMEOUT = _env_int("MINISEARCH_MAINT_LINK_TIMEOUT", 10, 1, 120)
+# Content-duplicate scan is O(signatures) in memory but O(pages) in reads, so it
+# is capped; url_hash dedup (the exact, cheap check) always runs in full.
+MAINTENANCE_DEDUP_SCAN = _env_int("MINISEARCH_MAINT_DEDUP_SCAN", 20000, 0, 1000000)
+# Pages shorter than this are never treated as content duplicates: short or
+# boilerplate bodies collide too easily to be worth merging.
+CONTENT_DUP_MIN_CHARS = _env_int("MINISEARCH_MAINT_DEDUP_MIN_CHARS", 200, 20, 100000)
+# Register the nightly maintenance as a background job (off by default so a
+# fresh install never surprises its owner with an overnight import/probe).
+MAINTENANCE_NIGHTLY_ENABLED = _env_bool("MINISEARCH_NIGHTLY", False)
+MAINTENANCE_NIGHTLY_HOUR = _env_int("MINISEARCH_NIGHTLY_HOUR", 3, 0, 23)
+
 # Local (private-network) sites are trusted: we skip robots.txt for them and
 # boost them in search results. The multiplier is stored per site so the admin
 # can tune it.
@@ -257,6 +291,8 @@ DB_SCHEMA = {
             embedding BLOB,
             indexed_at INTEGER DEFAULT 0,
             seo_score REAL DEFAULT 0.0,
+            last_link_check INTEGER DEFAULT 0,
+            link_status TEXT DEFAULT '',
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
     ''',
@@ -514,6 +550,18 @@ def _migrate_db(conn):
         conn.commit()
     except sqlite3.OperationalError:
         pass
+
+    # Nightly maintenance bookkeeping on pages: when the link was last probed
+    # and what the probe saw. Added in place so an upgrade never drops pages.
+    for column, ddl in (
+        ("last_link_check", "ALTER TABLE pages ADD COLUMN last_link_check INTEGER DEFAULT 0"),
+        ("link_status", "ALTER TABLE pages ADD COLUMN link_status TEXT DEFAULT ''"),
+    ):
+        try:
+            cursor.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     
     # Add recursion_depth column to sitemaps_feeds if not exists
     try:
@@ -1310,8 +1358,9 @@ def _format_network_error(exc):
     return text[:500]
 
 
-def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fetch', **kwargs):
-    """Centralized HTTP GET with finite retries for transient network errors."""
+def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fetch',
+              method='GET', **kwargs):
+    """Centralized HTTP request with finite retries for transient network errors."""
     parsed = urlparse(url or '')
     if parsed.scheme not in ('http', 'https'):
         raise FetchError(url, f"Unsupported URL scheme: {parsed.scheme or 'missing'}", retryable=False)
@@ -1321,7 +1370,7 @@ def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fe
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
-            resp = session.get(url, timeout=timeout, **kwargs)
+            resp = session.request(method, url, timeout=timeout, **kwargs)
         except Exception as exc:
             last_exc = exc
             retryable = _is_retryable_network_error(exc)
@@ -4029,6 +4078,391 @@ def check_for_updates_scheduled():
 
 
 # ============================================================================
+# NIGHTLY MAINTENANCE ("dreaming mode")
+# ============================================================================
+
+_maintenance_lock = threading.Lock()
+_maintenance_running = False
+
+
+def maintenance_log(message):
+    """Append one maintenance line to ``logs/maintenance.log`` (best effort).
+
+    Mirrors :func:`log_error`: a broken log path must never abort the run.
+    """
+    line = f"{datetime.now().isoformat()} - {message}"
+    print(f"[maintenance] {message}")
+    try:
+        os.makedirs(os.path.dirname(MAINTENANCE_LOG_PATH) or '.', exist_ok=True)
+        with open(MAINTENANCE_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _available_disk_mb(path=None):
+    """Free disk space in MB for ``path`` (or the DB directory), or ``None``."""
+    target = path or os.path.dirname(os.path.abspath(DB_PATH)) or '.'
+    try:
+        stat = os.statvfs(target)
+        return stat.f_bavail * stat.f_frsize / (1024.0 * 1024.0)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _content_signature(page):
+    """Cheap order-independent fingerprint of a page body.
+
+    Normalises to folded lower-case words and reduces them to a sorted set of
+    the most frequent tokens. Two pages whose signature sets are equal are
+    treated as the same content. Only bodies longer than
+    :data:`CONTENT_DUP_MIN_CHARS` are considered, so boilerplate/near-empty
+    pages do not collapse into one another.
+    """
+    body = (page['body_text'] or '').strip()
+    if len(body) < CONTENT_DUP_MIN_CHARS:
+        return None
+    tokens = _fold_tokenize(body)
+    if len(tokens) < 20:
+        return None
+    counts = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:40]
+    return frozenset(token for token, _ in top)
+
+
+def maintenance_dedup_pages(limit=None):
+    """Merge duplicate pages (identical url_hash, then identical content).
+
+    ``url_hash`` is an exact fingerprint of the canonical URL, so rows sharing
+    it are true duplicates and the newest is kept. Content duplicates (same
+    :func:`_content_signature`) keep the oldest row, because a stable URL is
+    preferable to a newer alias. Removed rows cascade out of FTS5 via the
+    existing delete trigger; their vectors are rebuilt by the caller.
+
+    Returns ``{'url': n, 'content': m}`` with the number of rows removed.
+    """
+    removed = {'url': 0, 'content': 0}
+
+    # 1) Exact URL duplicates. GROUP BY url_hash keeps this index-friendly.
+    dup_groups = execute_db_fetchall(
+        """SELECT url_hash, COUNT(*) AS n FROM pages
+           WHERE url_hash IS NOT NULL AND url_hash != ''
+           GROUP BY url_hash HAVING n > 1"""
+    )
+    for row in dup_groups:
+        rows = execute_db_fetchall(
+            "SELECT id FROM pages WHERE url_hash = ? ORDER BY indexed_at DESC, id DESC",
+            (row['url_hash'],)
+        )
+        for extra in rows[1:]:
+            execute_db("DELETE FROM pages WHERE id = ?", (extra['id'],), commit=True)
+            removed['url'] += 1
+
+    # 2) Content duplicates. Signatures are held in memory only as small
+    #    token sets; the full rows are never loaded at once.
+    if limit is None:
+        limit = MAINTENANCE_DEDUP_SCAN
+    seen = {}
+    scanned = 0
+    for page in execute_db_fetchall(
+            "SELECT id, url_hash, body_text FROM pages ORDER BY indexed_at ASC, id ASC"):
+        if SHUTDOWN_FLAG or scanned >= limit:
+            break
+        scanned += 1
+        signature = _content_signature(page)
+        if signature is None:
+            continue
+        first = seen.get(signature)
+        if first is None:
+            seen[signature] = page['id']
+            continue
+        execute_db("DELETE FROM pages WHERE id = ?", (page['id'],), commit=True)
+        removed['content'] += 1
+
+    return removed
+
+
+def maintenance_optimize_db():
+    """Run ``PRAGMA optimize`` and, when safe, a space-reclaiming ``VACUUM``.
+
+    ``VACUUM`` rewrites the entire database and temporarily needs roughly its
+    size in free space, so it is skipped unless a healthy margin is available.
+    Returns a short human-readable summary.
+    """
+    try:
+        execute_db("PRAGMA optimize", commit=True)
+    except sqlite3.OperationalError as e:
+        return f"optimize failed: {e}"
+
+    note = "PRAGMA optimize ok"
+    try:
+        db_bytes = os.path.getsize(DB_PATH)
+    except OSError:
+        return note + "; size unknown, VACUUM skipped"
+
+    free_mb = _available_disk_mb()
+    needed_mb = max(MAINTENANCE_VACUUM_MIN_FREE_MB, (db_bytes / (1024.0 * 1024.0)) * 1.2)
+    if free_mb is not None and free_mb < needed_mb:
+        return note + f"; VACUUM skipped (free {free_mb:.0f} MB < {needed_mb:.0f} MB)"
+
+    # VACUUM cannot run inside a transaction and fights concurrent writers, so
+    # take the DB lock and use the raw connection.
+    conn = get_db()
+    with _db_lock:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            conn.isolation_level = ""
+        except sqlite3.OperationalError as e:
+            return note + f"; VACUUM failed: {e}"
+        finally:
+            try:
+                conn.isolation_level = ""
+            except Exception:
+                pass
+    return note + "; VACUUM ok"
+
+
+def maintenance_backfill_embeddings(batch=None):
+    """Compute embeddings for pages indexed without them (low-memory catch-up).
+
+    In low-memory mode pages are stored with ``embedding IS NULL``. This stage
+    computes those vectors only when the device is actually allowed to use
+    embeddings, and processes a bounded batch so one night cannot exhaust RAM
+    or battery. Returns the number of pages embedded.
+    """
+    if not embeddings_enabled():
+        return 0
+    if batch is None:
+        batch = MAINTENANCE_EMBED_BATCH
+    if batch <= 0:
+        return 0
+
+    rows = execute_db_fetchall(
+        """SELECT id, og_title, title, og_description, body_text
+           FROM pages WHERE embedding IS NULL ORDER BY id ASC LIMIT ?""",
+        (batch,)
+    )
+    done = 0
+    for row in rows:
+        if SHUTDOWN_FLAG:
+            break
+        page = {
+            'og_title': row['og_title'], 'title': row['title'],
+            'og_description': row['og_description'], 'body_text': row['body_text'],
+        }
+        # Stop as soon as resources tighten mid-run: the rest is picked up by a
+        # later maintenance pass rather than risking a low-memory kill.
+        if not embeddings_enabled():
+            break
+        embedding = _embedding_for(page)
+        if embedding is None:
+            continue
+        execute_db("UPDATE pages SET embedding = ? WHERE id = ?",
+                   (embedding, row['id']), commit=True)
+        done += 1
+
+    if done:
+        _rebuild_hnsw_index()
+    return done
+
+
+def maintenance_import_wiki(max_pages=None):
+    """Continue any configured wiki source for a bounded number of articles.
+
+    Uses the paused/resume-aware :func:`run_wiki_import`, so it picks up from
+    the stored ``next_title`` and stays idempotent. Paused sources are skipped.
+    Returns a ``{source_id: imported}`` mapping.
+    """
+    if max_pages is None:
+        max_pages = MAINTENANCE_WIKI_PAGES
+    if max_pages <= 0:
+        return {}
+
+    results = {}
+    sources = execute_db_fetchall(
+        """SELECT * FROM site_sources
+           WHERE source_type = ? AND status = 'active' ORDER BY priority ASC, id ASC""",
+        (WIKI_SOURCE_TYPE,)
+    )
+    remaining = max_pages
+    for row in sources:
+        if SHUTDOWN_FLAG or remaining <= 0:
+            break
+        source = dict(row)
+        try:
+            imported = run_wiki_import(source, max_pages=remaining)
+        except Exception as e:
+            maintenance_log(f"wiki import failed for source {source.get('id')}: {e}")
+            log_error(f"maintenance wiki import {source.get('id')}", e)
+            continue
+        results[source['id']] = imported
+        remaining -= imported
+    return results
+
+
+def maintenance_check_dead_links(limit=None, purge=None):
+    """Probe the oldest indexed pages and record dead (404/410) links.
+
+    Only runs when a limit is configured, because it touches the network. A
+    page found dead gets ``link_status='dead'``; when purge is enabled it is
+    removed from the index. Alive pages are stamped ``link_status='ok'`` and a
+    fresh ``last_link_check`` so they are not re-probed every night.
+
+    Returns ``{'checked': n, 'dead': m, 'purged': k}``.
+    """
+    if limit is None:
+        limit = MAINTENANCE_LINK_CHECK_LIMIT
+    if purge is None:
+        purge = MAINTENANCE_DEAD_LINK_PURGE
+    stats = {'checked': 0, 'dead': 0, 'purged': 0}
+    if limit <= 0:
+        return stats
+
+    cutoff = int(time.time()) - MAINTENANCE_LINK_CHECK_DAYS * 24 * 3600
+    rows = execute_db_fetchall(
+        """SELECT id, url FROM pages
+           WHERE url LIKE 'http%' AND (last_link_check = 0 OR last_link_check < ?)
+           ORDER BY last_link_check ASC, indexed_at ASC LIMIT ?""",
+        (cutoff, limit)
+    )
+    for row in rows:
+        if SHUTDOWN_FLAG:
+            break
+        stats['checked'] += 1
+        dead = False
+        try:
+            resp = _http_get(row['url'], timeout=MAINTENANCE_LINK_TIMEOUT,
+                             max_retries=0, purpose='maintenance-link-check',
+                             method='HEAD')
+            # Only a definitive "gone" counts. Other non-2xx statuses (405 for
+            # HEAD, 403 from a WAF, 5xx hiccups) are inconclusive and must not
+            # cost a page its place in the index.
+            if resp.status_code in (404, 410):
+                dead = True
+            elif resp.status_code == 405:
+                # Server refuses HEAD; retry with a real GET before judging.
+                resp = _http_get(row['url'], timeout=MAINTENANCE_LINK_TIMEOUT,
+                                 max_retries=0, purpose='maintenance-link-check')
+                dead = resp.status_code in (404, 410)
+        except FetchError as e:
+            # A 404 surfaced as a non-retryable failure is equally conclusive.
+            dead = not e.retryable and ('404' in e.message or '410' in e.message)
+        except Exception as e:
+            log_error(f"maintenance link check {row['url']}", e)
+
+        if dead:
+            stats['dead'] += 1
+            execute_db(
+                "UPDATE pages SET link_status='dead', last_link_check=strftime('%s','now') WHERE id=?",
+                (row['id'],), commit=True)
+            if purge:
+                execute_db("DELETE FROM pages WHERE id = ?", (row['id'],), commit=True)
+                stats['purged'] += 1
+        else:
+            execute_db(
+                "UPDATE pages SET link_status='ok', last_link_check=strftime('%s','now') WHERE id=?",
+                (row['id'],), commit=True)
+        time.sleep(0.2)
+
+    if stats['purged']:
+        _rebuild_hnsw_index()
+    return stats
+
+
+def run_maintenance(dedup=True, backfill_embeddings=True, wiki=True,
+                    check_links=True, optimize=True, wiki_pages=None,
+                    link_limit=None):
+    """Run one complete nightly maintenance pass.
+
+    Stages are independent and individually guarded, so a failure in one still
+    lets the others finish. Returns a dict of per-stage summaries. Safe to call
+    from the CLI or a scheduler thread; a second concurrent run is refused.
+    """
+    global _maintenance_running
+    with _maintenance_lock:
+        if _maintenance_running:
+            maintenance_log("already running, skipping")
+            return {'skipped': True}
+        _maintenance_running = True
+    started = time.time()
+    maintenance_log("start")
+    summary = {}
+    try:
+        if dedup:
+            if SHUTDOWN_FLAG:
+                return summary
+            try:
+                summary['dedup'] = maintenance_dedup_pages()
+                maintenance_log(f"dedup removed {summary['dedup']}")
+            except Exception as e:
+                summary['dedup'] = f"error: {e}"
+                maintenance_log(f"dedup error: {e}")
+                log_error("maintenance dedup", e)
+
+        if backfill_embeddings:
+            if SHUTDOWN_FLAG:
+                return summary
+            try:
+                summary['embeddings'] = maintenance_backfill_embeddings()
+                maintenance_log(f"embeddings backfilled: {summary['embeddings']}")
+            except Exception as e:
+                summary['embeddings'] = f"error: {e}"
+                maintenance_log(f"embeddings error: {e}")
+                log_error("maintenance embeddings", e)
+
+        if wiki:
+            if SHUTDOWN_FLAG:
+                return summary
+            try:
+                summary['wiki'] = maintenance_import_wiki(max_pages=wiki_pages)
+                maintenance_log(f"wiki import: {summary['wiki']}")
+            except Exception as e:
+                summary['wiki'] = f"error: {e}"
+                maintenance_log(f"wiki error: {e}")
+                log_error("maintenance wiki", e)
+
+        if check_links:
+            if SHUTDOWN_FLAG:
+                return summary
+            try:
+                summary['links'] = maintenance_check_dead_links(limit=link_limit)
+                maintenance_log(f"links: {summary['links']}")
+            except Exception as e:
+                summary['links'] = f"error: {e}"
+                maintenance_log(f"links error: {e}")
+                log_error("maintenance links", e)
+
+        if optimize:
+            try:
+                summary['db'] = maintenance_optimize_db()
+                maintenance_log(f"db: {summary['db']}")
+            except Exception as e:
+                summary['db'] = f"error: {e}"
+                maintenance_log(f"db error: {e}")
+                log_error("maintenance optimize", e)
+    finally:
+        _maintenance_running = False
+        summary['elapsed'] = round(time.time() - started, 1)
+        maintenance_log(f"done in {summary['elapsed']}s")
+    return summary
+
+
+def maintenance_scheduled():
+    """Scheduler entry point: run maintenance unless the app is shutting down."""
+    if SHUTDOWN_FLAG:
+        return
+    try:
+        run_maintenance()
+    except Exception as e:
+        maintenance_log(f"scheduled run error: {e}")
+        log_error("scheduled maintenance", e)
+
+
+# ============================================================================
 # SHUTDOWN
 # ============================================================================
 
@@ -5074,6 +5508,29 @@ def _cli_import_wiki(args):
     return 0
 
 
+def _cli_maintenance(args):
+    """Run one nightly-maintenance pass from the command line and exit.
+
+    Intended for a Termux ``cron``/``termux-job-scheduler`` entry so the phone
+    can consolidate its index overnight while the server is asleep. Stages can
+    be turned off individually; the log goes to ``logs/maintenance.log``.
+    """
+    get_db()
+    summary = run_maintenance(
+        dedup=not args.no_dedup,
+        backfill_embeddings=not args.no_embeddings,
+        wiki=not args.no_wiki,
+        check_links=not args.no_links,
+        optimize=not args.no_optimize,
+        wiki_pages=args.max_pages,
+        link_limit=args.link_check,
+    )
+    print('-' * 70)
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+    return 0
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -5091,7 +5548,28 @@ if __name__ == '__main__':
                         help='Opakovat import, dokud dump nedá žádné nové články')
     parser.add_argument('--refresh', action='store_true',
                         help='Znovu indexovat již uložené články')
+
+    # Nightly maintenance ("dreaming mode").
+    parser.add_argument('--maintenance', '--nightly', dest='maintenance',
+                        action='store_true',
+                        help='Spustit noční údržbu a skončit (dedup, úklid DB, '
+                             'dopočet vektorů, pokračování wiki importu, kontrola odkazů)')
+    parser.add_argument('--no-dedup', action='store_true',
+                        help='Přeskočit slučování duplicitních stránek')
+    parser.add_argument('--no-embeddings', action='store_true',
+                        help='Přeskočit dopočet vektorů')
+    parser.add_argument('--no-wiki', action='store_true',
+                        help='Přeskočit pokračování wiki importu')
+    parser.add_argument('--no-links', action='store_true',
+                        help='Přeskočit kontrolu neplatných odkazů')
+    parser.add_argument('--no-optimize', action='store_true',
+                        help='Přeskočit PRAGMA optimize / VACUUM')
+    parser.add_argument('--link-check', type=int, default=None,
+                        help='Kolik nejstarších stránek ověřit na 404 (0 vypne)')
     args = parser.parse_args()
+
+    if args.maintenance:
+        raise SystemExit(_cli_maintenance(args))
 
     if args.import_wiki or args.source_id:
         raise SystemExit(_cli_import_wiki(args))
@@ -5120,6 +5598,14 @@ if __name__ == '__main__':
     _scheduler.add_job(check_sitemaps,   IntervalTrigger(hours=24), id='check_sitemaps')
     _scheduler.add_job(recrawl_all_sites, IntervalTrigger(hours=12), id='recrawl_all')
     _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
+    if MAINTENANCE_NIGHTLY_ENABLED:
+        # One nightly pass at the configured hour; a cron-style trigger keeps it
+        # out of the user's way far better than an interval job.
+        from apscheduler.triggers.cron import CronTrigger
+        _scheduler.add_job(maintenance_scheduled,
+                           CronTrigger(hour=MAINTENANCE_NIGHTLY_HOUR),
+                           id='nightly_maintenance')
+        print(f"Nightly maintenance scheduled at {MAINTENANCE_NIGHTLY_HOUR:02d}:00")
     _scheduler.start()
     print('Scheduler started')
 
