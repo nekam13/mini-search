@@ -3,3 +3,16 @@ data.ms/
 console.db
 __pycache__/
 .DS_Store
+
+# Wikipedia dumps and other large import artefacts: never commit these.
+*.xml.bz2
+*.xml.gz
+*.ndjson
+dumps/
+wiki-dumps/
+.agent_tmp/
+
+# Local runtime configuration (may hold machine-specific paths/settings).
+.env
+logs/
+data/

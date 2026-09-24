@@ -27,9 +27,10 @@ import re
 import gzip
 import io
 import socket
+from http.client import RemoteDisconnected
 from datetime import datetime, timedelta
 from ipaddress import ip_address
-from urllib.parse import urlparse, urlunparse, urljoin, urlencode
+from urllib.parse import urlparse, urlunparse, urljoin, urlencode, parse_qsl, quote
 from urllib.robotparser import RobotFileParser
 
 from flask import (Flask, render_template, request, redirect, jsonify)
@@ -38,11 +39,22 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
 import requests.packages.urllib3.util.connection as urllib3_cn
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 import feedparser
 import extruct
-import numpy as np
-import hnswlib
+
+# numpy/hnswlib are only needed for vector search. The mobile profile
+# (requirements-mobile.txt) omits them, so import defensively and let the
+# whole app run on FTS5 alone.
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - depends on install profile
+    np = None
+try:
+    import hnswlib
+except ImportError:  # pragma: no cover - depends on install profile
+    hnswlib = None
 
 
 # Some local networks resolve a hostname to both IPv4 and IPv6, and a stalled
@@ -54,15 +66,87 @@ urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 # GLOBAL CONFIG
 # ============================================================================
 
-DB_PATH = "console.db"
-MAX_RETRIES = 3
-REQUEST_TIMEOUT = 30
+def _env_int(name, default, minimum=None, maximum=None):
+    """Read an int from the environment, clamped to a sane range.
+
+    Invalid values silently fall back to ``default`` so a typo in the Termux
+    shell cannot stop the app from booting.
+    """
+    raw = os.environ.get(name)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+
+
+DB_PATH = os.environ.get("MINISEARCH_DB", "console.db")
+# ``MINISEARCH_PROFILE=lowmem`` flips every expensive default in one go, which is
+# the recommended setting on Termux/Android where RAM and storage are tight.
+LOW_MEMORY_MODE = _env_bool("MINISEARCH_LOWMEM") or \
+    os.environ.get("MINISEARCH_PROFILE", "").strip().lower() in ('lowmem', 'low-memory', 'mobile')
+
+MAX_RETRIES = _env_int("MINISEARCH_MAX_RETRIES", 3, 0, 10)
+REQUEST_TIMEOUT = _env_int("MINISEARCH_REQUEST_TIMEOUT", 30, 1, 600)
+DISCOVERY_TIMEOUT = _env_int("MINISEARCH_DISCOVERY_TIMEOUT", 10, 1, 600)
+DISCOVERY_MAX_RETRIES = _env_int("MINISEARCH_DISCOVERY_MAX_RETRIES", 2, 0, 10)
+HTTP_FETCH_RETRY_BASE_DELAY = 1.0
+# Statuses that are worth retrying: rate limiting plus transient server/proxy
+# problems. 429/503 are the ones Czech MediaWiki and shared hosts actually hit.
+RETRYABLE_HTTP_STATUSES = frozenset((408, 425, 429, 500, 502, 503, 504))
+# Cap for exponential HTTP backoff, kept modest so a slow phone recovers quickly.
+HTTP_RETRY_MAX_DELAY = _env_int("MINISEARCH_RETRY_MAX_DELAY", 5, 1, 120)
 MIN_DELAY = 1.0
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 MiniSearchBot/1.0")
 SHUTDOWN_FLAG = False
-MAX_SITEMAP_RECURSION = 5
-MAX_SITEMAP_URLS = 5000
+MAX_SITEMAP_RECURSION = _env_int("MINISEARCH_SITEMAP_RECURSION", 5, 1, 20)
+MAX_SITEMAP_URLS = _env_int("MINISEARCH_SITEMAP_MAX_URLS", 5000, 10, 500000)
+RECRAWL_STALE_AFTER_SECONDS = 3 * 24 * 3600
+
+# How many worker threads crawl the queue. One is plenty on a phone and keeps
+# SQLite contention and RAM low; desktop installs can raise it.
+WORKER_COUNT = _env_int("MINISEARCH_WORKERS", 1 if LOW_MEMORY_MODE else 2, 1, 16)
+# Caps a single page's extracted body so one huge article cannot balloon the DB.
+MAX_BODY_CHARS = _env_int("MINISEARCH_MAX_BODY_CHARS", 3500, 200, 200000)
+# Embeddings are the biggest per-page cost (384 floats = 1.5 KB each) and the
+# hnswlib index adds more RAM on top, so on a phone they should only run when
+# there is headroom. ``MINISEARCH_EMBEDDINGS`` accepts:
+#   1/0/true/false - hard on/off (the historical behaviour)
+#   auto           - keep vector search unless RAM or battery is too low
+# The default is ``auto`` in low-memory mode and always-on elsewhere.
+EMBEDDINGS_PREF = os.environ.get(
+    "MINISEARCH_EMBEDDINGS", "auto" if LOW_MEMORY_MODE else "1").strip().lower()
+# Below this much free RAM (MB) automatic mode drops embeddings.
+EMBED_MIN_FREE_MB = _env_int("MINISEARCH_MIN_FREE_MB", 300, 50, 100000)
+# Below this battery percentage, and while unplugged, automatic mode drops them.
+EMBED_MIN_BATTERY_PCT = _env_int("MINISEARCH_MIN_BATTERY_PCT", 15, 0, 100)
+EMBED_MAX_CHARS = _env_int("MINISEARCH_EMBED_MAX_CHARS", 1000, 100, 8000)
+# Above this many stored embeddings the hnswlib index is skipped in low-memory
+# mode, because the in-RAM index (plus the vectors) can exceed a phone's budget.
+HNSW_MAX_ELEMENTS = _env_int("MINISEARCH_HNSW_MAX_ELEMENTS", 100000, 100, 5000000)
+
+# --- Czech Wikipedia importer -------------------------------------------------
+# Default language for a bare wiki source and the API batch size. The default
+# importer is ``api`` because it needs no local storage; ``dump`` streams a
+# locally downloaded multistream dump instead (see run_wiki_import).
+WIKI_DEFAULT_LANG = os.environ.get("MINISEARCH_WIKI_LANG", "cs")
+WIKI_API_BATCH = _env_int("MINISEARCH_WIKI_BATCH", 50, 1, 50)
+WIKI_IMPORT_RETRIES = _env_int("MINISEARCH_WIKI_RETRIES", 3, 0, 10)
+# Optional API base for a Wikimedia mirror or a deterministic test server. When
+# unset the standard ``https://<lang>.wikipedia.org`` host is used.
+WIKI_API_BASE = os.environ.get("MINISEARCH_WIKI_API_BASE", "").rstrip("/")
 
 # Local (private-network) sites are trusted: we skip robots.txt for them and
 # boost them in search results. The multiplier is stored per site so the admin
@@ -90,6 +174,9 @@ _robots_cache = {}
 _robots_lock = threading.Lock()
 _domain_crawl_delay = {}
 _domain_delay_lock = threading.Lock()
+_http_local = threading.local()
+_active_recrawls = set()
+_recrawl_lock = threading.Lock()
 
 # Update tracking
 COMMIT_SHA_PATH = ".commit_sha"
@@ -113,6 +200,8 @@ DB_SCHEMA = {
             status TEXT DEFAULT 'active',
             error_count INTEGER DEFAULT 0,
             last_crawled INTEGER DEFAULT 0,
+            last_import_at INTEGER DEFAULT 0,
+            import_state TEXT DEFAULT '{}',
             max_pages INTEGER DEFAULT 500,
             crawl_delay REAL DEFAULT 1.0,
             is_local INTEGER DEFAULT 0,
@@ -125,6 +214,7 @@ DB_SCHEMA = {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             site_id INTEGER,
             url TEXT,
+            url_hash TEXT DEFAULT '',
             status TEXT DEFAULT 'pending',
             locked_by TEXT DEFAULT '',
             error_reason TEXT DEFAULT '',
@@ -197,7 +287,9 @@ DB_SCHEMA = {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             site_id INTEGER NOT NULL,
             url TEXT NOT NULL,
-            source_type TEXT NOT NULL CHECK(source_type IN ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')),
+            source_type TEXT NOT NULL CHECK(source_type IN ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom', 'wiki')),
+            importer TEXT DEFAULT '',
+            import_state TEXT DEFAULT '',
             priority INTEGER DEFAULT 5,
             notes TEXT DEFAULT '',
             last_checked INTEGER DEFAULT 0,
@@ -208,8 +300,15 @@ DB_SCHEMA = {
     '''
 }
 
-VALID_SOURCE_TYPES = ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom')
+# ``wiki`` is handled by the streaming Wikimedia dump importer rather than the
+# generic crawler. It is deliberately appended so the existing CHECK constraint
+# stays valid on upgraded databases (see ``_migrate_sources``).
+VALID_SOURCE_TYPES = ('domain', 'url', 'sitemap', 'feed', 'rss', 'atom', 'wiki')
 FEED_SOURCE_TYPES = ('feed', 'rss', 'atom')
+WIKI_SOURCE_TYPE = 'wiki'
+# Recognised ``importer`` values for a wiki source. ``dump`` streams a Wikimedia
+# multistream dump; ``api`` walks the MediaWiki action API.
+WIKI_IMPORTERS = ('dump', 'api')
 VALID_SITE_STATUSES = ('active', 'blocked', 'paused')
 MAX_PAGES_MIN = 1
 MAX_PAGES_MAX = 10000
@@ -222,6 +321,7 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_queue_priority ON crawl_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_queue_site ON crawl_queue(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_queue_scheduled ON crawl_queue(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_queue_url_hash ON crawl_queue(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_site ON pages(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
@@ -286,7 +386,61 @@ def get_db():
             _migrate_db(_db_conn)
             _backfill_fts(_db_conn)
             _migrate_sources(_db_conn)
+            run_self_migration(_db_conn)
     return _db_conn
+
+
+def run_self_migration(conn=None):
+    """Verify the schema upgrade and drop legacy leftovers once it is proven.
+
+    Called automatically on every startup, so an existing install upgrades in
+    place the same way it always has — no manual step. Nothing is deleted until
+    the new shape is confirmed: the legacy ``site_sources_old`` table (if an
+    interrupted rebuild left one behind) is only removed after the live table
+    exists with all expected columns and has not lost rows relative to it.
+    Returns a short human-readable summary string.
+    """
+    conn = conn or get_db()
+    notes = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+
+        # 1) Confirm the upgraded site_sources shape.
+        expected = {'id', 'site_id', 'url', 'source_type', 'importer',
+                    'import_state', 'priority', 'notes', 'last_checked',
+                    'status', 'created_at'}
+        cursor.execute("PRAGMA table_info(site_sources)")
+        columns = {row[1] for row in cursor.fetchall()}
+        missing = expected - columns
+        if missing:
+            notes.append(f"site_sources missing columns: {sorted(missing)}")
+            return '; '.join(notes)  # do not delete anything on a bad shape
+
+        # 2) Verify the CHECK constraint accepts the new 'wiki' type.
+        cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='site_sources'")
+        row = cursor.fetchone()
+        if not row or "'wiki'" not in (row[0] or ''):
+            notes.append("site_sources CHECK not upgraded")
+            return '; '.join(notes)
+
+        # 3) Only now, with the upgrade proven, drop the legacy backup table.
+        if 'site_sources_old' in tables:
+            cursor.execute("SELECT COUNT(*) FROM site_sources")
+            new_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM site_sources_old")
+            old_count = cursor.fetchone()[0]
+            if new_count >= old_count:
+                cursor.execute("DROP TABLE site_sources_old")
+                conn.commit()
+                notes.append(f"dropped legacy site_sources_old ({old_count} rows migrated)")
+            else:
+                notes.append(f"kept site_sources_old (new {new_count} < old {old_count})")
+    except sqlite3.OperationalError as e:
+        notes.append(f"self-migration skipped: {e}")
+    return '; '.join(notes) if notes else 'ok'
 
 
 def _init_schema(conn):
@@ -327,9 +481,29 @@ def _migrate_db(conn):
     except sqlite3.OperationalError:
         pass
 
+    # Add Wiki-import bookkeeping columns to sites if not exists
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN last_import_at INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE sites ADD COLUMN import_state TEXT DEFAULT '{}'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     # Add scheduled_at column to crawl_queue if not exists
     try:
         cursor.execute("ALTER TABLE crawl_queue ADD COLUMN scheduled_at INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add url_hash column to crawl_queue if not exists (robust deduplication)
+    try:
+        cursor.execute("ALTER TABLE crawl_queue ADD COLUMN url_hash TEXT DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -368,7 +542,30 @@ def _migrate_db(conn):
         conn.commit()
     except sqlite3.OperationalError:
         pass
-    
+
+    # Add wiki-importer columns to site_sources (pre-7.5 databases)
+    for column, ddl in (
+        ("importer", "ALTER TABLE site_sources ADD COLUMN importer TEXT DEFAULT ''"),
+        ("import_state", "ALTER TABLE site_sources ADD COLUMN import_state TEXT DEFAULT ''"),
+    ):
+        try:
+            cursor.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # Older databases carry a CHECK constraint without 'wiki'. SQLite cannot
+    # alter it, so rebuild the table only when the constraint still rejects it.
+    try:
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='site_sources'")
+        row = cursor.fetchone()
+        ddl = (row[0] if row else '') or ''
+        if "'wiki'" not in ddl:
+            _rebuild_site_sources(cursor)
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        print(f"site_sources constraint migration skipped: {e}")
+
     # Create triggers if not exists
     for trigger in DB_TRIGGERS:
         try:
@@ -376,6 +573,42 @@ def _migrate_db(conn):
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+
+def _rebuild_site_sources(cursor):
+    """Recreate site_sources with the extended CHECK constraint, preserving rows.
+
+    Columns the old table did not have are filled with defaults rather than
+    dropped, so upgrading an existing database never loses source rows or their
+    importer progress.
+    """
+    cursor.execute("PRAGMA table_info(site_sources)")
+    old_columns = {row[1] for row in cursor.fetchall()}
+
+    def column(name, fallback="''"):
+        return name if name in old_columns else f"{fallback} AS {name}"
+
+    cursor.execute("ALTER TABLE site_sources RENAME TO site_sources_old")
+    cursor.execute(DB_SCHEMA['site_sources'])
+    cursor.execute(f"""
+        INSERT INTO site_sources (id, site_id, url, source_type, importer, import_state,
+                                  priority, notes, last_checked, status, created_at)
+        SELECT id, site_id, url, source_type,
+               {column('importer')},
+               {column('import_state')},
+               priority, notes,
+               {column('last_checked', '0')},
+               status, created_at
+        FROM site_sources_old
+    """)
+    cursor.execute("DROP TABLE site_sources_old")
+    # Indexes live on the dropped table, so recreate them.
+    for index in DB_INDEXES:
+        if 'site_sources' in index:
+            try:
+                cursor.execute(index)
+            except sqlite3.OperationalError:
+                pass
 
 
 def _backfill_fts(conn):
@@ -504,7 +737,8 @@ def _get_latest_commit_from_github():
     """Get latest commit SHA from GitHub API."""
     try:
         url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BRANCH}"
-        resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=DISCOVERY_TIMEOUT, max_retries=DISCOVERY_MAX_RETRIES,
+                         purpose='github-commit-check')
         if resp.status_code == 200:
             data = resp.json()
             return data.get('sha', '')
@@ -698,21 +932,467 @@ def url_hash(url):
     return hashlib.md5(normalize_url(url).encode('utf-8')).hexdigest()
 
 
+def canonicalize_url(url, base_url=None):
+    """Return a stable canonical form of a URL for deduplication.
+
+    Builds on :func:`normalize_url` (lowercased host, stripped ``www.``, no
+    fragment) and additionally drops tracking/utm parameters, sorts the query
+    string and removes the default ``:80``/``:443`` port. Fragments are always
+    stripped so ``#section`` anchors collapse onto the article URL.
+    """
+    if not url:
+        return ''
+    candidate = url
+    if base_url:
+        try:
+            candidate = urljoin(base_url, url)
+        except Exception:
+            candidate = url
+    candidate = (candidate or '').strip()
+    if not candidate:
+        return ''
+    normalized = normalize_url(candidate)
+    try:
+        parsed = urlparse(normalized)
+    except ValueError:
+        return normalized
+
+    # Drop obvious tracking parameters; keep the rest so real query pages differ.
+    query_pairs = []
+    if parsed.query:
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower().startswith('utm_') or key.lower() in (
+                    'fbclid', 'gclid', 'yclid', 'ref', 'ref_src', 'spm', '_ga'):
+                continue
+            query_pairs.append((key, value))
+        query_pairs.sort()
+    query = urlencode(query_pairs)
+
+    netloc = parsed.netloc
+    # normalize_url lowercases the netloc; strip the scheme default port.
+    if parsed.scheme == 'http' and netloc.endswith(':80'):
+        netloc = netloc[:-3]
+    elif parsed.scheme == 'https' and netloc.endswith(':443'):
+        netloc = netloc[:-4]
+
+    path = parsed.path or '/'
+    if path != '/' and path.endswith('/'):
+        path = path[:-1]
+    return urlunparse((parsed.scheme, netloc, path, '', query, ''))
+
+
+# Czech text uses diacritics that FTS5's unicode61 tokenizer keeps, so a query
+# typed without them ("cesky") would miss "český". Folding happens only for
+# lookup/snippets; stored text keeps its original diacritics for display.
+# Built from a dict rather than two parallel strings so the mapping cannot drift.
+_FOLD_MAP = {
+    'á': 'a', 'ä': 'a', 'â': 'a', 'à': 'a', 'ã': 'a', 'å': 'a', 'ā': 'a',
+    'č': 'c', 'ć': 'c', 'ç': 'c',
+    'ď': 'd',
+    'é': 'e', 'ě': 'e', 'è': 'e', 'ë': 'e', 'ê': 'e', 'ē': 'e',
+    'í': 'i', 'ì': 'i', 'ï': 'i', 'î': 'i', 'ī': 'i',
+    'ň': 'n', 'ń': 'n',
+    'ó': 'o', 'ö': 'o', 'ô': 'o', 'ò': 'o', 'õ': 'o', 'ø': 'o', 'ō': 'o',
+    'ř': 'r', 'ŕ': 'r',
+    'š': 's', 'ś': 's', 'ş': 's',
+    'ť': 't', 'ţ': 't',
+    'ú': 'u', 'ů': 'u', 'ü': 'u', 'ù': 'u', 'û': 'u', 'ū': 'u',
+    'ý': 'y', 'ÿ': 'y',
+    'ž': 'z', 'ź': 'z', 'ż': 'z',
+    'ľ': 'l', 'ĺ': 'l', 'ł': 'l',
+    '·': '-',
+}
+_FOLD_TRANSLATION = str.maketrans(
+    {**{k: v for k, v in _FOLD_MAP.items()},
+     **{k.upper(): v for k, v in _FOLD_MAP.items()}}
+)
+
+
+def fold_diacritics(text):
+    """Lowercase ``text`` and strip Czech/Latin diacritics for matching."""
+    if not text:
+        return ''
+    return text.lower().translate(_FOLD_TRANSLATION)
+
+
+def _has_diacritics(text):
+    folded = fold_diacritics(text)
+    return folded != (text or '').lower()
+
+
+def _fold_tokenize(text):
+    """Split text into folded alphanumeric tokens of length >= 1."""
+    return [t for t in re.split(r'[^0-9a-z]+', fold_diacritics(text)) if t]
+
+
+def page_string(page, key, default=''):
+    """Read a text column from a page row without ever returning ``None``.
+
+    sqlite3 hands back ``None`` for NULL columns, and NULLs propagate through
+    string concatenation, so every read of an optional text field goes through
+    here. Keeps the rest of the code free of ``or ''`` noise.
+    """
+    value = page.get(key) if hasattr(page, 'get') else None
+    if value is None:
+        return default
+    return str(value)
+
+
+def page_json(page, key, default):
+    """Parse a JSON column off a page row, returning ``default`` on damage."""
+    raw = page_string(page, key)
+    if not raw:
+        return default
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+    return parsed if parsed is not None else default
+
+
+# Stopwords are only removed when building FTS queries; a query made entirely of
+# stopwords is kept as-is so search never returns nothing for "je".
+_CZ_STOPWORDS = {
+    'a', 'i', 'o', 'u', 'v', 've', 'na', 'se', 'si', 'je', 'jsou', 'by', 'byl',
+    'byla', 'bylo', 'ze', 'že', 'do', 'za', 'po', 'pro', 'od', 'k', 'ke', 's',
+    'z', 'ze', 'to', 'ten', 'ta', 'ty', 'ale', 'nebo', 'jako', 'co', 'jak',
+}
+
+
+def build_fts_query(query):
+    """Translate a user query into a safe FTS5 MATCH expression.
+
+    Each whitespace-separated term becomes a quoted prefix token, so stray FTS
+    operators can never raise a syntax error. When the query carries diacritics
+    the folded form is OR-ed in, which makes "cesky" match "český" and vice
+    versa while still ranking exact hits first (the original term comes first in
+    the OR chain).
+    """
+    if not query:
+        return ''
+    terms = [t for t in re.split(r'\s+', query.strip()) if t]
+    if not terms:
+        return ''
+    clauses = []
+    for term in terms:
+        cleaned = re.sub(r'["\'(){}\[\]^~*:+-]', ' ', term).strip()
+        cleaned = cleaned.strip()
+        if not cleaned:
+            continue
+        variants = [cleaned]
+        folded = fold_diacritics(cleaned)
+        if folded and folded != cleaned.lower():
+            variants.append(folded)
+        # Also add a tokenized folded variant for hyphenated words.
+        for part in _fold_tokenize(cleaned):
+            if part not in variants:
+                variants.append(part)
+        # Keep the original (possibly diacritic) form first for better ranking.
+        seen = set()
+        unique = []
+        for variant in variants:
+            if variant and variant not in seen:
+                seen.add(variant)
+                unique.append(variant)
+        if len(unique) == 1:
+            clauses.append(f'"{unique[0]}"*')
+        else:
+            clauses.append('(' + ' OR '.join(f'"{v}"*' for v in unique) + ')')
+    if not clauses:
+        return ''
+    # Drop Czech stopwords, but never empty the whole expression.
+    stripped = [c for c, t in zip(clauses, terms) if fold_diacritics(t) not in _CZ_STOPWORDS]
+    if stripped:
+        clauses = stripped
+    return ' AND '.join(clauses)
+
+
+# Schema.org ``@type`` fields are frequently arrays, and the useful object is
+# often nested under ``@graph``. These helpers normalise both shapes.
+def _schema_types(schema):
+    """Return a lowercased list of @type values from a JSON-LD node."""
+    if not isinstance(schema, dict):
+        return []
+    raw = schema.get('@type')
+    if isinstance(raw, str):
+        return [raw.lower()]
+    if isinstance(raw, list):
+        return [str(t).lower() for t in raw if isinstance(t, (str, int))]
+    return []
+
+
+def _iter_jsonld_nodes(node):
+    """Yield every dict node from a JSON-LD document, walking ``@graph``."""
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_jsonld_nodes(item)
+    elif isinstance(node, dict):
+        yield node
+        graph = node.get('@graph')
+        if graph is not None:
+            yield from _iter_jsonld_nodes(graph)
+        # Some sites nest the article under mainEntity / itemListElement.
+        for key in ('mainEntity', 'mainEntityOfPage', 'itemListElement', 'hasPart'):
+            if key in node:
+                yield from _iter_jsonld_nodes(node[key])
+
+
+def _jsonld_scripts(content):
+    """Yield the raw text of every ``application/ld+json`` script block.
+
+    Pages commonly embed several blocks and only one may be malformed. Parsing
+    them individually means one bad block cannot discard the good ones, which
+    extruct's whole-document parse would do.
+    """
+    try:
+        soup = BeautifulSoup(content, 'lxml')
+    except Exception:
+        return
+    for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
+        text = script.string if script.string is not None else script.get_text()
+        if text and text.strip():
+            yield text
+
+
+def _extract_jsonld(content, base_url=''):
+    """Parse JSON-LD from raw HTML, tolerating invalid/nested documents.
+
+    Returns ``(nodes, types)`` where ``nodes`` is a flat list of dicts and
+    ``types`` is the set of lowercased ``@type`` values found. Never raises.
+    """
+    nodes = []
+    types = set()
+    try:
+        data = extruct.extract(content, base_url=base_url or None, syntaxes=['json-ld'])
+        for doc in data.get('json-ld', []):
+            for node in _iter_jsonld_nodes(doc):
+                nodes.append(node)
+                types.update(_schema_types(node))
+    except Exception:
+        nodes = []
+
+    if not nodes:
+        # extruct refuses the whole document when any block is malformed; parse
+        # each script on its own so the valid ones still contribute.
+        for raw in _jsonld_scripts(content):
+            try:
+                doc = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            for node in _iter_jsonld_nodes(doc):
+                nodes.append(node)
+                types.update(_schema_types(node))
+    return nodes, types
+
+
+def _first_schema_value(nodes, types, wanted_types, keys):
+    """Return the first non-empty string for ``keys`` in a node of ``wanted`` type."""
+    wanted = {t.lower() for t in wanted_types}
+    for node in nodes:
+        node_types = set(_schema_types(node))
+        if wanted and not (node_types & wanted):
+            continue
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                # e.g. {"@type": "Person", "name": "..."}
+                name = value.get('name') or value.get('@id')
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+            if isinstance(value, list) and value:
+                first = value[0]
+                if isinstance(first, str) and first.strip():
+                    return first.strip()
+                if isinstance(first, dict):
+                    name = first.get('name')
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+    return ''
+
+
+def _parse_datetime(value):
+    """Best-effort ISO-8601 / RFC timestamp parse, returning a unix int or 0."""
+    if not value:
+        return 0
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    # Numeric strings may already be epoch seconds/millis.
+    if re.fullmatch(r'\d{10,13}', text):
+        number = int(text)
+        return number // 1000 if number > 10 ** 12 else number
+    candidates = [text, text[:19], text[:10]]
+    candidates.append(text.replace('Z', '+00:00'))
+    for candidate in candidates:
+        try:
+            return int(datetime.fromisoformat(candidate).timestamp())
+        except Exception:
+            continue
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d',
+                '%a, %d %b %Y %H:%M:%S %z', '%Y/%m/%d'):
+        try:
+            return int(datetime.strptime(text, fmt).timestamp())
+        except Exception:
+            continue
+    return 0
+
+
+class FetchError(Exception):
+    """HTTP fetch failed before receiving a usable response."""
+
+    def __init__(self, url, message, retryable=False, attempts=1, exc=None):
+        super().__init__(message)
+        self.url = url
+        self.message = message
+        self.retryable = retryable
+        self.attempts = attempts
+        self.exc = exc
+
+
+def _get_http_session():
+    """Thread-local requests session with stable headers for flaky local servers."""
+    session = getattr(_http_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': USER_AGENT,
+            'Connection': 'close',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        _http_local.session = session
+    return session
+
+
+def _exception_chain(exc):
+    """Yield exception plus chained causes/contexts."""
+    current = exc
+    seen = set()
+    while current and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_retryable_network_error(exc):
+    """True for transient connection-level failures."""
+    if isinstance(exc, (RemoteDisconnected, ConnectionResetError, TimeoutError,
+                        requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    for item in _exception_chain(exc):
+        if isinstance(item, (RemoteDisconnected, ConnectionResetError, TimeoutError,
+                             requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        text = str(item).lower()
+        if ('remote end closed connection without response' in text
+                or 'connection aborted' in text
+                or 'connection reset' in text
+                or 'timed out' in text):
+            return True
+    return False
+
+
+def _format_network_error(exc):
+    """Compact error for queue.error_reason and logs."""
+    parts = []
+    for item in _exception_chain(exc):
+        parts.append(f"{type(item).__name__}: {item}")
+    text = " | ".join(parts) if parts else f"{type(exc).__name__}: {exc}"
+    return text[:500]
+
+
+def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fetch', **kwargs):
+    """Centralized HTTP GET with finite retries for transient network errors."""
+    parsed = urlparse(url or '')
+    if parsed.scheme not in ('http', 'https'):
+        raise FetchError(url, f"Unsupported URL scheme: {parsed.scheme or 'missing'}", retryable=False)
+
+    attempts = max(1, int(max_retries or 1))
+    session = _get_http_session()
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = session.get(url, timeout=timeout, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_network_error(exc)
+            if retryable and attempt < attempts:
+                time.sleep(_retry_delay(attempt))
+                continue
+            msg = (f"{purpose}: {_format_network_error(exc)} "
+                   f"(attempt {attempt}/{attempts})")
+            raise FetchError(url, msg, retryable=retryable, attempts=attempt, exc=exc) from exc
+
+        # Transient HTTP statuses are retried too, so callers do not each have to
+        # reimplement backoff. 429 honours Retry-After (capped) when present.
+        if resp.status_code in RETRYABLE_HTTP_STATUSES and attempt < attempts:
+            delay = _retry_after_delay(resp) or _retry_delay(attempt)
+            time.sleep(delay)
+            continue
+        return resp
+    raise FetchError(url, f"{purpose}: unknown network error", retryable=True,
+                     attempts=attempts, exc=last_exc)
+
+
+def _retry_delay(attempt, base=None):
+    """Exponential backoff for retry ``attempt`` (1-based), capped."""
+    base = HTTP_FETCH_RETRY_BASE_DELAY if base is None else base
+    return min(float(HTTP_RETRY_MAX_DELAY), base * (2 ** (attempt - 1)))
+
+
+def _retry_after_delay(resp):
+    """Parse a ``Retry-After`` header into a capped number of seconds, or 0."""
+    raw = (resp.headers.get('Retry-After') or '').strip() if resp.headers else ''
+    if not raw:
+        return 0
+    try:
+        return min(float(HTTP_RETRY_MAX_DELAY), max(0.0, float(int(raw))))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ============================================================================
 # ROBOTS.TXT
 # ============================================================================
 
 def _get_robots(base_url):
-    """Return cached RobotFileParser for a domain."""
+    """Return cached RobotFileParser for a domain.
+
+    Fetched through :func:`_http_get` so it honours our timeout, retries and
+    User-Agent instead of the stdlib's blocking ``urllib`` read. A missing or
+    broken robots.txt yields an allow-all parser.
+    """
     domain = get_domain(base_url)
     with _robots_lock:
         if domain in _robots_cache:
             return _robots_cache[domain]
     robots_url = urljoin(base_url, '/robots.txt')
+    lines = []
+    try:
+        resp = _http_get(robots_url, timeout=DISCOVERY_TIMEOUT,
+                         max_retries=DISCOVERY_MAX_RETRIES, purpose='robots')
+        if resp.status_code == 200:
+            text = resp.text or ''
+            lines = text.splitlines()
+        elif resp.status_code in (401, 403):
+            # A protected robots.txt is treated as "no crawling allowed" for
+            # non-local hosts, matching the standard convention.
+            lines = ['User-agent: *', 'Disallow: /']
+    except Exception:
+        lines = []
     rp = RobotFileParser()
     rp.set_url(robots_url)
     try:
-        rp.read()
+        rp.parse(lines)
     except Exception:
         pass
     with _robots_lock:
@@ -750,8 +1430,9 @@ def get_crawl_delay(base_url):
         if domain in _domain_crawl_delay:
             return _domain_crawl_delay[domain]
 
-    if is_local_url(base_url):
-        # No robots.txt to consult on a private LAN; stay a good citizen anyway.
+    if is_local_url(base_url) or is_wikipedia_url(base_url):
+        # No robots.txt to consult on a private LAN (and Wikipedia is served by
+        # its own importer/API, not the crawler); stay a good citizen anyway.
         delay = MIN_DELAY
     else:
         try:
@@ -959,7 +1640,55 @@ def detect_source_type(url, fallback='url'):
     if (lower.endswith('.rss') or lower.endswith('.atom') or '/rss' in lower
             or '/feed' in lower or '/atom' in lower or 'feed' in lower):
         return 'rss'
+    if 'wikipedia.org' in lower or 'wikimedia.org' in lower or lower.startswith('wiki:'):
+        return WIKI_SOURCE_TYPE
     return fallback
+
+
+def is_wikipedia_url(url):
+    """True for Wikimedia/Wikipedia addresses that the dump importer can serve."""
+    lower = (url or '').lower()
+    return 'wikipedia.org' in lower or 'wikimedia.org' in lower
+
+
+def normalize_wiki_source(url, importer=None):
+    """Map a wiki source URL onto ``(site_url, importer, lang)``.
+
+    Accepts a bare language code (``cs``), ``cs.wikipedia.org``, a full article
+    URL, the ``wiki:cs`` shorthand, or a ``file:///path/dump.bz2`` local dump.
+    ``importer`` is ``api`` (walk the MediaWiki action API, the default because
+    it needs no local storage) or ``dump`` (stream a downloaded multistream
+    dump, ideal offline on a device with the dump on disk).
+    """
+    value = (url or '').strip()
+    lang = WIKI_DEFAULT_LANG
+    mode = (importer or 'api').strip().lower()
+    if mode not in WIKI_IMPORTERS:
+        mode = 'api'
+
+    # A local dump path implies the dump importer; the site it belongs to is
+    # still the corresponding language wiki, inferred from the filename.
+    if value.lower().startswith('file://'):
+        return f"https://{lang_from_wiki_url(value)}.wikipedia.org", 'dump', lang
+
+    if value.lower().startswith('wiki:'):
+        lang = value.split(':', 1)[1].strip() or lang
+        return f"https://{lang}.wikipedia.org", mode, lang
+
+    # Bare language code, e.g. "cs" or "cs-cs".
+    if re.fullmatch(r'[a-z]{2,3}(-[a-z]+)?', value.lower()):
+        lang = value.lower()
+        return f"https://{lang}.wikipedia.org", mode, lang
+
+    host = extract_host(value)
+    match = re.match(r'([a-z\-]+)\.(?:m\.)?wikipedia\.org$', host or '')
+    if match:
+        lang = match.group(1)
+    elif host.endswith('wikipedia.org'):
+        lang = WIKI_DEFAULT_LANG
+    elif not host:
+        return None, mode, lang
+    return f"https://{lang}.wikipedia.org", mode, lang
 
 
 def get_site_sources(site_id):
@@ -980,14 +1709,25 @@ def get_source_by_id(source_id):
     return dict(row) if row else None
 
 
-def add_source(site_id, url, source_type='url', priority=5, notes='', is_local=None):
+def add_source(site_id, url, source_type='url', priority=5, notes='', is_local=None,
+               importer=None):
     """Add a source under a site. Returns (source_id, error_message)."""
     if source_type not in VALID_SOURCE_TYPES:
         return None, f'Nepodporovaný typ zdroje: {source_type}'
 
-    ok, message = validate_url(url)
-    if not ok:
-        return None, message
+    # A wiki source is a language/domain selector, not a crawlable URL, so it is
+    # validated by the importer rather than ``validate_url``.
+    if source_type == WIKI_SOURCE_TYPE:
+        site_url, importer, _lang = normalize_wiki_source(url, importer)
+        if not site_url:
+            return None, 'Neplatný odkaz na Wikipedii'
+        # Wiki content is public and served by the importer, never crawled, so
+        # never mark it local (which would also apply the LAN search boost).
+        is_local = False
+    else:
+        ok, message = validate_url(url)
+        if not ok:
+            return None, message
 
     ok, message, priority = validate_priority(priority)
     if not ok:
@@ -1016,6 +1756,40 @@ def add_source(site_id, url, source_type='url', priority=5, notes='', is_local=N
             site_id = add_site(normalized, 500, is_local=is_local)
             if not site_id:
                 return None, 'Doménu nebylo možné vytvořit'
+
+    if source_type == WIKI_SOURCE_TYPE:
+        # Create/reuse the ``cs.wikipedia.org`` site. The stored source URL is
+        # the language selector (or the ``file://`` dump path), so the importer
+        # knows which dump/language to read.
+        site_url, importer, lang = normalize_wiki_source(url, importer)
+        domain = get_domain(site_url)
+        existing_site = execute_db_fetchone(
+            "SELECT id FROM sites WHERE canonical_url = ?", (domain,)
+        )
+        if existing_site:
+            site_id = existing_site[0]
+        else:
+            site_id = add_site(site_url, 500, is_local=False)
+            if not site_id:
+                return None, 'Doménu nebylo možné vytvořit'
+        normalized = url.strip() if url.strip().lower().startswith(
+            WIKI_DUMP_SOURCE_PREFIX) else site_url
+        duplicate = execute_db_fetchone(
+            "SELECT id FROM site_sources WHERE site_id = ? AND source_type = ? "
+            "AND url = ?",
+            (site_id, WIKI_SOURCE_TYPE, normalized)
+        )
+        if duplicate:
+            return None, 'Tento zdroj je již pod doménou zaregistrován'
+        execute_db(
+            """INSERT INTO site_sources (site_id, url, source_type, importer, import_state,
+                                         priority, notes, last_checked, status)
+               VALUES (?, ?, ?, ?, '', ?, ?, 0, 'active')""",
+            (site_id, normalized, source_type, importer, priority, notes or ''),
+            commit=True
+        )
+        source_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
+        return source_id, None
 
     normalized = normalize_url(url)
     if source_type == 'domain':
@@ -1068,12 +1842,18 @@ def update_source(source_id, **kwargs):
     params = []
 
     if kwargs.get('url') is not None:
-        ok, message = validate_url(kwargs['url'])
-        if not ok:
-            return False, message
-        new_url = normalize_url(kwargs['url'])
-        if source['source_type'] == 'domain':
-            new_url = get_domain(new_url)
+        if source['source_type'] == WIKI_SOURCE_TYPE:
+            new_url, _importer, _lang = normalize_wiki_source(
+                kwargs['url'], kwargs.get('importer') or source.get('importer'))
+            if not new_url:
+                return False, 'Neplatný odkaz na Wikipedii'
+        else:
+            ok, message = validate_url(kwargs['url'])
+            if not ok:
+                return False, message
+            new_url = normalize_url(kwargs['url'])
+            if source['source_type'] == 'domain':
+                new_url = get_domain(new_url)
         if new_url != source['url']:
             duplicate = execute_db_fetchone(
                 "SELECT id FROM site_sources WHERE site_id = ? AND url = ? AND id != ?",
@@ -1083,6 +1863,13 @@ def update_source(source_id, **kwargs):
                 return False, 'Tento zdroj je již pod doménou zaregistrován'
         updates.append("url = ?")
         params.append(new_url)
+
+    if kwargs.get('importer') is not None and source['source_type'] == WIKI_SOURCE_TYPE:
+        mode = str(kwargs['importer']).strip().lower()
+        if mode not in WIKI_IMPORTERS:
+            return False, 'Nepodporovaný importér'
+        updates.append("importer = ?")
+        params.append(mode)
 
     if kwargs.get('source_type') is not None:
         if kwargs['source_type'] not in VALID_SOURCE_TYPES:
@@ -1303,29 +2090,65 @@ def get_filtered_sites(search='', status='', source_type='', local_only=False):
     return [_decorate_site(dict(row)) for row in execute_db_fetchall(query, tuple(params))]
 
 
+def _begin_site_recrawl(site_id):
+    """Guard against overlapping recrawls for one site."""
+    with _recrawl_lock:
+        if site_id in _active_recrawls:
+            return False
+        _active_recrawls.add(site_id)
+        return True
+
+
+def _finish_site_recrawl(site_id):
+    with _recrawl_lock:
+        _active_recrawls.discard(site_id)
+
+
 def recrawl_site(site_id):
     """Queue every domain/url/sitemap/feed source belonging to a site."""
     site = get_site_by_id(site_id)
     if not site:
         return False, 'Web nenalezen'
+    if not _begin_site_recrawl(site_id):
+        return False, 'Re-crawl tohoto webu právě běží'
     try:
-        site_id_result, added = phase_1_discovery(site['canonical_url'], site['max_pages'])
+        site_id_result, added = phase_1_discovery(
+            site['canonical_url'],
+            site['max_pages'],
+            allow_indexed_refresh=True
+        )
         return True, f"Re-crawl zahájen ({added} URL ve frontě)"
     except Exception as e:
         log_error(f"Recrawl failed for site {site_id}", e)
         return False, f"Re-crawl selhal: {e}"
+    finally:
+        _finish_site_recrawl(site_id)
 
 
 def recrawl_async(site_id):
     """Run recrawl_site in the background (discovery hits the network)."""
+    if not get_site_by_id(site_id):
+        return False, 'Web nenalezen'
+    if not _begin_site_recrawl(site_id):
+        return False, 'Re-crawl tohoto webu právě běží'
 
     def _run():
         try:
-            recrawl_site(site_id)
+            site = get_site_by_id(site_id)
+            if not site:
+                return
+            phase_1_discovery(
+                site['canonical_url'],
+                site['max_pages'],
+                allow_indexed_refresh=True
+            )
         except Exception as e:
             log_error(f"Background recrawl of site {site_id} failed", e)
+        finally:
+            _finish_site_recrawl(site_id)
 
     threading.Thread(target=_run, daemon=True).start()
+    return True, 'Re-crawl spuštěn na pozadí'
 
 # ============================================================================
 # VECTOR SEARCH (hnswlib)
@@ -1335,15 +2158,91 @@ def _init_hnsw(dim=384):
     """Create a fresh hnswlib index with given dimension."""
     global _hnsw_index
     idx = hnswlib.Index(space='cosine', dim=dim)
-    idx.init_index(max_elements=100000, ef_construction=200, M=16)
+    idx.init_index(max_elements=HNSW_MAX_ELEMENTS, ef_construction=200, M=16)
     idx.set_ef(50)
     _hnsw_index = idx
     return idx
 
 
+def _available_memory_mb():
+    """Best-effort free RAM in MB, or ``None`` when it cannot be determined.
+
+    Reads ``/proc/meminfo`` (Linux, incl. Termux) and falls back to
+    ``os.sysconf``; returns ``None`` on platforms that expose neither, which
+    callers treat as "don't know, don't block".
+    """
+    try:
+        with open('/proc/meminfo') as handle:
+            for line in handle:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        pages = os.sysconf('SC_AVPHYS_PAGES')
+        size = os.sysconf('SC_PAGE_SIZE')
+        if pages > 0 and size > 0:
+            return pages * size / (1024.0 * 1024.0)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def _battery_status():
+    """Return ``(percent, charging)`` from sysfs, or ``(None, None)`` if unknown."""
+    for base in ('/sys/class/power_supply/BAT0', '/sys/class/power_supply/battery'):
+        try:
+            with open(f"{base}/capacity") as handle:
+                percent = int(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+        charging = True
+        try:
+            with open(f"{base}/status") as handle:
+                charging = handle.read().strip().lower() in ('charging', 'full')
+        except OSError:
+            charging = True
+        return percent, charging
+    return None, None
+
+
+def _embeddings_allowed_by_resources():
+    """Automatic-mode gate: keep vectors only when RAM and battery allow."""
+    free_mb = _available_memory_mb()
+    if free_mb is not None and free_mb < EMBED_MIN_FREE_MB:
+        return False
+    percent, charging = _battery_status()
+    if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
+        return False
+    return True
+
+
+def embeddings_enabled():
+    """Whether vector search should run at all in this configuration.
+
+    False when embeddings are explicitly disabled, or the numpy/hnswlib stack
+    is missing (mobile profile), or automatic mode finds the device low on RAM
+    or battery. In every one of those cases search falls back to FTS5.
+    """
+    if np is None or hnswlib is None:
+        return False
+    if EMBEDDINGS_PREF in ('0', 'false', 'off', 'no', 'ne'):
+        return False
+    if EMBEDDINGS_PREF in ('1', 'true', 'on', 'yes', 'ano'):
+        return True
+    return _embeddings_allowed_by_resources()
+
+
 def get_hnsw_index():
-    """Return (or create+populate) global hnswlib index."""
+    """Return (or create+populate) global hnswlib index, or ``None`` if disabled.
+
+    In low-memory mode the index is never built: the per-page embeddings plus
+    the hnswlib graph can easily exceed a phone's budget, and full-text search
+    still works. Callers must handle ``None``.
+    """
     global _hnsw_index
+    if not embeddings_enabled():
+        return None
     if _hnsw_index is None:
         dim = get_model().get_sentence_embedding_dimension()
         _init_hnsw(dim)
@@ -1370,8 +2269,11 @@ def _load_embeddings_into_index():
 
 
 def _rebuild_hnsw_index():
-    """Rebuild index from scratch (called after delete)."""
+    """Rebuild index from scratch (called after delete). No-op if disabled."""
     global _hnsw_index
+    if not embeddings_enabled():
+        _hnsw_index = None
+        return
     if _hnsw_index is not None:
         dim = _hnsw_index.dim
         _init_hnsw(dim)
@@ -1397,8 +2299,10 @@ def get_model():
 
 
 def generate_embedding(text):
+    if not embeddings_enabled():
+        return None
     try:
-        return get_model().encode(text[:1000])
+        return get_model().encode(text[:EMBED_MAX_CHARS])
     except Exception:
         return np.zeros(384, dtype=np.float32)
 
@@ -1538,9 +2442,13 @@ def _site_priority_multiplier(site_id):
 
 
 def vector_search(query, limit=25, filter_type=None):
-    """Search with hnswlib; local sites are boosted by their multiplier."""
+    """Search with hnswlib; local sites are boosted by their multiplier.
+
+    Returns ``[]`` when embeddings are disabled (low-memory mode) so
+    :func:`hybrid_search` silently falls back to full-text search.
+    """
     idx = get_hnsw_index()
-    if idx.element_count == 0:
+    if idx is None or idx.element_count == 0:
         return []
 
     query_embedding = generate_embedding(query)
@@ -1606,26 +2514,24 @@ def _attach_priority(page):
         page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
     return page
 def fts_search(query, limit=25):
-    """Search using FTS5 full-text search."""
+    """Search using FTS5 full-text search with a diacritic-folded query."""
     results = []
+    match_expr = build_fts_query(query)
+    if not match_expr:
+        return results
     try:
-        # Use FTS5 with unicode61 tokenizer for Czech support
         rows = execute_db_fetchall("""
             SELECT p.* FROM pages_fts fts
             JOIN pages p ON fts.page_id = p.id
             WHERE pages_fts MATCH ?
             ORDER BY rank
             LIMIT ?
-        """, (query, limit * 2))
-        
+        """, (match_expr, limit * 2))
         for row in rows:
-            page = dict(row)
-            # Calculate relevance from FTS5 rank
-            # For simplicity, use position in results as proxy
-            results.append(page)
+            results.append(dict(row))
     except Exception as e:
+        # A malformed expression must never break the whole search.
         print(f"FTS5 search error: {e}")
-    
     return results
 
 
@@ -1646,15 +2552,17 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
     # Collect candidate URLs
     candidate_urls = []
     try:
-        resp = requests.get(urljoin(base_url, '/robots.txt'), timeout=10,
-                            headers={'User-Agent': USER_AGENT})
+        resp = _http_get(urljoin(base_url, '/robots.txt'),
+                         timeout=DISCOVERY_TIMEOUT,
+                         max_retries=DISCOVERY_MAX_RETRIES,
+                         purpose='robots-discovery')
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith('sitemap:'):
                     sitemap_url = line.split(':', 1)[1].strip()
                     candidate_urls.append(sitemap_url)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Could not probe robots.txt for {base_url}", e)
 
     for path in [
         '/sitemap.xml', '/sitemap_index.xml', '/sitemap.xml.gz',
@@ -1673,8 +2581,11 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
             # Check robots.txt for this URL (skipped for local sites)
             if not is_allowed(url, site_id=site_id):
                 continue
-                
-            resp = requests.get(url, timeout=10, headers={'User-Agent': USER_AGENT})
+
+            resp = _http_get(url,
+                             timeout=DISCOVERY_TIMEOUT,
+                             max_retries=DISCOVERY_MAX_RETRIES,
+                             purpose='source-discovery')
             if resp.status_code != 200:
                 continue
             ct = resp.headers.get('Content-Type', '')
@@ -1694,8 +2605,8 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
             else:
                 continue
             discovered.append({'url': url, 'type': item_type})
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"Could not probe discovered source {url}", e)
 
     for item in discovered:
         try:
@@ -1715,7 +2626,8 @@ def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
     
     urls = []
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='sitemap-fetch')
         if resp.status_code != 200:
             return []
         
@@ -1749,14 +2661,18 @@ def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
 def parse_feed(url):
     urls = []
     try:
-        feed = feedparser.parse(url)
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='feed-fetch')
+        if resp.status_code != 200:
+            return []
+        feed = feedparser.parse(resp.content)
         for entry in feed.entries:
             if hasattr(entry, 'link'):
                 urls.append(entry.link)
             elif hasattr(entry, 'links') and entry.links:
                 urls.append(entry.links[0].get('href', ''))
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Error parsing feed {url}", e)
     return urls
 
 
@@ -1766,8 +2682,9 @@ def crawl_homepage_for_links(site_url, max_pages):
     try:
         if not is_allowed(site_url):
             return []
-            
-        resp = requests.get(site_url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+
+        resp = _http_get(site_url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='homepage-crawl')
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content, 'lxml')
             for a in soup.find_all('a', href=True):
@@ -1776,50 +2693,96 @@ def crawl_homepage_for_links(site_url, max_pages):
                     urls.append(full_url)
                 if len(urls) >= max_pages:
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Homepage crawl failed for {site_url}", e)
     return urls
 
 
-def _queue_url(site_id, url, priority=None):
+def _queue_url(site_id, url, priority=None, allow_indexed_refresh=False,
+               stale_after_seconds=None, revive_error=True):
     """Queue a URL for crawling unless it is disallowed or already known.
 
     Local sites ignore robots.txt and their URLs are queued with the most
     urgent priority so the user sees results quickly.
     """
     if not url:
-        return
+        return False
+    url = normalize_url(url)
+    if not url:
+        return False
     site = get_site_by_id(site_id) if site_id else None
     is_local = bool(site and site.get('is_local'))
     if not is_allowed(url, site_id=site_id, is_local=is_local):
-        return
+        return False
 
     if priority is None:
         priority = LOCAL_QUEUE_PRIORITY if is_local else DEFAULT_QUEUE_PRIORITY
     elif is_local:
         priority = min(priority, LOCAL_QUEUE_PRIORITY)
 
-    # Check if already indexed
-    url_h = url_hash(url)
-    existing_page = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
-    if existing_page:
-        return
+    now = int(time.time())
+    stale_cutoff = None
+    if stale_after_seconds and stale_after_seconds > 0:
+        stale_cutoff = now - int(stale_after_seconds)
 
-    # Check if already in queue
-    existing = execute_db_fetchone("SELECT id FROM crawl_queue WHERE url = ?", (url,))
-    if existing:
-        return
+    normalized_hash = url_hash(url)
+
+    # If this URL already sits in the queue, avoid duplicate rows.
+    existing_q = execute_db_fetchone(
+        """SELECT id, status, retry_count, created_at
+           FROM crawl_queue
+           WHERE site_id = ? AND (url = ? OR url_hash = ?)
+           ORDER BY id DESC LIMIT 1""",
+        (site_id, url, normalized_hash)
+    )
+    if existing_q:
+        row_id, status, retry_count, created_at = existing_q
+        if status in ('pending', 'locked', 'completed'):
+            return False
+        if status == 'error' and revive_error:
+            should_revive = (retry_count < MAX_RETRIES)
+            if not should_revive and stale_cutoff is not None and (created_at or 0) <= stale_cutoff:
+                should_revive = True
+            if should_revive:
+                new_retry = retry_count if retry_count < MAX_RETRIES else 0
+                execute_db(
+                    """UPDATE crawl_queue
+                       SET status='pending', locked_by='', scheduled_at=0,
+                           retry_count=?, error_reason='', priority=MIN(priority, ?),
+                           url=?, url_hash=?
+                       WHERE id=?""",
+                    (new_retry, priority, url, normalized_hash, row_id), commit=True
+                )
+                return True
+        return False
+
+    # Check if already indexed
+    existing_page = execute_db_fetchone(
+        "SELECT id, indexed_at FROM pages WHERE url_hash=?",
+        (normalized_hash,)
+    )
+    if existing_page:
+        if not allow_indexed_refresh:
+            return False
+        indexed_at = existing_page[1] or 0
+        if stale_cutoff is None:
+            return False
+        if indexed_at >= stale_cutoff:
+            return False
 
     try:
         execute_db(
-            "INSERT INTO crawl_queue (site_id, url, status, priority, scheduled_at) VALUES (?, ?, 'pending', ?, 0)",
-            (site_id, url, priority), commit=True
+            """INSERT INTO crawl_queue (site_id, url, url_hash, status, priority, scheduled_at)
+               VALUES (?, ?, ?, 'pending', ?, 0)""",
+            (site_id, url, normalized_hash, priority), commit=True
         )
+        return True
     except Exception:
-        pass
+        return False
 
 
-def index_source(source_id):
+def index_source(source_id, allow_indexed_refresh=False, stale_after_seconds=None,
+                 queue_budget=None):
     """Queue every URL a single non-domain source contributes.
 
     Returns the number of URLs considered. Safe to call from a worker thread.
@@ -1836,22 +2799,41 @@ def index_source(source_id):
     priority = source['priority'] or 5
     queued = 0
 
+    def _enqueue(candidate_url, candidate_priority):
+        nonlocal queued
+        if queue_budget is not None and queued >= queue_budget:
+            return
+        if _queue_url(
+            site_id,
+            candidate_url,
+            candidate_priority,
+            allow_indexed_refresh=allow_indexed_refresh,
+            stale_after_seconds=stale_after_seconds
+        ):
+            queued += 1
+
     try:
+        if source_type == WIKI_SOURCE_TYPE:
+            # The Wikipedia importer streams articles straight into ``pages``;
+            # it does not go through the crawl queue (there is no page to fetch).
+            site = get_site_by_id(site_id) or {}
+            budget = queue_budget
+            if budget is None:
+                budget = int(site.get('max_pages') or 500)
+            return run_wiki_import(source, max_pages=budget,
+                                   allow_indexed_refresh=allow_indexed_refresh)
         if source_type == 'url':
-            _queue_url(site_id, normalize_url(url), priority)
-            queued = 1
+            _enqueue(normalize_url(url), priority)
         elif source_type == 'sitemap':
             for u in parse_sitemap(url):
                 n = normalize_url(u)
                 if n:
-                    _queue_url(site_id, n, 3)
-                    queued += 1
+                    _enqueue(n, priority)
         elif source_type in FEED_SOURCE_TYPES:
             for u in parse_feed(url):
                 n = normalize_url(u)
                 if n:
-                    _queue_url(site_id, n, 1)
-                    queued += 1
+                    _enqueue(n, priority)
         execute_db(
             "UPDATE site_sources SET last_checked = strftime('%s','now') WHERE id = ?",
             (source_id,), commit=True
@@ -1874,7 +2856,71 @@ def index_source_async(source_id):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def phase_1_discovery(site_url, max_pages=500):
+def _revive_retryable_errors(site_id, stale_after_seconds=None):
+    """Move retryable/old queue errors back to pending without touching locked work."""
+    rows = execute_db_fetchall(
+        """SELECT id, retry_count, created_at
+           FROM crawl_queue
+           WHERE site_id = ? AND status = 'error' AND locked_by = ''""",
+        (site_id,)
+    )
+    revived = 0
+    now = int(time.time())
+    stale_cutoff = None
+    if stale_after_seconds and stale_after_seconds > 0:
+        stale_cutoff = now - int(stale_after_seconds)
+
+    for row_id, retry_count, created_at in rows:
+        should_revive = retry_count < MAX_RETRIES
+        if not should_revive and stale_cutoff is not None and (created_at or 0) <= stale_cutoff:
+            should_revive = True
+        if not should_revive:
+            continue
+        new_retry = retry_count if retry_count < MAX_RETRIES else 0
+        execute_db(
+            """UPDATE crawl_queue
+               SET status='pending', locked_by='', scheduled_at=0, retry_count=?,
+                   error_reason=''
+               WHERE id = ?""",
+            (new_retry, row_id), commit=True
+        )
+        revived += 1
+    return revived
+
+
+def _queue_stale_pages(site_id, remaining, stale_after_seconds):
+    """Queue already indexed pages only when they are stale."""
+    if remaining <= 0 or stale_after_seconds <= 0:
+        return 0
+    rows = execute_db_fetchall(
+        """SELECT url
+           FROM pages
+           WHERE site_id = ?
+           ORDER BY indexed_at ASC
+           LIMIT ?""",
+        (site_id, remaining * 3)
+    )
+    added = 0
+    for (candidate_url,) in rows:
+        if added >= remaining:
+            break
+        if _queue_url(site_id, candidate_url, DEFAULT_QUEUE_PRIORITY,
+                      allow_indexed_refresh=True,
+                      stale_after_seconds=stale_after_seconds):
+            added += 1
+    return added
+
+
+def site_has_wiki_source(site_id):
+    """True when a site is driven by the Wikipedia importer, not the crawler."""
+    row = execute_db_fetchone(
+        "SELECT 1 FROM site_sources WHERE site_id = ? AND source_type = ? LIMIT 1",
+        (site_id, WIKI_SOURCE_TYPE)
+    )
+    return row is not None
+
+
+def phase_1_discovery(site_url, max_pages=500, allow_indexed_refresh=False):
     site_url = normalize_url(site_url)
     if not site_url:
         return None, 0
@@ -1882,9 +2928,10 @@ def phase_1_discovery(site_url, max_pages=500):
     # Check if site already exists
     domain = get_domain(site_url)
     existing = execute_db_fetchone("SELECT id FROM sites WHERE canonical_url = ?", (domain,))
+    recrawl_mode = bool(existing or allow_indexed_refresh)
+    stale_after_seconds = RECRAWL_STALE_AFTER_SECONDS if recrawl_mode else None
     if existing:
         site_id = existing[0]
-        execute_db("DELETE FROM crawl_queue WHERE site_id = ?", (site_id,), commit=True)
     else:
         site_id = add_site(site_url, max_pages)
         if not site_id:
@@ -1912,34 +2959,71 @@ def phase_1_discovery(site_url, max_pages=500):
         "WHERE site_id = ? AND source_type != 'domain' AND status = 'active'",
         (site_id,)
     )
+    added = 0
+    if recrawl_mode:
+        added += _revive_retryable_errors(site_id, stale_after_seconds=stale_after_seconds)
+
     for (source_id,) in manual_sources:
-        index_source(source_id)
+        remaining = max(max_pages - added, 0)
+        if remaining <= 0:
+            break
+        added += index_source(
+            source_id,
+            allow_indexed_refresh=recrawl_mode,
+            stale_after_seconds=stale_after_seconds,
+            queue_budget=remaining
+        )
+
+    # A Wikipedia site is served entirely by the dump/API importer. Running the
+    # generic sitemap/homepage crawler against wikipedia.org would be pointless
+    # and very expensive, so skip it and let the wiki sources above do the work.
+    if site_has_wiki_source(site_id):
+        execute_db(
+            "UPDATE sites SET last_crawled = strftime('%s','now') WHERE id = ?",
+            (site_id,), commit=True
+        )
+        return site_id, added
 
     discovered = discover_sitemaps_and_feeds(site_url, site_id, max_pages)
     urls_to_add = []
+    seen_hashes = set()
+
+    def _remember(url, priority):
+        n = normalize_url(url)
+        if not n:
+            return
+        h = url_hash(n)
+        if h in seen_hashes:
+            return
+        seen_hashes.add(h)
+        urls_to_add.append((n, priority))
 
     for item in discovered:
         if item['type'] == 'sitemap':
             for u in parse_sitemap(item['url']):
-                n = normalize_url(u)
-                if n:
-                    urls_to_add.append((n, 3))
+                _remember(u, 3)
         elif item['type'] in ('rss', 'atom'):
             for u in parse_feed(item['url']):
-                n = normalize_url(u)
-                if n:
-                    urls_to_add.append((n, 1))
+                _remember(u, 1)
 
     if not urls_to_add:
         for u in crawl_homepage_for_links(site_url, max_pages):
-            urls_to_add.append((u, 5))
+            _remember(u, 5)
 
-    added = 0
     for url, priority in urls_to_add:
-        if len(urls_to_add) > max_pages:
+        if added >= max_pages:
             break
-        _queue_url(site_id, url, priority)
-        added += 1
+        if _queue_url(site_id, url, priority,
+                      allow_indexed_refresh=recrawl_mode,
+                      stale_after_seconds=stale_after_seconds):
+            added += 1
+
+    if recrawl_mode and added < max_pages:
+        added += _queue_stale_pages(
+            site_id,
+            max_pages - added,
+            stale_after_seconds=stale_after_seconds or 0
+        )
 
     execute_db(
         "UPDATE sites SET last_crawled = strftime('%s','now') WHERE id = ?",
@@ -1948,97 +3032,799 @@ def phase_1_discovery(site_url, max_pages=500):
     return site_id, added
 
 
-def extract_page_content(url, site_id):
-    page_data = {
-        'url': url, 'site_id': site_id, 'url_hash': url_hash(url),
-        'title': '', 'og_title': '', 'og_description': '', 'og_image': '',
-        'favicon_url': '', 'body_text': '', 'images': [],
-        'schema_type': '', 'schema_details': {}, 'audio_url': '',
-        'has_audio': 0, 'published_timestamp': 0, 'seo_score': 0.0
-    }
+# ============================================================================
+# CZECH WIKIPEDIA IMPORTER (streaming, memory-bounded)
+# ============================================================================
+#
+# Czech Wikipedia (and every other language) publishes the article wikitext as
+# a ``pages-articles-multistream.xml.bz2`` dump plus an
+# ``*-index.txt.bz2`` index. The importer offers two modes:
+#
+#   * ``api`` (default): walk the MediaWiki action API in batches. No local
+#     storage, works immediately, ideal on a phone.
+#   * ``dump``: point a source at a ``file:///.../cswiki-....xml.bz2`` dump and
+#     stream it with ``xml.etree`` in pull mode. Nothing is loaded into RAM and
+#     only one ``<page>`` is alive at a time. This is the offline-bulk mode.
+#
+# Bulk-importing via the dump is far cheaper than crawling the live site: one
+# deterministic file, no per-article HTTP round-trips and no rate limits.
+
+# A wiki source URL is either a plain language selector (``https://cs.wikipedia.org``)
+# or a ``file://`` path pointing at a locally downloaded dump. Keeping the dump
+# off the repository (see .gitignore) is what makes the mobile workflow viable.
+WIKI_DUMP_SOURCE_PREFIX = 'file://'
+
+
+def wiki_lang_and_importer(source):
+    """Return ``(lang, importer, dump_path)`` for a wiki source row.
+
+    ``dump_path`` is set only when the source points at a local dump file.
+    """
+    raw = (source.get('url') or '').strip()
+    importer = (source.get('importer') or 'dump').strip().lower()
+    if importer not in WIKI_IMPORTERS:
+        importer = 'api'
+    dump_path = ''
+    if raw.startswith(WIKI_DUMP_SOURCE_PREFIX):
+        dump_path = raw[len(WIKI_DUMP_SOURCE_PREFIX):]
+    return lang_from_wiki_url(raw), importer, dump_path
+
+
+def lang_from_wiki_url(url):
+    """Extract the language code from a wiki URL, dump path or bare code."""
+    host = extract_host(url)
+    match = re.match(r'([a-z\-]+)\.(?:m\.)?wikipedia\.org$', host or '')
+    if match:
+        return match.group(1)
+    value = (url or '').strip().lower()
+    if re.fullmatch(r'[a-z]{2,3}(-[a-z]+)?', value):
+        return value
+    # A local dump filename looks like ``cswiki-latest-pages-articles...``.
+    match = re.search(r'/([a-z\-]+)wiki-', value)
+    if match:
+        return match.group(1)
+    return WIKI_DEFAULT_LANG
+
+
+def run_wiki_import(source, max_pages=None, allow_indexed_refresh=False):
+    """Import articles from a Wikipedia source into the local index.
+
+    The import is streaming, idempotent (``store_page`` upserts by URL hash),
+    respects ``max_pages`` and stores its progress on the source row so a
+    pause/resume never restarts from scratch. Returns the number of articles
+    newly or newly-refreshed indexed.
+    """
+    source_id = source['id']
+    site_id = source['site_id']
+    lang, importer, dump_path = wiki_lang_and_importer(source)
+
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
-        if resp.status_code != 200:
-            return None
-        content = resp.content
-        soup = BeautifulSoup(content, 'lxml')
+        state = json.loads(source.get('import_state') or '{}')
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
 
-        def meta(prop):
-            tag = soup.find('meta', attrs={'property': prop}) or soup.find('meta', attrs={'name': prop})
-            return tag.get('content', '') if tag else ''
+    resume_title = state.get('next_title') or ''
+    done = 0
+    last_title = resume_title
+    site = get_site_by_id(site_id) or {}
+    if max_pages is None:
+        max_pages = int(site.get('max_pages') or 500)
+    max_pages = max(1, int(max_pages))
 
-        page_data['og_title'] = meta('og:title')
-        page_data['og_description'] = meta('og:description')
-        page_data['og_image'] = meta('og:image')
-        t = soup.find('title')
-        page_data['title'] = t.text.strip() if t else ''
-        if not page_data['og_title']:
-            page_data['og_title'] = page_data['title']
+    base_imported = int(state.get('imported') or 0)
 
-        fav = soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')
-        page_data['favicon_url'] = urljoin(url, fav['href']) if (fav and fav.get('href')) else urljoin(url, '/favicon.ico')
+    def _progress(next_title):
+        """Persist import progress so a pause/resume continues where it stopped."""
+        state['next_title'] = next_title
+        state['updated_at'] = int(time.time())
+        # Absolute, not incremental: _progress is called repeatedly in one run.
+        state['imported'] = base_imported + done
+        execute_db(
+            "UPDATE site_sources SET import_state = ?, last_checked = strftime('%s','now') "
+            "WHERE id = ?",
+            (json.dumps(state), source_id), commit=True
+        )
+        execute_db(
+            "UPDATE sites SET last_import_at = strftime('%s','now'), import_state = ? WHERE id = ?",
+            (json.dumps(state), site_id), commit=True
+        )
 
-        body_parts = []
-        for sel in ['article', 'main', 'p', 'h1', 'h2', 'h3']:
-            for el in soup.select(sel):
-                text = el.get_text().strip()
-                if text:
-                    body_parts.append(text)
-        page_data['body_text'] = ' '.join(body_parts)[:3500]
+    # Ask the iterator for one extra article: if it yields it we know the dump
+    # has more to give and must record a resume point; if it stops short we have
+    # seen everything and can start over next time.
+    stop = False
+    for article in _iter_wiki_articles(lang, resume_title, max_pages + 1, importer, dump_path):
+        if SHUTDOWN_FLAG or done >= max_pages:
+            stop = True
+            break
+        last_title = article['title']
 
-        page_data['images'] = [
-            {'url': urljoin(url, img['src']), 'alt': img.get('alt', '')}
-            for img in soup.find_all('img', src=True)
-        ]
+        # Filtering: drop redirects and non-encyclopaedic namespaces. Redirects
+        # are still recorded as aliases so a search for the redirect title finds
+        # the target article.
+        if article.get('redirect'):
+            _record_wiki_alias(site_id, lang, article['redirect'], article['title'])
+            continue
+        if article.get('skip'):
+            continue
 
-        audio = soup.find('audio', src=True)
-        if audio:
-            page_data['audio_url'] = urljoin(url, audio['src'])
-            page_data['has_audio'] = 1
-        else:
-            for a in soup.find_all('a', href=True):
-                if any(a['href'].lower().endswith(ext) for ext in ('.mp3', '.m4a', '.wav', '.ogg')):
-                    page_data['audio_url'] = urljoin(url, a['href'])
-                    page_data['has_audio'] = 1
-                    break
+        page = _wiki_article_to_page(article, site_id, lang)
+        if not page:
+            continue
+
+        if not allow_indexed_refresh:
+            existing = execute_db_fetchone(
+                "SELECT 1 FROM pages WHERE url_hash = ?", (page['url_hash'],))
+            if existing:
+                continue
 
         try:
-            data = extruct.extract(content, uniform=True)
-            for schema in data.get('json-ld', []):
-                if isinstance(schema, dict) and '@type' in schema:
-                    page_data['schema_type'] = schema['@type']
-                    page_data['schema_details'] = schema
-                    dp = schema.get('datePublished', '')
-                    if dp:
-                        try:
-                            page_data['published_timestamp'] = int(datetime.fromisoformat(dp[:10]).timestamp())
-                        except Exception:
-                            try:
-                                page_data['published_timestamp'] = int(datetime.strptime(dp[:19], '%Y-%m-%dT%H:%M:%S').timestamp())
-                            except Exception:
-                                pass
-                    break
+            store_page(page)
+            done += 1
+        except Exception as e:
+            log_error(f"Could not store wiki article {article.get('title')}", e)
+        if done and done % 50 == 0:
+            _progress(article['title'])
+
+    # Remember the last title seen so the next run continues (the boundary title
+    # is re-read and skipped as a duplicate, which is harmless and safe).
+    if stop and last_title:
+        _progress(last_title)
+    else:
+        # A full pass over the dump: start again from the top next time.
+        _progress('')
+    return done
+
+
+def _record_wiki_alias(site_id, lang, alias, target):
+    """Store a redirect title as a site alias so it never becomes a dead end."""
+    site = get_site_by_id(site_id)
+    if not site:
+        return
+    try:
+        aliases = json.loads(site.get('aliases') or '[]')
+        if not isinstance(aliases, list):
+            aliases = []
+    except Exception:
+        aliases = []
+    alias_url = f"https://{lang}.wikipedia.org/wiki/{quote(alias.replace(' ', '_'))}"
+    if alias_url not in aliases:
+        aliases.append(alias_url)
+        execute_db("UPDATE sites SET aliases = ? WHERE id = ?",
+                   (json.dumps(aliases), site_id), commit=True)
+
+
+def _wiki_article_to_page(article, site_id, lang):
+    """Convert a parsed wiki article into the shared ``pages`` record shape."""
+    title = article.get('title') or ''
+    if not title:
+        return None
+    slug = quote(title.replace(' ', '_'))
+    url = f"https://{lang}.wikipedia.org/wiki/{slug}"
+    body = article.get('text') or ''
+
+    # MediaWiki entity HTML embeds JSON-LD in a <script> tag, and the importer
+    # sets ``article['schema_extra']``; feed both through the shared extractor
+    # so wiki pages get identical OG/schema handling to crawled pages.
+    html = article.get('html') or ''
+    page = extract_page_content(
+        url, site_id, html=html or f"<html><head><title>{title}</title></head>"
+                                   f"<body>{body}</body></html>",
+        body_text=body, canonical_hint=url
+    )
+    if not page:
+        return None
+
+    # The dump already gives us a clean title; prefer it over the <title> tag.
+    page['title'] = title
+    page['og_title'] = article.get('display_title') or title
+    if article.get('description'):
+        page['og_description'] = article['description']
+    if article.get('timestamp'):
+        page['published_timestamp'] = article['timestamp']
+    page['schema_type'] = page.get('schema_type') or 'Article'
+    page['seo_score'] = calculate_seo_score(page)
+    # The title carries the strongest signal for wiki lookups, so prepend it.
+    body_for_index = f"{title}. {body}"
+    page['body_text'] = re.sub(r'\s+', ' ', body_for_index).strip()[:MAX_BODY_CHARS]
+    page['embedding'] = _embedding_for(page)
+    return page
+
+
+# Non-encyclopaedic namespaces are skipped: talk pages, user pages, categories,
+# templates, files, portals and Wikipedia-internal meta pages.
+_WIKI_SKIP_NAMESPACES = (
+    'talk:', 'user:', 'user talk:', 'wikipedia:', 'wikipedia talk:',
+    'file:', 'file talk:', 'mediawiki:', 'mediawiki talk:', 'template:',
+    'template talk:', 'help:', 'help talk:', 'category:', 'category talk:',
+    'portal:', 'portal talk:', 'draft:', 'draft talk:', 'module:',
+    'module talk:', 'special:', 'book:', 'education program:',
+)
+_WIKI_REDIRECT_RE = re.compile(r'^\s*#(?:REDIRECT|PŘESMĚRUJ|PŘESMĚROVAT)\s*:?\s*\[\[([^\]]+)\]\]',
+                               re.IGNORECASE)
+
+
+def _wiki_text_from_wikitext(wikitext):
+    """Crude but dependency-free wikitext -> plain text conversion.
+
+    The Czech Wikipedia dump stores wikitext; stripping the common markup is
+    enough for full-text search and avoids adding a parser dependency. Template
+    bodies, tables and external links are removed because they add noise.
+    """
+    text = wikitext or ''
+    # Drop comments and templates (handling simple nesting).
+    text = re.sub(r'<!--.*?-->', ' ', text, flags=re.DOTALL)
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r'\{\{[^{}]*\}\}', ' ', text, flags=re.DOTALL)
+    # Drop tables and image/file links.
+    text = re.sub(r'\{\|.*?\|\}', ' ', text, flags=re.DOTALL)
+    text = re.sub(r'\[\[(?:File|Soubor|Image|Kategorie|Category):[^\]]*\]\]', ' ',
+                  text, flags=re.IGNORECASE)
+    # ``[[target|label]]`` -> label, ``[[target]]`` -> target.
+    text = re.sub(r'\[\[(?:[^\]|]*\|)?([^\]]*)\]\]', r'\1', text)
+    text = re.sub(r'\[(?:https?://\S+)\s+([^\]]*)\]', r'\1', text)
+    text = re.sub(r'\[https?://\S+\]', ' ', text)
+    text = re.sub(r"''+", '', text)
+    # Headings, list markers, table cells, tags.
+    text = re.sub(r'^[=]{2,}.*?[=]{2,}\s*$', ' ', text, flags=re.MULTILINE)
+    text = re.sub(r'^[*#:;]+\s*', ' ', text, flags=re.MULTILINE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'&nbsp;', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _iter_wiki_articles(lang, resume_title, max_pages, importer='api', dump_path=''):
+    """Yield article dicts from a Wikipedia source.
+
+    Two importers are supported:
+
+    * ``api`` (default) walks the MediaWiki action API in batches. It needs a
+      network connection but no local storage, so it is the sane default on a
+      phone.
+    * ``dump`` streams a locally downloaded ``pages-articles-multistream`` dump
+      with ``xml.etree`` in pull mode: nothing is ever read into a string and
+      only the current ``<page>`` element is held in memory. This is the
+      preferred mode offline and is dramatically cheaper than crawling the live
+      site one article at a time.
+
+    Both are lazy, so the caller can stop after ``max_pages``.
+    """
+    if importer == 'dump' and dump_path:
+        yield from _iter_wiki_articles_dump(dump_path, resume_title, max_pages)
+        return
+    yield from _iter_wiki_articles_api(lang, resume_title, max_pages)
+
+
+def _xml_child(element, name):
+    """Find a direct child by local name, ignoring the XML namespace.
+
+    ``ElementTree.Element`` is falsy when it has no children, so ``find(a) or
+    find(b)`` silently loses empty elements like ``<text>``. This helper uses
+    explicit ``None`` checks instead.
+    """
+    if element is None:
+        return None
+    child = element.find('{*}' + name)
+    if child is None:
+        child = element.find(name)
+    return child
+
+
+def _wiki_page_from_element(page_el):
+    """Build an article dict from a parsed ``<page>`` XML element."""
+    def _text(name):
+        child = _xml_child(page_el, name)
+        return child.text.strip() if child is not None and child.text else ''
+
+    title = _text('title')
+    ns = _text('ns') or '0'
+    redirect_el = _xml_child(page_el, 'redirect')
+    revision = _xml_child(page_el, 'revision')
+
+    raw_text = ''
+    timestamp = 0
+    if revision is not None:
+        text_el = _xml_child(revision, 'text')
+        if text_el is not None and text_el.text:
+            raw_text = text_el.text
+        ts_el = _xml_child(revision, 'timestamp')
+        if ts_el is not None and ts_el.text:
+            timestamp = _parse_datetime(ts_el.text)
+
+    article = {
+        'title': title,
+        'ns': ns,
+        'redirect': (redirect_el.get('title') if redirect_el is not None else '') or '',
+        'timestamp': timestamp,
+        'html': '',
+    }
+    if article['redirect']:
+        return article
+
+    if str(ns) not in ('', '0') or title.lower().startswith(_WIKI_SKIP_NAMESPACES):
+        article['skip'] = True
+        return article
+
+    match = _WIKI_REDIRECT_RE.match(raw_text)
+    if match:
+        # ``#REDIRECT [[Target]]`` becomes an alias, not a page.
+        article['redirect'] = match.group(1).split('|')[0].strip()
+        return article
+
+    article['skip'] = False
+    article['text'] = _wiki_text_from_wikitext(raw_text)
+    return article
+
+
+def _iter_wiki_articles_dump(dump_path, resume_title, max_pages):
+    """Stream ``<page>`` elements out of a local (b)z2 XML dump.
+
+    Uses ``ElementTree.iterparse`` so the file is consumed incrementally and
+    each element is dropped once handled. ``max_pages`` caps how many articles
+    are even materialised, and ``resume_title`` lets a paused import continue
+    where it stopped instead of rescanning from the beginning.
+    """
+    import bz2
+    try:
+        import xml.etree.ElementTree as ET
+    except Exception:
+        return
+
+    try:
+        if dump_path.endswith('.bz2'):
+            handle = bz2.open(dump_path, 'rb')
+        else:
+            handle = open(dump_path, 'rb')
+    except OSError as e:
+        log_error(f"Could not open wiki dump {dump_path}", e)
+        return
+
+    yielded = 0
+    try:
+        # ``events=('end',)`` plus clearing each element keeps memory flat; the
+        # multistream dump has a single <mediawiki> root, so iterparse is valid.
+        for _event, element in ET.iterparse(handle, events=('end',)):
+            if not element.tag.endswith('page'):
+                continue
+            article = _wiki_page_from_element(element)
+            element.clear()
+            if not article.get('title'):
+                continue
+            # Titles are ordered, so once we reach the resume marker everything
+            # after it is a candidate; earlier titles were already imported.
+            if resume_title and article['title'] < resume_title:
+                continue
+            yield article
+            yielded += 1
+            if yielded >= max_pages:
+                return
+    except Exception as e:
+        log_error(f"Error streaming wiki dump {dump_path}", e)
+    finally:
+        try:
+            handle.close()
         except Exception:
             pass
 
-        # Calculate SEO score
-        page_data['seo_score'] = calculate_seo_score(page_data)
 
-        embed_text = (
-            (page_data['og_title'] or page_data['title']) + ' ' +
-            page_data['og_description'] + ' ' + page_data['body_text']
-        )
-        page_data['embedding'] = generate_embedding(embed_text).tobytes()
+def _wiki_api_url(lang):
+    """Action-API endpoint for a language, honouring a mirror override."""
+    if WIKI_API_BASE:
+        return f"{WIKI_API_BASE}/w/api.php"
+    return f"https://{lang}.wikipedia.org/w/api.php"
+
+
+def _iter_wiki_articles_api(lang, resume_title, max_pages):
+    """Fallback importer that walks the MediaWiki action API."""
+    api = _wiki_api_url(lang)
+    params = {
+        'action': 'query', 'format': 'json', 'list': 'allpages',
+        'aplimit': str(WIKI_API_BATCH), 'apfilterredir': 'nonredirects',
+        'apnamespace': '0',
+    }
+    if resume_title:
+        params['apfrom'] = resume_title
+    yielded = 0
+    while yielded < max_pages:
+        try:
+            resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                             params=params, purpose='wiki-api')
+            if resp.status_code != 200:
+                return
+            payload = resp.json()
+        except Exception as e:
+            log_error(f"Wiki API list failed for {lang}", e)
+            return
+        pages = (payload.get('query', {}) or {}).get('allpages', []) or []
+        if not pages:
+            return
+        titles = [p.get('title') for p in pages if p.get('title')]
+        for article in _fetch_wiki_api_batch(lang, titles):
+            yield article
+            yielded += 1
+            if yielded >= max_pages:
+                return
+        cont = payload.get('continue', {}) or {}
+        if not cont:
+            return
+        params.update(cont)
+
+
+def _fetch_wiki_api_batch(lang, titles):
+    """Fetch plaintext extracts for a batch of titles via the API."""
+    if not titles:
+        return
+    api = _wiki_api_url(lang)
+    params = {
+        'action': 'query', 'format': 'json', 'prop': 'extracts|info',
+        'explaintext': '1', 'exintro': '0', 'inprop': 'url',
+        'redirects': '1', 'titles': '|'.join(titles),
+    }
+    try:
+        resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         params=params, purpose='wiki-api')
+        if resp.status_code != 200:
+            return
+        payload = resp.json()
+    except Exception as e:
+        log_error(f"Wiki API extract failed for {lang}", e)
+        return
+    for page in ((payload.get('query', {}) or {}).get('pages', {}) or {}).values():
+        if 'missing' in page:
+            continue
+        yield {
+            'title': page.get('title') or '',
+            'redirect': '',
+            'timestamp': 0,
+            'text': page.get('extract') or '',
+            'html': '',
+            'skip': False,
+        }
+
+
+def empty_page_data(url, site_id):
+    """A page record with every field the store expects, blanked out."""
+    return {
+        'url': url, 'site_id': site_id,
+        'url_hash': url_hash(canonicalize_url(url) or url),
+        'title': '', 'og_title': '', 'og_description': '', 'og_image': '',
+        'favicon_url': '', 'body_text': '', 'images': [],
+        'schema_type': '', 'schema_details': {}, 'audio_url': '',
+        'has_audio': 0, 'published_timestamp': 0, 'seo_score': 0.0,
+        'embedding': None,
+    }
+
+
+def _decode_response(resp, content=None):
+    """Return bytes plus the best-effort decoded text of an HTTP response."""
+    raw = content if content is not None else resp.content
+    charset = None
+    try:
+        charset = resp.encoding
+    except Exception:
+        charset = None
+    if not charset:
+        try:
+            charset = resp.apparent_encoding
+        except Exception:
+            charset = None
+    for candidate in (charset, 'utf-8', 'windows-1250'):
+        if not candidate:
+            continue
+        try:
+            return raw, raw.decode(candidate, errors='strict')
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw, raw.decode('utf-8', errors='replace')
+
+
+def _body_text_from_soup(soup, limit):
+    """Extract readable body text, preferring article/main over loose tags.
+
+    Selecting ``article``/``main`` first prevents the same paragraph being
+    counted twice (once via ``p`` and once via its container), which both
+    bloats the DB and skews relevance.
+    """
+    parts = []
+    seen = set()
+
+    def add(text):
+        text = re.sub(r'\s+', ' ', text or '').strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        parts.append(text)
+
+    containers = soup.select('article') or soup.select('main') or []
+    if containers:
+        for container in containers:
+            for tag in container.find_all(['h1', 'h2', 'h3', 'p', 'li']):
+                add(tag.get_text())
+    else:
+        # Fall back to the body but drop chrome that is never article content.
+        body = soup.body or soup
+        for tag in body.find_all(['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript']):
+            tag.decompose()
+        for tag in body.find_all(['h1', 'h2', 'h3', 'p', 'li']):
+            add(tag.get_text())
+    return ' '.join(parts)[:limit]
+
+
+def extract_page_content(url, site_id, response=None, body_text=None,
+                         html=None, canonical_hint=None):
+    """Extract searchable metadata and body text from a fetched page.
+
+    ``html``/``body_text``/``canonical_hint`` let callers that already parsed a
+    response (the Wikimedia importer) reuse the same normalisation without a
+    second network fetch.
+    """
+    page_data = empty_page_data(url, site_id)
+    try:
+        if html is None:
+            resp = response
+            if resp is None:
+                resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                                 purpose='page-extract')
+            if resp.status_code != 200:
+                return None
+            raw, text = _decode_response(resp)
+        else:
+            raw = html.encode('utf-8') if isinstance(html, str) else html
+            text = html if isinstance(html, str) else raw.decode('utf-8', errors='replace')
+        # Parse the decoded text, not the raw bytes: lxml ignores the HTTP
+        # charset header and would mangle windows-1250 Czech pages if handed
+        # bytes. Raw bytes are still kept for JSON-LD (extruct sniffs encoding).
+        soup = BeautifulSoup(text, 'lxml')
+
+        def meta(*props):
+            for prop in props:
+                tag = (soup.find('meta', attrs={'property': prop})
+                       or soup.find('meta', attrs={'name': prop}))
+                if tag and tag.get('content'):
+                    return tag['content'].strip()
+            return ''
+
+        # Canonical URL: prefer the page's own <link rel=canonical>, then the
+        # hint the caller supplied, then the URL we fetched.
+        canonical = ''
+        link = soup.find('link', rel=lambda v: v and 'canonical' in str(v).lower())
+        if link and link.get('href'):
+            canonical = canonicalize_url(link['href'], base_url=url)
+        canonical = canonical or canonical_hint or url
+        canonical = canonicalize_url(canonical, base_url=url) or url
+        page_data['url'] = canonical
+        page_data['url_hash'] = url_hash(canonical)
+
+        page_data['og_title'] = meta('og:title', 'twitter:title')
+        page_data['og_description'] = meta('og:description', 'twitter:description',
+                                           'description')
+        raw_image = meta('og:image', 'og:image:url', 'twitter:image')
+        page_data['og_image'] = urljoin(canonical, raw_image) if raw_image else ''
+        page_data['favicon_url'] = urljoin(
+            canonical, (soup.find('link', rel='icon') or
+                        soup.find('link', rel='shortcut icon') or {}).get('href', '')
+        ) if (soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')) \
+            else urljoin(canonical, '/favicon.ico')
+
+        title_tag = soup.find('title')
+        page_data['title'] = title_tag.text.strip() if title_tag else ''
+        if not page_data['og_title']:
+            page_data['og_title'] = page_data['title']
+
+        if body_text is not None:
+            page_data['body_text'] = re.sub(r'\s+', ' ', body_text).strip()[:MAX_BODY_CHARS]
+        else:
+            page_data['body_text'] = _body_text_from_soup(soup, MAX_BODY_CHARS)
+
+        images = []
+        for img in soup.find_all('img', src=True):
+            try:
+                src = urljoin(canonical, img['src'])
+            except Exception:
+                continue
+            images.append({'url': src, 'alt': img.get('alt', '')})
+        page_data['images'] = images
+
+        audio = soup.find('audio', src=True)
+        if audio:
+            page_data['audio_url'] = urljoin(canonical, audio['src'])
+            page_data['has_audio'] = 1
+        else:
+            for a in soup.find_all('a', href=True):
+                if any(a['href'].lower().endswith(ext)
+                       for ext in ('.mp3', '.m4a', '.wav', '.ogg')):
+                    page_data['audio_url'] = urljoin(canonical, a['href'])
+                    page_data['has_audio'] = 1
+                    break
+
+        # --- Schema.org JSON-LD (tolerates @graph, @type arrays, invalid JSON) ---
+        nodes, types = _extract_jsonld(raw, base_url=canonical)
+        article_types = ('article', 'blogposting', 'newsarticle', 'techarticle',
+                         'scholarlyarticle', 'report', 'webpage', 'podcastepisode')
+        chosen_type = ''
+        for pref in ('article', 'blogposting', 'newsarticle', 'techarticle',
+                     'scholarlyarticle', 'podcastepisode'):
+            if pref in types:
+                chosen_type = pref
+                break
+        if not chosen_type and types:
+            chosen_type = sorted(types)[0]
+        page_data['schema_type'] = chosen_type.title() if chosen_type else ''
+
+        # Store the richest matching node as details, plus a reserved _meta bag.
+        details = {}
+        for node in nodes:
+            node_types = set(_schema_types(node))
+            if node_types & set(article_types) or not details:
+                details = {k: v for k, v in node.items() if not k.startswith('@')}
+                details['@type'] = node.get('@type')
+                break
+
+        author = _first_schema_value(nodes, types,
+                                     ('article', 'blogposting', 'newsarticle', 'person'),
+                                     ('author', 'creator'))
+        date_published = _first_schema_value(
+            nodes, types, article_types,
+            ('datePublished', 'dateCreated', 'uploadDate'))
+        breadcrumbs = []
+        for node in nodes:
+            node_types = set(_schema_types(node))
+            # The list may be the node itself (BreadcrumbList) or nested under a
+            # ``breadcrumb`` property of an Article/WebPage node.
+            candidates = []
+            if 'breadcrumblist' in node_types:
+                candidates.append(node)
+            nested = node.get('breadcrumb')
+            if isinstance(nested, dict):
+                candidates.append(nested)
+            for candidate in candidates:
+                for item in candidate.get('itemListElement', []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get('name')
+                    if not name and isinstance(item.get('item'), dict):
+                        name = item['item'].get('name')
+                    if isinstance(name, str) and name.strip() \
+                            and name.strip() not in breadcrumbs:
+                        breadcrumbs.append(name.strip())
+            if breadcrumbs:
+                break
+
+        meta_bag = {
+            'canonical': canonical,
+            'og_type': meta('og:type'),
+            'og_site_name': meta('og:site_name'),
+            'author': author or meta('author', 'article:author'),
+            'breadcrumbs': breadcrumbs,
+            'twitter_card': meta('twitter:card'),
+            'html_lang': (soup.html.get('lang') if soup.html else '') or '',
+        }
+        published = (_parse_datetime(date_published)
+                     or _parse_datetime(meta('article:published_time',
+                                             'datePublished', 'date')))
+        page_data['published_timestamp'] = published
+        meta_bag['published'] = published
+        if details:
+            details['_meta'] = meta_bag
+            page_data['schema_details'] = details
+        else:
+            page_data['schema_details'] = {'_meta': meta_bag}
+
+        page_data['seo_score'] = calculate_seo_score(page_data)
+        page_data['embedding'] = _embedding_for(page_data)
         return page_data
     except Exception as e:
+        log_error(f"Error extracting {url}", e)
         print(f"Error extracting {url}: {e}")
         return None
+
+
+def _embedding_for(page_data):
+    """Bytes for the page embedding, or ``None`` when embeddings are disabled."""
+    if not embeddings_enabled():
+        return None
+    embed_text = ((page_data.get('og_title') or page_data.get('title') or '') + ' ' +
+                  (page_data.get('og_description') or '') + ' ' +
+                  (page_data.get('body_text') or ''))
+    vector = generate_embedding(embed_text)
+    if vector is None:
+        return None
+    return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def store_page(page_data):
+    """Insert or refresh a page row and update the vector index.
+
+    Shared by the crawler and the Wikipedia importer so both go through exactly
+    the same FTS/vector pipeline. Returns the page id.
+    """
+    url = page_data['url']
+    url_h = page_data['url_hash']
+    embedding = page_data.get('embedding')
+    page_id = None
+
+    existing = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
+    if existing:
+        execute_db(
+            """UPDATE pages SET site_id=?, url=?, title=?, og_title=?, og_description=?,
+               og_image=?, favicon_url=?, body_text=?, images=?, schema_type=?
+               , schema_details=?, audio_url=?, has_audio=?, published_timestamp=?,
+               embedding=COALESCE(?, embedding), seo_score=?, indexed_at=strftime('%s','now')
+               WHERE url_hash=?""",
+            (page_data['site_id'], url, page_data['title'], page_data['og_title'],
+             page_data['og_description'], page_data['og_image'], page_data['favicon_url'],
+             page_data['body_text'], json.dumps(page_data['images']),
+             page_data['schema_type'], json.dumps(page_data['schema_details']),
+             page_data['audio_url'], page_data['has_audio'],
+             page_data['published_timestamp'], embedding, page_data['seo_score'], url_h),
+            commit=True
+        )
+        page_id = existing[0]
+    else:
+        execute_db(
+            """INSERT INTO pages (site_id,url,url_hash,title,og_title,og_description,og_image,
+               favicon_url,body_text,images,schema_type,schema_details,audio_url,has_audio,
+               published_timestamp,embedding,seo_score,indexed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
+            (page_data['site_id'], url, url_h, page_data['title'], page_data['og_title'],
+             page_data['og_description'], page_data['og_image'], page_data['favicon_url'],
+             page_data['body_text'], json.dumps(page_data['images']),
+             page_data['schema_type'], json.dumps(page_data['schema_details']),
+             page_data['audio_url'], page_data['has_audio'],
+             page_data['published_timestamp'], embedding, page_data['seo_score']),
+            commit=True
+        )
+        page_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
+
+    if embedding:
+        try:
+            idx = get_hnsw_index()
+            if idx is not None:
+                emb = np.frombuffer(embedding, dtype=np.float32)
+                idx.add_items(emb.reshape(1, -1), np.array([page_id]))
+        except Exception as e:
+            # A full or unavailable index must not fail the whole page.
+            log_error(f"Could not add page {page_id} to vector index", e)
+    return page_id
+
+
+def _set_queue_retry_or_error(queue_id, reason, retryable=True):
+    """Retry pending items with backoff, then mark as permanent error."""
+    reason = (reason or 'Unknown crawler error')[:500]
+    if not retryable:
+        execute_db(
+            "UPDATE crawl_queue SET status='error', locked_by='', error_reason=? WHERE id=?",
+            (reason, queue_id), commit=True
+        )
+        return
+
+    row = execute_db_fetchone("SELECT retry_count FROM crawl_queue WHERE id=?", (queue_id,))
+    current_retry = (row[0] if row else 0)
+    next_retry = current_retry + 1
+    delay = min(300, 5 * (2 ** max(0, next_retry - 1)))
+    scheduled_at = int(time.time()) + delay
+    execute_db(
+        """UPDATE crawl_queue
+           SET retry_count=?, status='pending', locked_by='', scheduled_at=?, error_reason=?
+           WHERE id=?""",
+        (next_retry, scheduled_at, reason, queue_id), commit=True
+    )
+    if next_retry >= MAX_RETRIES:
+        execute_db(
+            "UPDATE crawl_queue SET status='error', scheduled_at=0, error_reason=? WHERE id=?",
+            (reason, queue_id), commit=True
+        )
 
 
 def process_url(queue_id, site_id, url):
     """Fetch and index one URL. Handles 429/403 at HTTP level."""
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENT})
+        resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                         purpose='queue-fetch')
 
         if resp.status_code == 429:
             retry_after = int(resp.headers.get('Retry-After', 60))
@@ -2061,73 +3847,35 @@ def process_url(queue_id, site_id, url):
             return
 
         if resp.status_code != 200:
-            execute_db(
-                "UPDATE crawl_queue SET retry_count=retry_count+1, status='pending', locked_by='' WHERE id=?",
-                (queue_id,), commit=True
+            retryable_http = resp.status_code in RETRYABLE_HTTP_STATUSES
+            _set_queue_retry_or_error(
+                queue_id,
+                f"HTTP {resp.status_code}",
+                retryable=retryable_http
             )
-            retry = execute_db_fetchone("SELECT retry_count FROM crawl_queue WHERE id=?", (queue_id,))
-            if retry and retry[0] >= MAX_RETRIES:
-                execute_db(
-                    "UPDATE crawl_queue SET status='error', error_reason=? WHERE id=?",
-                    (f"HTTP {resp.status_code}", queue_id), commit=True
-                )
             return
 
-        page_data = extract_page_content(url, site_id)
+        page_data = extract_page_content(url, site_id, response=resp)
         if page_data is None:
-            execute_db(
-                "UPDATE crawl_queue SET retry_count=retry_count+1, status='pending', locked_by='' WHERE id=?",
-                (queue_id,), commit=True
-            )
+            _set_queue_retry_or_error(queue_id, "Extraction returned no content", retryable=True)
             return
 
-        # Check if already indexed (race condition)
-        existing = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (page_data['url_hash'],))
-        if existing:
-            execute_db(
-                """UPDATE pages SET title=?,og_title=?,og_description=?,og_image=?,
-                   favicon_url=?,body_text=?,images=?,schema_type=?,schema_details=?,
-                   audio_url=?,has_audio=?,published_timestamp=?,embedding=?,seo_score=?,
-                   indexed_at=strftime('%s','now') WHERE url_hash=?""",
-                (page_data['title'], page_data['og_title'], page_data['og_description'],
-                 page_data['og_image'], page_data['favicon_url'], page_data['body_text'],
-                 json.dumps(page_data['images']), page_data['schema_type'],
-                 json.dumps(page_data['schema_details']), page_data['audio_url'],
-                 page_data['has_audio'], page_data['published_timestamp'],
-                 page_data['embedding'], page_data['seo_score'], page_data['url_hash']),
-                commit=True
-            )
-            page_id = existing[0]
-        else:
-            execute_db(
-                """INSERT INTO pages (site_id,url,url_hash,title,og_title,og_description,og_image,
-                   favicon_url,body_text,images,schema_type,schema_details,audio_url,has_audio,
-                   published_timestamp,embedding,seo_score,indexed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
-                (page_data['site_id'], page_data['url'], page_data['url_hash'],
-                 page_data['title'], page_data['og_title'], page_data['og_description'],
-                 page_data['og_image'], page_data['favicon_url'], page_data['body_text'],
-                 json.dumps(page_data['images']), page_data['schema_type'],
-                 json.dumps(page_data['schema_details']), page_data['audio_url'],
-                 page_data['has_audio'], page_data['published_timestamp'], page_data['embedding'],
-                 page_data['seo_score']),
-                commit=True
-            )
-            page_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
-
-        idx = get_hnsw_index()
-        emb = np.frombuffer(page_data['embedding'], dtype=np.float32)
-        idx.add_items(emb.reshape(1, -1), np.array([page_id]))
+        store_page(page_data)
 
         execute_db(
-            "UPDATE crawl_queue SET status='completed' WHERE id=?",
+            "UPDATE crawl_queue SET status='completed', locked_by='', scheduled_at=0, error_reason='' WHERE id=?",
             (queue_id,), commit=True
         )
 
+    except FetchError as e:
+        log_error(f"Fetch failed for queue item {queue_id} ({url})", e.exc or e)
+        _set_queue_retry_or_error(queue_id, e.message, retryable=e.retryable)
     except Exception as e:
-        execute_db(
-            "UPDATE crawl_queue SET status='error', error_reason=? WHERE id=?",
-            (str(e), queue_id), commit=True
+        log_error(f"Unexpected process_url error for {url}", e)
+        _set_queue_retry_or_error(
+            queue_id,
+            _format_network_error(e),
+            retryable=_is_retryable_network_error(e)
         )
 
 
@@ -2146,7 +3894,8 @@ def _worker_loop(name):
                 """SELECT cq.id, cq.site_id, cq.url, s.crawl_delay 
                    FROM crawl_queue cq
                    JOIN sites s ON cq.site_id = s.id
-                   WHERE cq.status='pending' AND cq.retry_count<? 
+                   WHERE cq.status='pending' AND cq.retry_count<?
+                     AND (cq.scheduled_at=0 OR cq.scheduled_at<=strftime('%s','now'))
                    ORDER BY cq.priority ASC, cq.scheduled_at ASC LIMIT 3""",
                 (MAX_RETRIES,)
             )
@@ -2154,14 +3903,19 @@ def _worker_loop(name):
                 time.sleep(5)
                 continue
             
+            locked_rows = []
             for row_id, site_id, url, site_delay in rows:
                 domain_delay = max(MIN_DELAY, site_delay or MIN_DELAY)
-                execute_db(
-                    "UPDATE crawl_queue SET status='locked',locked_by=?, scheduled_at=0 WHERE id=?",
+                locked = execute_db(
+                    """UPDATE crawl_queue
+                       SET status='locked',locked_by=?, scheduled_at=0
+                       WHERE id=? AND status='pending'""",
                     (name, row_id), commit=True
                 )
+                if locked.rowcount:
+                    locked_rows.append((row_id, site_id, url, site_delay))
             
-            for row_id, site_id, url, site_delay in rows:
+            for row_id, site_id, url, site_delay in locked_rows:
                 if SHUTDOWN_FLAG:
                     break
                 process_url(row_id, site_id, url)
@@ -2172,13 +3926,33 @@ def _worker_loop(name):
             time.sleep(5)
 
 
+def _recover_interrupted_queue():
+    """Return items left ``locked`` by a crash/shutdown to the pending state.
+
+    A hard stop can strand rows in ``locked`` with no owner, so nothing would
+    ever pick them up again. Called once at startup.
+    """
+    try:
+        result = execute_db(
+            """UPDATE crawl_queue SET status='pending', locked_by='', scheduled_at=0
+               WHERE status='locked' AND locked_by != ''""",
+            commit=True
+        )
+        if result.rowcount:
+            print(f"Recovered {result.rowcount} interrupted queue item(s)")
+    except Exception as e:
+        log_error("Could not recover interrupted queue items", e)
+
+
 def start_workers():
     global _worker_threads
-    for name in ('worker_a', 'worker_b'):
+    _recover_interrupted_queue()
+    names = [f"worker_{chr(ord('a') + i)}" for i in range(WORKER_COUNT)]
+    for name in names:
         t = threading.Thread(target=_worker_loop, args=(name,), daemon=True)
         t.start()
         _worker_threads.append(t)
-    print("Workers spusteny (worker_a, worker_b)")
+    print(f"Workers spusteny ({WORKER_COUNT}x: {', '.join(names)})")
 
 
 # ============================================================================
@@ -2238,7 +4012,7 @@ def recrawl_all_sites():
         "SELECT id,canonical_url,max_pages FROM sites WHERE status='active'"
     ):
         try:
-            phase_1_discovery(row[1], row[2])
+            recrawl_site(row[0])
         except Exception as e:
             print(f"Recrawl error {row[1]}: {e}")
 
@@ -2319,17 +4093,22 @@ def _result_url_path(url):
 
 
 def _result_snippet(page, query, length=240):
-    """Body text windowed around the first query match so the hit is visible."""
-    text = (page.get('og_description') or page.get('body_text') or '').strip()
+    """Body text windowed around the first query match so the hit is visible.
+
+    Matching is diacritic-insensitive, so a query typed without háčky still
+    finds the window in text that carries them.
+    """
+    text = (page_string(page, 'og_description') or page_string(page, 'body_text')).strip()
     if not text:
         return ''
     text = re.sub(r'\s+', ' ', text)
 
-    lowered = text.lower()
+    lowered = fold_diacritics(text)
     position = -1
-    for term in (query or '').lower().split():
-        position = lowered.find(term)
-        if position != -1:
+    for term in _fold_tokenize(query or ''):
+        found = lowered.find(term)
+        if found != -1:
+            position = found
             break
 
     if position > length // 2:
@@ -2345,21 +4124,356 @@ def _result_snippet(page, query, length=240):
 
 
 def _highlight_snippet(snippet, query):
-    """Wrap query terms in <mark>. Escaping happens before the markup is added."""
-    escaped = escape(snippet)
-    terms = {t for t in (query or '').lower().split() if len(t) > 2}
+    """Wrap query terms in <mark>. Escaping happens before the markup is added.
+
+    The match is performed on the diacritic-folded text so ``cesky`` highlights
+    ``český``, but the *original* substring is what gets wrapped, so the escape
+    order (escape first, then insert markup) is preserved exactly.
+    """
+    escaped = escape(snippet or '')
+    terms = [t for t in _fold_tokenize(query or '') if len(t) > 2]
     if not terms:
         return escaped
 
-    pattern = '|'.join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
-
-    def replace(match):
-        return f'<mark>{match.group(0)}</mark>'
-
+    # Fold only to locate matches; slice the escaped string with the same
+    # indices so markup never touches the raw input.
+    folded = fold_diacritics(str(escaped))
+    pattern = '|'.join(re.escape(t) for t in sorted(set(terms), key=len, reverse=True))
     try:
-        return re.sub(f'({pattern})', replace, escaped, flags=re.IGNORECASE)
+        matches = list(re.finditer(pattern, folded, flags=re.IGNORECASE))
     except re.error:
         return escaped
+    if not matches:
+        return escaped
+
+    out = []
+    cursor = 0
+    for match in matches:
+        start, end = match.span()
+        if start < cursor:
+            continue
+        out.append(str(escaped)[cursor:start])
+        out.append(f'<mark>{str(escaped)[start:end]}</mark>')
+        cursor = end
+    out.append(str(escaped)[cursor:])
+    return ''.join(out)
+
+
+# --- Rich result cards ------------------------------------------------------
+# prepare_results() classifies each hit and precomputes every display value, so
+# the template only renders. Detection is best-effort: an untyped page always
+# falls back to a plain article card.
+
+_WIKI_HOST_RE = re.compile(
+    r'(?:^|\.)(?:wikipedia|wikimedia|wiktionary|wikinews|wikisource|wikiquote|'
+    r'wikibooks|wikiversity|wikivoyage|mediawiki)\.org$')
+
+CARD_WIKI = 'wiki'
+CARD_PRODUCT = 'product'
+CARD_RECIPE = 'recipe'
+CARD_ORGANIZATION = 'organization'
+CARD_ARTICLE = 'article'
+CARD_TYPES = (CARD_WIKI, CARD_RECIPE, CARD_PRODUCT, CARD_ORGANIZATION, CARD_ARTICLE)
+
+_RECIPE_SCHEMA_TYPES = frozenset(('recipe',))
+_PRODUCT_SCHEMA_TYPES = frozenset((
+    'product', 'individualproduct', 'productmodel', 'productgroup', 'offer',
+    'aggregateoffer', 'vehicle', 'book', 'movie', 'softwareapplication',
+    'mobileapplication', 'videogame', 'course', 'event', 'apispecification',
+))
+_ORGANIZATION_SCHEMA_TYPES = frozenset((
+    'organization', 'localbusiness', 'corporation', 'ngo',
+    'educationalorganization', 'governmentorganization', 'medicalorganization',
+    'sportsorganization', 'restaurant', 'store', 'professionalservice',
+    'hotel', 'dentist', 'physician', 'pharmacy', 'bank', 'library', 'museum',
+    'cafeorcoffeeshop', 'barorpub', 'grocery store', 'grocery', 'autodealer',
+    'travelagency',
+))
+# Schema.org availability values -> (Czech label, in-stock flag).
+_AVAILABILITY_LABELS = {
+    'instock': ('Skladem', True),
+    'limitedavailability': ('Omezená dostupnost', True),
+    'onlineonly': ('Pouze online', True),
+    'instoreonly': ('Pouze na prodejně', True),
+    'preorder': ('Předprodej', True),
+    'presale': ('Předprodej', True),
+    'backorder': ('Na objednávku', False),
+    'outofstock': ('Vyprodáno', False),
+    'soldout': ('Vyprodáno', False),
+    'discontinued': ('Ukončeno', False),
+}
+_CURRENCY_SYMBOLS = {'CZK': 'Kč', 'EUR': '€', 'USD': '$', 'GBP': '£',
+                     'PLN': 'zł', 'HUF': 'Ft', 'CHF': 'CHF'}
+_ISO_DURATION_RE = re.compile(
+    r'^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?'
+    r'(?:(?P<seconds>\d+)S)?)?$', re.IGNORECASE)
+
+
+def _schema_scalar(value):
+    """Best-effort plain string from a JSON-LD scalar or wrapper object."""
+    if value is None or isinstance(value, bool):
+        return ''
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ('name', 'value', '@id', 'url', 'text'):
+            if key in value:
+                found = _schema_scalar(value[key])
+                if found:
+                    return found
+        return ''
+    if isinstance(value, (list, tuple)):
+        for entry in value:
+            found = _schema_scalar(entry)
+            if found:
+                return found
+    return ''
+
+
+def _schema_number(value):
+    """Parse a numeric value, tolerating Czech decimal commas and spaces."""
+    text = _schema_scalar(value)
+    if not text:
+        return None
+    cleaned = text.replace(' ', '').replace('\u00a0', '')
+    if ',' in cleaned and '.' in cleaned:
+        cleaned = cleaned.replace('.', '').replace(',', '.')
+    else:
+        cleaned = cleaned.replace(',', '.')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _nested_scalar(node, path):
+    """Follow ``path`` through dicts/lists and return the first scalar found."""
+    current = node
+    for key in path:
+        if isinstance(current, (list, tuple)):
+            current = next((e for e in current if isinstance(e, dict)), None)
+        if not isinstance(current, dict):
+            return ''
+        current = current.get(key)
+    return _schema_scalar(current)
+
+
+def _format_price(amount, currency):
+    """Czech-friendly price: thousands separated by spaces, comma decimals."""
+    if amount is None:
+        return ''
+    currency = (currency or '').strip().upper()
+    if abs(amount - round(amount)) < 0.005:
+        text = f"{int(round(amount)):,}".replace(',', ' ')
+    else:
+        text = f"{amount:,.2f}".replace(',', ' ').replace('.', ',')
+    symbol = _CURRENCY_SYMBOLS.get(currency)
+    return f"{text} {symbol}" if symbol else f"{text} {currency}".strip()
+
+
+def _format_duration(value):
+    """Render an ISO-8601 duration (PT30M, PT1H20M) as Czech minutes/hours."""
+    text = _schema_scalar(value)
+    if not text:
+        return ''
+    match = _ISO_DURATION_RE.match(text)
+    if match:
+        minutes = (int(match.group('days') or 0) * 1440
+                   + int(match.group('hours') or 0) * 60
+                   + int(match.group('minutes') or 0)
+                   + (1 if int(match.group('seconds') or 0) >= 30 else 0))
+    else:
+        number = _schema_number(text)
+        minutes = int(round(number)) if number is not None else 0
+    if minutes <= 0:
+        return ''
+    hours, rest = divmod(minutes, 60)
+    if hours and rest:
+        return f"{hours} h {rest} min"
+    if hours:
+        return f"{hours} h"
+    return f"{rest} min"
+
+
+def _safe_image_url(value):
+    """Allow only absolute http(s) and root-relative image URLs.
+
+    Keeps ``javascript:``/``data:`` payloads out of ``<img src>`` even though a
+    stored page can carry arbitrary JSON-LD.
+    """
+    text = _schema_scalar(value)
+    if not text:
+        return ''
+    lower = text.lower()
+    if lower.startswith('http://') or lower.startswith('https://'):
+        return text
+    if text.startswith('/') and not text.startswith('//'):
+        return text
+    return ''
+
+
+def _first_image_url(item):
+    """First usable URL from the stored ``images`` list, or ``''``."""
+    images = page_json(item, 'images', [])
+    if isinstance(images, list):
+        for entry in images:
+            if isinstance(entry, dict):
+                safe = _safe_image_url(entry.get('url'))
+                if safe:
+                    return safe
+    return ''
+
+
+def _card_type_for(item, schema_types):
+    """Classify a result into a rich-card type (see ``CARD_TYPES``)."""
+    try:
+        host = (urlparse(page_string(item, 'url')).hostname or '').lower()
+    except Exception:
+        host = ''
+    if _WIKI_HOST_RE.search(host):
+        return CARD_WIKI
+    if schema_types & _RECIPE_SCHEMA_TYPES:
+        return CARD_RECIPE
+    if schema_types & _PRODUCT_SCHEMA_TYPES:
+        return CARD_PRODUCT
+    if schema_types & _ORGANIZATION_SCHEMA_TYPES:
+        return CARD_ORGANIZATION
+    return CARD_ARTICLE
+
+
+def _rich_card_fields(item):
+    """Derive card type and structured display fields for a result.
+
+    Every value is a plain pre-formatted string (already safe for autoescape),
+    so the template renders without branching on raw JSON-LD.
+    """
+    details = page_json(item, 'schema_details', {})
+    if not isinstance(details, dict):
+        details = {}
+    schema_types = set(_schema_types(details))
+    declared = (page_string(item, 'schema_type') or '').lower()
+    if declared:
+        schema_types.add(declared)
+
+    price_amount = None
+    for path in (('offers', 'price'), ('offers', 'lowPrice'), ('offers', 'highPrice'),
+                 ('price',), ('priceSpecification', 'price')):
+        price_amount = _schema_number(_nested_scalar(details, path))
+        if price_amount is not None:
+            break
+
+    card_type = _card_type_for(item, schema_types)
+    if card_type == CARD_ARTICLE and price_amount is not None:
+        card_type = CARD_PRODUCT
+
+    fields = {'card_type': card_type}
+    badge = page_string(item, 'schema_type')
+    if card_type == CARD_WIKI:
+        fields['card_badge'] = 'Wikipedie'
+    else:
+        fields['card_badge'] = badge or {
+            CARD_PRODUCT: 'Produkt', CARD_RECIPE: 'Recept',
+            CARD_ORGANIZATION: 'Organizace', CARD_ARTICLE: 'Článek',
+        }.get(card_type, 'Článek')
+
+    meta = details.get('_meta') if isinstance(details.get('_meta'), dict) else {}
+    breadcrumbs = meta.get('breadcrumbs')
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = []
+    fields['breadcrumbs'] = [str(b) for b in breadcrumbs if str(b).strip()][:6]
+    fields['meta_author'] = _schema_scalar(meta.get('author'))
+
+    rows = []
+
+    # Rating is shared by products and recipes.
+    rating_value = _schema_number(
+        _nested_scalar(details, ('aggregateRating', 'ratingValue')))
+    rating_count = _nested_scalar(
+        details, ('aggregateRating', 'ratingCount'))
+    rating_count = rating_count or _nested_scalar(
+        details, ('aggregateRating', 'reviewCount'))
+    if rating_value is not None and rating_value > 0:
+        best = _schema_number(
+            _nested_scalar(details, ('aggregateRating', 'bestRating'))) or 5.0
+        best = best if best > 0 else 5.0
+        fields['rating_value'] = f"{rating_value:.1f}".rstrip('0').rstrip('.')
+        fields['rating_pct'] = max(0, min(100, int(round(rating_value / best * 100))))
+        fields['rating_count'] = _schema_scalar(rating_count)
+
+    if card_type == CARD_PRODUCT:
+        currency = (_nested_scalar(details, ('offers', 'priceCurrency'))
+                    or _nested_scalar(details, ('priceCurrency',)))
+        fields['price_display'] = _format_price(price_amount, currency)
+        availability = _nested_scalar(details, ('offers', 'availability'))
+        if availability:
+            key = availability.rstrip('/').rsplit('/', 1)[-1].lower()
+            label, ok = _AVAILABILITY_LABELS.get(key, (availability, True))
+            fields['availability'] = label
+            fields['availability_ok'] = ok
+        brand = _nested_scalar(details, ('brand',)) or _nested_scalar(details, ('brand', 'name'))
+        sku = _nested_scalar(details, ('sku',)) or _nested_scalar(details, ('mpn',))
+        if brand:
+            rows.append(('Značka', brand))
+        if sku:
+            rows.append(('Kód', sku))
+
+    elif card_type == CARD_RECIPE:
+        time_display = _format_duration(_nested_scalar(details, ('totalTime',)))
+        if not time_display:
+            time_display = _format_duration(_nested_scalar(details, ('cookTime',)))
+        if not time_display:
+            time_display = _format_duration(_nested_scalar(details, ('prepTime',)))
+        fields['time_display'] = time_display
+        calories = _nested_scalar(details, ('nutrition', 'calories'))
+        if calories:
+            fields['calories'] = f"{calories} kcal" if calories.isdigit() else calories
+        yield_value = _nested_scalar(details, ('recipeYield',))
+        category = _nested_scalar(details, ('recipeCategory',))
+        cuisine = _nested_scalar(details, ('recipeCuisine',))
+        if yield_value:
+            rows.append(('Porce', yield_value))
+        if category:
+            rows.append(('Kategorie', category))
+        if cuisine:
+            rows.append(('Kuchyně', cuisine))
+
+    elif card_type == CARD_ORGANIZATION:
+        address = _nested_scalar(details, ('address', 'streetAddress'))
+        locality = _nested_scalar(details, ('address', 'addressLocality'))
+        if not address:
+            address = _nested_scalar(details, ('address',))
+        fields['address'] = ', '.join(p for p in (address, locality) if p)
+        fields['phone'] = _nested_scalar(details, ('telephone',))
+        logo = (_safe_image_url(_nested_scalar(details, ('logo',)))
+                or _safe_image_url(_nested_scalar(details, ('image',))))
+        if logo:
+            fields['logo'] = logo
+        hours = _nested_scalar(details, ('openingHours',))
+        if hours:
+            rows.append(('Otevírací doba', hours))
+
+    elif card_type == CARD_WIKI:
+        lang = ''
+        try:
+            host = (urlparse(page_string(item, 'url')).hostname or '').lower()
+            lang = host.split('.')[0] if host.endswith('.wikipedia.org') else ''
+        except Exception:
+            lang = ''
+        if lang:
+            rows.append(('Jazyk', f"Wikipedie ({lang})"))
+        if fields['breadcrumbs']:
+            rows.append(('Kategorie', ' › '.join(fields['breadcrumbs'])))
+        rows.append(('Zdroj', 'Wikimedia'))
+
+    if card_type != CARD_WIKI and fields['breadcrumbs']:
+        rows.append(('Zařazení', ' › '.join(fields['breadcrumbs'])))
+    if fields['meta_author'] and card_type != CARD_WIKI:
+        rows.append(('Autor', fields['meta_author']))
+
+    fields['rich_metadata'] = [{'label': label, 'value': value} for label, value in rows]
+    return fields
 
 
 def prepare_results(results, query):
@@ -2367,13 +4481,23 @@ def prepare_results(results, query):
     prepared = []
     for page in results:
         item = dict(page)
-        item['domain'] = _result_domain(item.get('url', ''))
-        item['display_url_path'] = _result_url_path(item.get('url', ''))
+        item['domain'] = _result_domain(page_string(item, 'url'))
+        item['display_url_path'] = _result_url_path(page_string(item, 'url'))
         item['snippet_html'] = _highlight_snippet(_result_snippet(item, query), query)
         item['relevance_pct'] = int(round(float(item.get('relevance') or 0)))
-        item['display_title'] = item.get('og_title') or item.get('title') or item.get('url', '')
-        item['display_date'] = item.get('published_date') or ''
-        item['thumb'] = item.get('og_image') or item.get('favicon_url') or ''
+        item['display_title'] = (page_string(item, 'og_title') or page_string(item, 'title')
+                                 or page_string(item, 'url'))
+        item['display_date'] = page_string(item, 'published_date') or (
+            format_timestamp(item.get('published_timestamp'))
+            if item.get('published_timestamp') else '')
+
+        item.update(_rich_card_fields(item))
+
+        thumb = (_safe_image_url(page_string(item, 'og_image'))
+                 or _safe_image_url(page_string(item, 'favicon_url')))
+        if not thumb and item['card_type'] in (CARD_PRODUCT, CARD_RECIPE, CARD_ORGANIZATION):
+            thumb = _first_image_url(item)
+        item['thumb'] = item.get('logo') or thumb
         prepared.append(item)
     return prepared
 
@@ -2459,9 +4583,16 @@ def _source_from_form(payload, require_site=True):
     if source_type not in VALID_SOURCE_TYPES:
         return None, 'Neplatný typ zdroje'
     url = (payload.get('url') or '').strip()
-    ok, message = validate_url(url)
-    if not ok:
-        return None, message
+    importer = (payload.get('importer') or '').strip().lower()
+    if source_type == WIKI_SOURCE_TYPE:
+        site_url, importer, _lang = normalize_wiki_source(url, importer or None)
+        if not site_url:
+            return None, 'Neplatný odkaz na Wikipedii'
+        url = site_url
+    else:
+        ok, message = validate_url(url)
+        if not ok:
+            return None, message
     ok, message, priority = validate_priority(payload.get('priority', 5))
     if not ok:
         return None, message
@@ -2471,6 +4602,8 @@ def _source_from_form(payload, require_site=True):
         'priority': priority,
         'notes': (payload.get('notes') or '').strip(),
     }
+    if source_type == WIKI_SOURCE_TYPE:
+        data['importer'] = importer or 'api'
     if require_site:
         site_id = payload.get('site_id')
         if not site_id:
@@ -2619,9 +4752,10 @@ def admin_site_edit(site_id):
 
 @app.route('/admin/sites/<int:site_id>/recrawl')
 def admin_site_recrawl(site_id):
-    ok, message = recrawl_site(site_id)
+    ok, message = recrawl_async(site_id)
     key = 'success' if ok else 'error'
-    return redirect(f'/admin/sites/{site_id}?{key}={message}')
+    target = f'/admin/sites/{site_id}' if get_site_by_id(site_id) else '/admin/sites'
+    return redirect(f'{target}?{key}={message}')
 
 
 @app.route('/admin/sites/<int:site_id>/delete')
@@ -2787,7 +4921,7 @@ def api_source_get(source_id):
 @app.route('/admin/api/sources/<int:source_id>', methods=['PUT', 'PATCH'])
 def api_source_update(source_id):
     payload = request.get_json(silent=True) or request.form.to_dict()
-    allowed = ('url', 'source_type', 'priority', 'notes', 'status', 'max_pages')
+    allowed = ('url', 'source_type', 'priority', 'notes', 'status', 'max_pages', 'importer')
     kwargs = {k: payload[k] for k in allowed if k in payload and payload[k] != ''}
     ok, message = update_source(source_id, **kwargs)
     if not ok:
@@ -2902,7 +5036,66 @@ def admin_update_status():
 # MAIN
 # ============================================================================
 
+def _cli_import_wiki(args):
+    """Run a Wikipedia import from the command line, without starting the server.
+
+    Lets a Termux user bulk-import a downloaded Czech dump (or hit the API)
+    in a one-off process that exits when done, instead of driving it through
+    the always-on Flask app.
+    """
+    get_db()
+    source = None
+    if args.source_id:
+        source = get_source_by_id(args.source_id)
+        if not source:
+            print(f"Zdroj {args.source_id} nenalezen")
+            return 1
+    else:
+        if not args.import_wiki:
+            print("Zadejte --import-wiki <cs|file:///cesta/dump.bz2> nebo --source-id N")
+            return 1
+        source_id, error = add_source(
+            0, args.import_wiki, WIKI_SOURCE_TYPE, importer=args.importer or None)
+        if source_id is None:
+            print(f"Zdroj nelze vytvořit: {error}")
+            return 1
+        source = get_source_by_id(source_id)
+
+    total = 0
+    while True:
+        imported = run_wiki_import(source, max_pages=args.max_pages,
+                                   allow_indexed_refresh=args.refresh)
+        total += imported
+        print(f"Importováno {imported} článků (celkem {total})")
+        if imported == 0 or not args.all:
+            break
+        source = get_source_by_id(source['id'])
+    print(f"Hotovo. Celkem importováno: {total}")
+    return 0
+
+
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Mini Search – hybridní vyhledávač')
+    parser.add_argument('--import-wiki', metavar='CILE',
+                        help='Importovat Wikipedii: jazykový kód "cs", '
+                             'nebo "file:///cesta/cswiki-….xml.bz2" pro lokální dump')
+    parser.add_argument('--source-id', type=int,
+                        help='Pokračovat v importu existujícího wiki zdroje')
+    parser.add_argument('--importer', choices=WIKI_IMPORTERS,
+                        help='Použitý importér (api/dump)')
+    parser.add_argument('--max-pages', type=int, default=None,
+                        help='Kolik článků na jeden běh (výchozí dle domény)')
+    parser.add_argument('--all', action='store_true',
+                        help='Opakovat import, dokud dump nedá žádné nové články')
+    parser.add_argument('--refresh', action='store_true',
+                        help='Znovu indexovat již uložené články')
+    args = parser.parse_args()
+
+    if args.import_wiki or args.source_id:
+        raise SystemExit(_cli_import_wiki(args))
+
     print('=' * 70)
     print('Mini Search v7.4 - Hybrid Search Engine')
     print('=' * 70)
@@ -2910,11 +5103,17 @@ if __name__ == '__main__':
     get_db()
     print('Database initialized')
 
-    get_hnsw_index()
-    print('hnswlib index initialized')
+    if embeddings_enabled():
+        get_hnsw_index()
+        print('hnswlib index initialized')
 
-    get_model()
-    print('Model loaded')
+    # Loading the sentence-transformer model is the single largest RAM cost; in
+    # low-memory mode we never touch it and search stays on FTS5.
+    if embeddings_enabled():
+        get_model()
+        print('Model loaded')
+    else:
+        print('Embeddings disabled (low-memory mode) - FTS5 fallback active')
 
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(check_feeds,      IntervalTrigger(hours=1),  id='check_feeds')

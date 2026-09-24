@@ -31,6 +31,18 @@ sleep 1
 # Vytvoreni adresaru pro logy
 mkdir -p logs
 
+# Volitelna konfigurace z .env (napr. MINISEARCH_PROFILE=lowmem pro Termux).
+if [ -f ".env" ]; then
+    echo "[*] Nacitam konfiguraci z .env..."
+    set -a
+    . ./.env
+    set +a
+fi
+
+if [ "${MINISEARCH_PROFILE:-}" = "lowmem" ]; then
+    echo "[*] Nizkopametovy rezim (lowmem) - embeddings vypnuty, FTS5 fallback"
+fi
+
 # Aktivace virtualniho prostredi a spusteni
 if [ -d "venv" ]; then
     echo "[*] Aktivuji virtualni prostredi..."

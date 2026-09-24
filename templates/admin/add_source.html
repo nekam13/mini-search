@@ -30,6 +30,7 @@
                     <option value="rss">RSS feed</option>
                     <option value="atom">Atom feed</option>
                     <option value="feed">Feed (obecný)</option>
+                    <option value="wiki">Wikipedie (dump/API)</option>
                 </select>
                 <div class="hint">Typ se předvyplní automaticky podle zadané adresy.</div>
             </div>
@@ -39,7 +40,27 @@
             <label for="url">URL zdroje</label>
             <input type="text" id="url" name="url" required
                    placeholder="https://example.com/sitemap.xml">
-            <div class="hint">Povinné. Přijímá doménu i plnou adresu včetně https.</div>
+            <div class="hint">
+                Povinné. Přijímá doménu i plnou adresu včetně https.
+                Pro Wikipedii stačí jazykový kód (např. <code>cs</code>), adresa
+                <code>cs.wikipedia.org</code>, nebo <code>file:///cesta/cswiki-….xml.bz2</code>
+                pro lokálně stažený dump.
+            </div>
+        </div>
+
+        <div class="form-row" id="wiki-options" style="display:none">
+            <div class="form-group">
+                <label for="importer">Importér Wikipedie</label>
+                <select id="importer" name="importer">
+                    <option value="api">API (bez lokálního úložiště)</option>
+                    <option value="dump">Dump (streamovaný lokální soubor)</option>
+                </select>
+                <div class="hint">
+                    API stahuje články po dávkách a nic neukládá na disk.
+                    Dump streamuje stažený <code>pages-articles</code> soubor
+                    a je vhodný offline.
+                </div>
+            </div>
         </div>
 
         <div class="form-row">

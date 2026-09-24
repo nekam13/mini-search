@@ -7,4 +7,7 @@ feedparser>=6.0.0
 extruct>=0.15.0
 numpy>=1.24.0
 hnswlib>=0.7.0
+
+# Optional: vector search. Without it Mini Search falls back to FTS5 (see
+# requirements-mobile.txt for the Termux/Android profile, which skips these).
 sentence-transformers>=2.2.0

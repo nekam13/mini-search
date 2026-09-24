@@ -1,0 +1,15 @@
+# Mini Search – Termux/Android (lowmem) profile.
+#
+# Same runtime as requirements.txt, minus the heavy ML stack: no torch and no
+# sentence-transformers, so no PyTorch wheel (~200 MB+ RAM/disk) is needed.
+# Search then runs on FTS5 full-text only, which is what low-memory mode uses
+# anyway (MINISEARCH_PROFILE=lowmem).
+#
+# Install with:  pip install -r requirements-mobile.txt
+flask>=3.0.0
+apscheduler>=3.10.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+feedparser>=6.0.0
+extruct>=0.15.0
