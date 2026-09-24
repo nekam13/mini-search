@@ -57,33 +57,87 @@
 <div id="resultList" class="result-list">
     {% for r in results %}
     <article class="result-item"
+             data-card="{{ r.card_type }}"
              data-title="{{ r.display_title|lower }}"
              data-date="{{ r.published_timestamp or 0 }}">
-        {% if r.thumb %}
-        <img src="{{ r.thumb }}" class="result-thumb" alt="" loading="lazy">
-        {% endif %}
-        <div class="result-content">
-            <div class="result-title">
-                {% if r.schema_type %}<span class="badge badge-type">{{ r.schema_type }}</span>{% endif %}
-                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">{{ r.display_title }}</a>
-            </div>
-            <div class="result-url"><span class="domain">{{ r.domain }}</span>{{ r.display_url_path }}</div>
-            <div class="result-snippet">{{ r.snippet_html|safe }}</div>
-            <div class="result-meta">
-                {% if r.display_date %}<span class="meta-item">{{ r.display_date }}</span>{% endif %}
-                {% if r.has_audio == 1 %}<span class="meta-item">Audio</span>{% endif %}
-                {% if r.relevance %}
-                <span class="relevance">
-                    <span class="relevance-track"><span class="relevance-fill" style="width: {{ [r.relevance_pct, 100]|min }}%"></span></span>
-                    <span class="relevance-value">{{ r.relevance_pct }}%</span>
-                </span>
-                {% endif %}
-            </div>
-            {% if r.audio_url and r.has_audio == 1 %}
-            <div class="result-audio">
-                <audio controls preload="none"><source src="{{ r.audio_url }}" type="audio/mpeg"></audio>
+        <div class="card-rich card-{{ r.card_type }}">
+        <div class="rich-head">
+            <span class="badge badge-{{ r.card_type }}">{{ r.card_badge }}</span>
+            {% if r.card_type == 'wiki' and r.rich_metadata %}
+            <span class="badge badge-accent">Encyklopedie</span>
+            {% endif %}
+        </div>
+        <div class="card-media-layout">
+            {% if r.thumb %}
+            <div class="card-thumbnail">
+                <img src="{{ r.thumb }}" class="result-thumb" alt="" loading="lazy">
             </div>
             {% endif %}
+            <div class="result-content">
+                <div class="result-title">
+                    <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">{{ r.display_title }}</a>
+                </div>
+                <div class="result-url"><span class="domain">{{ r.domain }}</span>{{ r.display_url_path }}</div>
+
+                {% if r.price_display or r.availability or r.time_display or r.calories %}
+                <div class="rich-specs">
+                    {% if r.price_display %}<span class="price-tag">{{ r.price_display }}</span>{% endif %}
+                    {% if r.availability %}
+                    <span class="availability{% if r.availability_ok %} availability-ok{% else %} availability-no{% endif %}">{{ r.availability }}</span>
+                    {% endif %}
+                    {% if r.time_display %}<span class="rich-chip">⏱ {{ r.time_display }}</span>{% endif %}
+                    {% if r.calories %}<span class="rich-chip">{{ r.calories }}</span>{% endif %}
+                </div>
+                {% endif %}
+
+                {% if r.rating_value %}
+                <div class="rating-stars" title="Hodnocení {{ r.rating_value }} z 5">
+                    <span class="rating-track" aria-hidden="true">
+                        <span class="rating-empty">★★★★★</span>
+                        <span class="rating-fill" style="width: {{ r.rating_pct }}%">★★★★★</span>
+                    </span>
+                    <span class="rating-text">{{ r.rating_value }}{% if r.rating_count %} ({{ r.rating_count }}){% endif %}</span>
+                </div>
+                {% endif %}
+
+                <div class="result-snippet">{{ r.snippet_html|safe }}</div>
+
+                {% if r.address or r.phone %}
+                <div class="rich-specs">
+                    {% if r.address %}<span class="rich-chip">📍 {{ r.address }}</span>{% endif %}
+                    {% if r.phone %}<span class="rich-chip">☎ {{ r.phone }}</span>{% endif %}
+                </div>
+                {% endif %}
+
+                {% if r.rich_metadata %}
+                <dl class="rich-metadata">
+                    {% for pair in r.rich_metadata %}
+                    <div class="rich-metadata-row">
+                        <dt>{{ pair.label }}</dt>
+                        <dd>{{ pair.value }}</dd>
+                    </div>
+                    {% endfor %}
+                </dl>
+                {% endif %}
+
+                <div class="result-meta">
+                    {% if r.display_date %}<span class="meta-item">{{ r.display_date }}</span>{% endif %}
+                    {% if r.meta_author %}<span class="meta-item">{{ r.meta_author }}</span>{% endif %}
+                    {% if r.has_audio == 1 %}<span class="meta-item">Audio</span>{% endif %}
+                    {% if r.relevance %}
+                    <span class="relevance">
+                        <span class="relevance-track"><span class="relevance-fill" style="width: {{ [r.relevance_pct, 100]|min }}%"></span></span>
+                        <span class="relevance-value">{{ r.relevance_pct }}%</span>
+                    </span>
+                    {% endif %}
+                </div>
+                {% if r.audio_url and r.has_audio == 1 %}
+                <div class="result-audio">
+                    <audio controls preload="none"><source src="{{ r.audio_url }}" type="audio/mpeg"></audio>
+                </div>
+                {% endif %}
+            </div>
+        </div>
         </div>
     </article>
     {% endfor %}

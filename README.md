@@ -132,7 +132,8 @@ Prvky rozhraní:
 | Našeptávač | Napovídá titulky z indexu, ovládá se šipkami, Enter potvrdí, Esc zavře |
 | Filtry | Vše, Články, Podcasty, Audio, Ceny (tlačítka ve stylu chipů) |
 | Řazení | Podle relevance, názvu nebo data (klientsky, bez přenačtení) |
-| Karty výsledků | Doménový breadcrumb, zvýrazněné shody, indikátor relevance, audio přehrávač |
+| Karty výsledků | Strukturované „Rich Results" karty podle typu obsahu (viz níže) |
+| Rich Results | Wikipedie, produkt, recept, organizace a článek – každý s vlastními informacemi |
 | Stránkování | 25 výsledků na stránku, parametr `page` (nad 500 výsledků se nepokračuje) |
 | Prázdné stavy | Vysvětlení a přímý odkaz do správy zdrojů, když se nic nenajde |
 
@@ -145,6 +146,32 @@ prvky se při najetí nadzvednou a při stisku „zapadnou".
 Šablona dostává už připravená data (`prepare_results()`), takže v HTML nezůstává
 žádná logika. Zvýrazňování hledaných výrazů escapuje text ještě před vložením
 značek `<mark>`, takže uložené HTML v titulech se nevykreslí.
+
+### Rich Results karty
+
+Každý výsledek dostane v `prepare_results()` klíč `card_type`, podle kterého se
+vybere vizuální karta:
+
+| `card_type` | Kdy | Co se zobrazí |
+|---|---|---|
+| `wiki` | cíl je `*.wikipedia.org` / Wikimedia | badge „Wikipedie", jazyk, kategorie z breadcrumbs, zdroj Wikimedia, náhledový obrázek |
+| `product` | Schema.org `Product` (nebo jakákoli stránka s cenou) | náhled, cena (`price-tag`), dostupnost (`Skladem`/`Vyprodáno`), hodnocení hvězdičkami, značka, kód |
+| `recipe` | Schema.org `Recipe` | obrázek jídla, doba přípravy, kalorie, hodnocení, porce, kuchyně |
+| `organization` | Schema.org `Organization`/`LocalBusiness` | logo, adresa, telefon, otevírací doba |
+| `article` | výchozí (cokoli jiného) | titulek, breadcrumb, zvýrazněný snippet, autor a datum |
+
+Typ se určuje z hostitele URL a ze strukturovaných dat (`schema_type` +
+`schema_details`, kde je i `_meta` s breadcrumbs a autorem). Veškeré hodnoty se
+předpočítávají do hotových řetězců (cena s `Kč`, doba jako `1 h 20 min`), takže
+šablona jen vykresluje. Obrázky se přijímají jen jako `http(s)` nebo kořenově
+relativní URL – `javascript:` i `data:` se zahazují, aby se do `<img src>`
+nedostal skript. Vše ostatní prochází autoescapingem.
+
+Styly karet jsou v `static/css/clay.css` (třídy `.card-rich`, `.card-wiki`,
+`.card-product`, `.card-recipe`, `.card-organization`, `.badge-wiki`,
+`.price-tag`, `.rating-stars`, `.rich-metadata`, `.card-thumbnail`,
+`.card-media-layout`) a používají výhradně existující tokeny design systému.
+Na malých obrazovkách se náhled přesune nad text a zmenší se.
 
 ## Admin panel (Clay design)
 
@@ -252,6 +279,7 @@ python3 tests/test_local_sites.py            # lokální sítě: detekce, robots
 python3 tests/test_local_indexing_smoke.py   # živý lokální HTTP server: crawl a indexace
 python3 tests/test_wiki_import.py            # wiki importér: dump, API, idempotence, resume
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
+python3 tests/test_rich_cards.py             # Rich Results karty, XSS, auto-migrace a úklid
 ```
 
 Všechny testy jsou deterministické a běží bez živého internetu – síťová část
@@ -365,7 +393,9 @@ výchozí hodnoty najednou. Konfigurace se čte z prostředí:
 |---|---|---|
 | `MINISEARCH_PROFILE` | – | `lowmem` = úsporný režim pro mobil |
 | `MINISEARCH_WORKERS` | 1 (lowmem) / 2 | Počet crawlovacích vláken |
-| `MINISEARCH_EMBEDDINGS` | 1 (0 v lowmem) | Zapnout vektorové embeddingy |
+| `MINISEARCH_EMBEDDINGS` | `auto` (lowmem) / `1` | `auto` = vektory jen při dostatku RAM a baterie; `1`/`0` = natvrdo |
+| `MINISEARCH_MIN_FREE_MB` | 300 | Pod touto volnou RAM (MB) se `auto` vektory vypne |
+| `MINISEARCH_MIN_BATTERY_PCT` | 15 | Pod tímto % baterie (bez nabíjení) se `auto` vektory vypne |
 | `MINISEARCH_REQUEST_TIMEOUT` | 30 | HTTP timeout (s) |
 | `MINISEARCH_MAX_RETRIES` | 3 | Počet pokusů u síťových chyb |
 | `MINISEARCH_RETRY_MAX_DELAY` | 5 | Strop exponenciálního backoffu (s) |
@@ -382,6 +412,16 @@ export MINISEARCH_WORKERS=1
 
 Po přerušení (kill/crash) se při startu řádky fronty, které zůstaly v `locked`,
 vrátí zpět do `pending`, takže se zpracování samo obnoví.
+
+### Vektorové vyhledávání na mobilu (`auto`)
+
+V lowmem režimu je výchozí `MINISEARCH_EMBEDDINGS=auto`: vektorové hledání se
+zapne, jen když je na zařízení dost prostředků. Aplikace zjišťuje volnou RAM
+(`/proc/meminfo`, jinak `os.sysconf`) a stav baterie (`/sys/class/power_supply`);
+když je volné paměti méně než `MINISEARCH_MIN_FREE_MB`, nebo je baterie pod
+`MINISEARCH_MIN_BATTERY_PCT` a telefon se nenabíjí, vektory se přeskočí a hledání
+plynule přejde na FTS5. Na zařízeních, kde se stav nedá přečíst, se nic neblokuje.
+Chování lze vynutit pomocí `MINISEARCH_EMBEDDINGS=1` nebo `0`.
 
 ## Zpracování stránek a crawler
 
@@ -453,6 +493,15 @@ Pro bezpečnou aktualizaci existující instalace:
 - Nainstaluje nové závislosti
 - Provede migraci databáze (nedestruktivní)
 - Uloží aktuální commit SHA
+
+### Automatická migrace a úklid
+
+Migrace probíhá sama při každém startu (`get_db()`), takže se nic nemusí spouštět
+ručně a stará databáze se upgraduje na místě. Aplikace nejdřív ověří, že výsledná
+tabulka má všechny sloupce a že nový typ `wiki` projde CHECK constraintem; teprve
+potom smaže případnou zálohu z přerušené migrace (`site_sources_old`). Pokud by
+nová tabulka obsahovala méně řádků než záloha, záloha se **zachová** k ruční
+kontrole. Díky tomu je aktualizace bezpečná i při výpadku uprostřed přestavby.
 
 ### Automatické kontrolování aktualizací
 

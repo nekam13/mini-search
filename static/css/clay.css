@@ -243,3 +243,111 @@ label.checkbox-label {
     font-weight: 600; font-size: 0.9rem; cursor: pointer;
 }
 label.checkbox-label input[type="checkbox"] { width: auto; box-shadow: none; }
+
+/* ---------------- Rich result cards ----------------
+   Google "Rich Results"-style structured cards. The card type (wiki / product /
+   recipe / organization / article) is decided in prepare_results(); the classes
+   here only style it. Colours come from the shared clay tokens above so the
+   whole page keeps one visual language. */
+/* The rich wrapper fills the flex item and stacks badge / media / meta. */
+.card-rich {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+}
+/* A type-coloured top rule marks the card kind on top of the shared card. */
+.card-rich.card-wiki { border-top: 3px solid var(--secondary); }
+.card-rich.card-product { border-top: 3px solid var(--accent); }
+.card-rich.card-recipe { border-top: 3px solid var(--primary); }
+.card-rich.card-organization { border-top: 3px solid var(--secondary-dark); }
+.card-rich.card-article { border-top: 3px solid var(--border); }
+
+.card-rich .rich-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.card-media-layout { display: flex; gap: 16px; align-items: flex-start; }
+.card-media-layout .result-content { flex: 1; min-width: 0; }
+
+.card-thumbnail {
+    flex-shrink: 0;
+    width: 148px; height: 104px;
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--clay-surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--clay-drop), var(--clay-lift);
+    display: grid; place-items: center;
+}
+.card-thumbnail .result-thumb {
+    width: 100%; height: 100%;
+    border: none; border-radius: 0; box-shadow: none;
+}
+
+/* Per-type accent + badge colours */
+.result-item.card-wiki { border-top-color: var(--secondary); }
+.result-item.card-product { border-top-color: var(--accent); }
+.result-item.card-recipe { border-top-color: var(--primary); }
+.result-item.card-organization { border-top-color: var(--secondary-dark); }
+
+.badge-wiki { background: rgba(33, 150, 243, 0.16); color: var(--secondary-dark); }
+.badge-product { background: rgba(255, 193, 7, 0.26); color: #8a6d00; }
+.badge-recipe { background: rgba(76, 175, 80, 0.18); color: var(--primary-dark); }
+.badge-organization { background: rgba(25, 118, 210, 0.16); color: var(--secondary-dark); }
+.badge-article { background: rgba(33, 150, 243, 0.14); color: var(--secondary-dark); }
+
+/* Structured spec rows (price, availability, time…) */
+.rich-specs { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 8px; }
+.rich-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: var(--radius-pill);
+    background: var(--raised); border: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--text); box-shadow: var(--clay-lift);
+}
+
+.price-tag {
+    display: inline-block; padding: 4px 12px; border-radius: var(--radius-pill);
+    background: var(--clay-accent); color: #6b5300;
+    font-weight: 700; font-size: 0.95rem;
+    box-shadow: var(--clay-drop), var(--clay-lift);
+}
+.availability {
+    display: inline-block; padding: 4px 10px; border-radius: var(--radius-pill);
+    font-size: 0.8rem; font-weight: 600;
+}
+.availability-ok { background: rgba(76, 175, 80, 0.16); color: var(--primary-dark); }
+.availability-no { background: rgba(229, 57, 53, 0.14); color: var(--danger-dark); }
+
+/* Rating stars: a clipped gold overlay drawn on top of the grey track */
+.rating-stars { display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; }
+.rating-track {
+    position: relative; display: inline-block; line-height: 1;
+    font-size: 0.95rem; letter-spacing: 2px;
+    color: #d8d8d8; white-space: nowrap;
+}
+.rating-fill {
+    position: absolute; top: 0; left: 0; overflow: hidden;
+    color: var(--accent-dark); white-space: nowrap;
+}
+.rating-text { font-size: 0.82rem; font-weight: 600; color: var(--text-light); }
+
+/* Key/value metadata list (organisation address, wiki categories, …) */
+.rich-metadata {
+    display: grid; gap: 4px 14px; margin: 8px 0 4px;
+    padding: 10px 12px; border-radius: var(--radius);
+    background: rgba(0, 0, 0, 0.02);
+    box-shadow: var(--clay-inset);
+}
+.rich-metadata-row { display: flex; gap: 8px; font-size: 0.84rem; }
+.rich-metadata dt { flex-shrink: 0; color: var(--text-light); font-weight: 600; min-width: 96px; }
+.rich-metadata dd { color: var(--text); word-break: break-word; }
+
+@media (max-width: 600px) {
+    .card-media-layout { flex-direction: column; }
+    .card-thumbnail { width: 100%; height: 150px; }
+    .rich-metadata dt { min-width: 76px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .card-rich, .card-thumbnail { transition: none; }
+}
