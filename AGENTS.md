@@ -22,7 +22,11 @@ python3 tests/test_wiki_import.py            # wiki dump/API importer, idempoten
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 python3 tests/test_rich_cards.py             # Rich Result cards, XSS, self-migration + cleanup
 python3 tests/test_maintenance.py            # nightly maintenance: dedup, vectors, wiki, dead links
+python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, lowmem scope
 ```
+
+`tests/test_crawler_discovery.py` runs against a loopback HTTP server, so it never
+touches the live internet — keep new crawler tests offline in the same way.
 
 All suites are deterministic and offline: network behaviour runs against a
 throwaway local HTTP server, and the wiki importer test writes a small bz2 dump
@@ -141,14 +145,34 @@ parsing (`_jsonld_scripts`). Transient HTTP statuses are retried centrally in
 `_http_get()` (`RETRYABLE_HTTP_STATUSES`, `_retry_delay` / `_retry_after_delay`),
 so callers must not re-implement backoff.
 
+## Crawler link discovery and sitemaps
+
+`process_url()` follows same-domain `<a href>` links it finds on an indexed page,
+so a site is crawled even when it has no sitemap. `extract_links_from_soup()`
+(used by both the crawler and tests) drops external domains, `mailto:`/
+`javascript:`, images and attachment extensions, strips fragments and collapses
+duplicates; `_is_crawlable_link()` is the single predicate behind that.
+`MAX_LINKS_PER_PAGE` (`MINISEARCH_MAX_LINKS_PER_PAGE`) caps new links per page.
+`_site_remaining_budget()` keeps discovery inside the site's `max_pages`.
+
+`parse_sitemap()` recurses into sitemap indexes, unwraps gzip by magic bytes
+(`_maybe_gunzip`, so a bad `Content-Type` still works), strips whitespace-only
+`<loc>` values and returns `[]` for unparseable XML instead of raising.
+`discover_sitemaps_and_feeds()` dedupes by URL and body via
+`_classify_discovery_body()` and is backed by a UNIQUE index on `sitemaps_feeds`.
+
 ## Low-memory mode
 
 `MINISEARCH_PROFILE=lowmem` (or `MINISEARCH_LOWMEM=1`) sets `LOW_MEMORY_MODE`,
-which disables embeddings and drops the worker count. `embeddings_enabled()` is
-the runtime check: `get_hnsw_index()` returns `None`, `generate_embedding()`
-returns `None` and `vector_search()` returns `[]` when off, so `hybrid_search()`
-falls back to FTS5. `_recover_interrupted_queue()` runs at `start_workers()`
-and returns `locked` rows to `pending` after a crash.
+which only turns off the *vector* stack — crawling, sitemap and link discovery
+are unaffected and must keep working. `embeddings_enabled()` is the runtime
+check: `get_hnsw_index()` returns `None`, `generate_embedding()` returns `None`
+and `vector_search()` returns `[]` when off, so `hybrid_search()` falls back to
+FTS5. `get_hnsw_index()` also refuses to build above `HNSW_MAX_ELEMENTS` stored
+vectors (default 20k in lowmem). `_recover_interrupted_queue()` runs at
+`start_workers()` and returns `locked` rows to `pending` after a crash.
+SQLite gets a small page cache (`SQLITE_CACHE_KB`) and `close_db()` checkpoints
+the WAL with TRUNCATE so the `-wal` file does not grow across restarts.
 
 ## Nightly maintenance ("dreaming mode")
 
@@ -216,8 +240,11 @@ use it rather than re-deriving those keys by hand.
 
 ## Environment notes
 
-- `sentence_transformers` is usually unavailable, so vector search silently
-  falls back to FTS5. Tests must not assume vector search works.
+- `sentence_transformers` is usually unavailable. Rather than fall back to FTS5
+  directly, `get_model()` returns a dependency-free `_HashingEmbedding`
+  (hashed folded tokens, unit-normalised) so vector search still works at low
+  quality; the real model is always preferred. `get_model()` returns `None` only
+  when numpy itself is missing. Tests must not assume a real model is present.
 - Expected console noise: `Model nelze nacist: ...` and `FTS5 table backfilled ...`.
 - Existing databases are migrated in place; never drop `console.db`. Migration
   runs automatically inside `get_db()` and `run_self_migration()` only deletes a

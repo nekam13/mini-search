@@ -397,10 +397,14 @@ výchozí hodnoty najednou. Konfigurace se čte z prostředí:
 | `MINISEARCH_EMBEDDINGS` | `auto` (lowmem) / `1` | `auto` = vektory jen při dostatku RAM a baterie; `1`/`0` = natvrdo |
 | `MINISEARCH_MIN_FREE_MB` | 300 | Pod touto volnou RAM (MB) se `auto` vektory vypne |
 | `MINISEARCH_MIN_BATTERY_PCT` | 15 | Pod tímto % baterie (bez nabíjení) se `auto` vektory vypne |
-| `MINISEARCH_REQUEST_TIMEOUT` | 30 | HTTP timeout (s) |
+| `MINISEARCH_REQUEST_TIMEOUT` | 10 (lowmem) / 30 | HTTP timeout (s) |
 | `MINISEARCH_MAX_RETRIES` | 3 | Počet pokusů u síťových chyb |
 | `MINISEARCH_RETRY_MAX_DELAY` | 5 | Strop exponenciálního backoffu (s) |
 | `MINISEARCH_MAX_BODY_CHARS` | 3500 | Max délka těla stránky |
+| `MINISEARCH_MAX_LINKS_PER_PAGE` | 100 | Max nových odkazů z jedné stránky (0 = vypnuto) |
+| `MINISEARCH_SQLITE_CACHE_KB` | 2048 (lowmem) / 16384 | Cache SQLite (KiB) |
+| `MINISEARCH_SQLITE_TEMP_STORE` | 1 (lowmem) / 2 | Dočasné tabulky: 0=default, 1=soubor, 2=RAM |
+| `MINISEARCH_HNSW_MAX_ELEMENTS` | 20000 (lowmem) / 100000 | Strop vektorů pro hnswlib index |
 | `MINISEARCH_WIKI_LANG` | `cs` | Výchozí jazyk Wikipedie |
 | `MINISEARCH_WIKI_BATCH` | 50 | Dávka pro wiki API |
 | `MINISEARCH_WIKI_API_BASE` | – | Mirror MediaWiki API (např. pro testy) |
@@ -423,6 +427,18 @@ když je volné paměti méně než `MINISEARCH_MIN_FREE_MB`, nebo je baterie po
 `MINISEARCH_MIN_BATTERY_PCT` a telefon se nenabíjí, vektory se přeskočí a hledání
 plynule přejde na FTS5. Na zařízeních, kde se stav nedá přečíst, se nic neblokuje.
 Chování lze vynutit pomocí `MINISEARCH_EMBEDDINGS=1` nebo `0`.
+
+Když `sentence-transformers` není nainstalovaný (typicky na Termuxu), použije se
+místo něj **lokální hashovací embedding** (`_HashingEmbedding`) – hash
+foldovaných tokenů normalizovaný do jednotkové délky. Nezabírá místo, nestahuje
+model a česká diakritika se v něm skládá (`Praha` == `praha`). Kvalita je nižší
+než u skutečného modelu, takže ten má vždy přednost; hashování je jen rozumný
+fallback, aby vektorové hledání nevrátilo hlouposti jako dřívější nulové vektory.
+
+Vektory se navíc neindexují do hnswlib, pokud jich je více než
+`MINISEARCH_HNSW_MAX_ELEMENTS` nebo pokud lowmem režim není v dobré kondici;
+hledání se pak plynule vrací na FTS5. Crawling, sitemapy a sledování odkazů
+nikdy nezávisí na vektorech – lowmem vypíná jen AI část, ne zpracování stránek.
 
 ## Noční údržba („dreaming mode")
 
@@ -490,6 +506,14 @@ Na pozadí lze údržbu zapnout přes `MINISEARCH_NIGHTLY=1`
   a User-Agent; u lokálních webů a Wikipedie se robots.txt obchází.
 - **Retry/backoff**: přechodné stavy (429, 500, 502, 503, 504, 408, 425) se
   opakují s exponenciálním zpožděním; `429` respektuje `Retry-After`.
+- **Sledování odkazů**: každá zaindexovaná stránka přidá do fronty odkazy, které
+  na ní najde (`<a href>`), takže se web proleze i když sitemap chybí nebo je
+  neúplný. Přeskakují se odkazy mimo doménu, `mailto:`/`javascript:`, obrázky a
+  další přílohy; počet nových odkazů na stránku hlídá
+  `MINISEARCH_MAX_LINKS_PER_PAGE`. Celkový počet stránek drží `max_pages` webu.
+- **Sitemapy**: `robots.txt` (`Sitemap:`), indexové sitemapy se rekurzivně
+  rozbalí, gzip se pozná podle magic bytes (i při špatném `Content-Type`),
+  duplicitní a prázdné `<loc>` se vyčistí a poškozené XML se přeskočí.
 - **Odolnost**: jeden velký nebo poškozený článek nezastaví ostatní; těla stránek
   se ořezávají na `MINISEARCH_MAX_BODY_CHARS`.
 
