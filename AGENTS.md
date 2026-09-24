@@ -21,6 +21,7 @@ python3 tests/test_local_indexing_smoke.py   # live local HTTP server: crawl + i
 python3 tests/test_wiki_import.py            # wiki dump/API importer, idempotency, resume
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 python3 tests/test_rich_cards.py             # Rich Result cards, XSS, self-migration + cleanup
+python3 tests/test_maintenance.py            # nightly maintenance: dedup, vectors, wiki, dead links
 ```
 
 All suites are deterministic and offline: network behaviour runs against a
@@ -148,6 +149,37 @@ the runtime check: `get_hnsw_index()` returns `None`, `generate_embedding()`
 returns `None` and `vector_search()` returns `[]` when off, so `hybrid_search()`
 falls back to FTS5. `_recover_interrupted_queue()` runs at `start_workers()`
 and returns `locked` rows to `pending` after a crash.
+
+## Nightly maintenance ("dreaming mode")
+
+`run_maintenance()` runs one bounded pass in four stages, each independently
+guarded and interruptible via `SHUTDOWN_FLAG`; the CLI entry point is
+`--maintenance` / `--nightly` (`_cli_maintenance`), and `maintenance_scheduled()`
+is the optional background job (`MINISEARCH_NIGHTLY=1`). A concurrent second run
+is refused by `_maintenance_lock`.
+
+- `maintenance_dedup_pages()` merges rows sharing a `url_hash` (exact URL dupe,
+  keep newest) and rows with an identical `_content_signature()` (keep oldest).
+  `_content_signature` skips bodies under `CONTENT_DUP_MIN_CHARS`/20 tokens, so
+  short boilerplate never collapses. Deletes rely on the existing FTS5 delete
+  trigger — do **not** delete from `pages` while bypassing triggers.
+- `maintenance_optimize_db()` always runs `PRAGMA optimize`; `VACUUM` only when
+  `_available_disk_mb()` clears `MAINTENANCE_VACUUM_MIN_MB` (and 1.2× the DB
+  size), because VACUUM needs the DB's size in free space. It takes `_db_lock`
+  and flips `isolation_level` to `None` — VACUUM cannot run in a transaction.
+- `maintenance_backfill_embeddings()` only writes rows where
+  `embedding IS NULL`, and re-checks `embeddings_enabled()` each iteration so a
+  mid-run resource drop stops cleanly (the rest is picked up next night).
+- `maintenance_import_wiki()` reuses `run_wiki_import()` (resume via
+  `next_title`, skips `status='paused'`), bounded by `--max-pages`.
+- `maintenance_check_dead_links()` probes oldest pages with HEAD, falls back to
+  GET on 405, and only treats 404/410 as dead (403/5xx are inconclusive). It is
+  opt-in via `MINISEARCH_MAINT_LINK_CHECK`; `MINISEARCH_MAINT_PURGE_DEAD=1`
+  removes dead rows. New columns `pages.link_status` / `pages.last_link_check`
+  are added by the in-place migration in `_migrate_db`.
+
+Progress lines go through `maintenance_log()` to `logs/maintenance.log`
+(gitignored), mirroring the best-effort contract of `log_error()`.
 
 ## Site stats keys
 

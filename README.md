@@ -280,6 +280,7 @@ python3 tests/test_local_indexing_smoke.py   # živý lokální HTTP server: cra
 python3 tests/test_wiki_import.py            # wiki importér: dump, API, idempotence, resume
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 python3 tests/test_rich_cards.py             # Rich Results karty, XSS, auto-migrace a úklid
+python3 tests/test_maintenance.py            # noční údržba: dedup, vektory, wiki, mrtvé odkazy
 ```
 
 Všechny testy jsou deterministické a běží bez živého internetu – síťová část
@@ -422,6 +423,59 @@ když je volné paměti méně než `MINISEARCH_MIN_FREE_MB`, nebo je baterie po
 `MINISEARCH_MIN_BATTERY_PCT` a telefon se nenabíjí, vektory se přeskočí a hledání
 plynule přejde na FTS5. Na zařízeních, kde se stav nedá přečíst, se nic neblokuje.
 Chování lze vynutit pomocí `MINISEARCH_EMBEDDINGS=1` nebo `0`.
+
+## Noční údržba („dreaming mode")
+
+Jedním během se databáze zkonsoliduje, doplní chybějící vektory, pomalu
+pokračuje v importu Wikipedie a (volitelně) zkontroluje mrtvé odkazy. Režim je
+šetrný k paměti: každá etapa je dávkovaná, respektuje `SHUTDOWN_FLAG` (lze ji
+přerušit) a průběh se loguje do `logs/maintenance.log`.
+
+```bash
+# Jednorázově (ideálně přes termux-job-scheduler / cron v noci)
+python3 app_combined.py --maintenance
+
+# Jen úklid DB a dopočet vektorů, bez sítě
+python3 app_combined.py --nightly --no-wiki --no-links
+
+# Omezit wiki import a zapnout kontrolu odkazů s promazáním mrtvých
+MINISEARCH_MAINT_LINK_CHECK=200 MINISEARCH_MAINT_PURGE_DEAD=1 \
+  python3 app_combined.py --maintenance --max-pages 500
+```
+
+Co který krok dělá:
+
+1. **Dedup a úklid** – sloučí stránky se stejným `url_hash` (přesná shoda URL)
+   i stránky s identickým obsahem (podpis z nejčastějších tokenů; krátká těla se
+   nechávají být, aby se nesléval boilerplate). Uvolněné místo se vrátí pomocí
+   `PRAGMA optimize`; `VACUUM` se spustí jen když je na disku dost místa
+   (`MINISEARCH_MAINT_VACUUM_MIN_MB`, jinak se přeskočí a nic se nerozbije).
+2. **Dopočet vektorů** – stránkám z lowmem režimu (`embedding IS NULL`)
+   dopočítá vektory, ale jen když jsou vektory vůbec povolené (respektuje
+   `MINISEARCH_EMBEDDINGS=auto`). Běží v dávkách a při zhoršení prostředků se
+   zastaví; zbytek dobere další noc.
+3. **Pomalý import Wikipedie** – naváže na uložený `next_title` u aktivních wiki
+   zdrojů (`--max-pages`, výchozí `MINISEARCH_MAINT_WIKI_PAGES=200`). Pauznuté
+   zdroje přeskočí, opakovaný běh je idempotentní.
+4. **Kontrola odkazů** – ověří nejstarší stránky (HEAD, při 405 fallback na GET)
+   a stránky s 404/410 označí `link_status='dead'`; s
+   `MINISEARCH_MAINT_PURGE_DEAD=1` je i smaže. Ověřování se ve výchozím stavu
+   **nespouští** (`MINISEARCH_MAINT_LINK_CHECK=0`), protože sahá na síť.
+
+Na pozadí lze údržbu zapnout přes `MINISEARCH_NIGHTLY=1`
+(hodina `MINISEARCH_NIGHTLY_HOUR`, výchozí 3:00).
+
+| Proměnná | Výchozí | Význam |
+|---|---|---|
+| `MINISEARCH_MAINTENANCE_LOG` | `logs/maintenance.log` | Kam se loguje průběh |
+| `MINISEARCH_MAINT_WIKI_PAGES` | 200 | Max článků na jednu noc (0 vypne) |
+| `MINISEARCH_MAINT_EMBED_BATCH` | 200 | Max stránek s dopočtem vektorů na běh |
+| `MINISEARCH_MAINT_LINK_CHECK` | 0 | Kolik nejstarších stránek ověřit (0 vypne) |
+| `MINISEARCH_MAINT_LINK_CHECK_DAYS` | 30 | Po kolika dnech stránku přeověřit |
+| `MINISEARCH_MAINT_PURGE_DEAD` | 0 | `1` = mazat stránky s 404/410 |
+| `MINISEARCH_MAINT_VACUUM_MIN_MB` | 50 | Kolik MB volného místa je potřeba pro `VACUUM` |
+| `MINISEARCH_NIGHTLY` | 0 | `1` = registrovat noční úlohu na pozadí |
+| `MINISEARCH_NIGHTLY_HOUR` | 3 | Hodina noční úlohy (0–23) |
 
 ## Zpracování stránek a crawler
 
