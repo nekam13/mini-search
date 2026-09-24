@@ -209,9 +209,8 @@ def main():
         server.server_close()
 
     # --- low-memory mode ---------------------------------------------------
-    # Simulate the Termux default by disabling embeddings and rebuilding the
-    # module-level state.
-    m.ENABLE_EMBEDDINGS = False
+    # Simulate the Termux default by hard-disabling embeddings.
+    m.EMBEDDINGS_PREF = '0'
     m._hnsw_index = None
     check("embeddings disabled reports False", m.embeddings_enabled() is False)
     check("vector index not built when disabled", m.get_hnsw_index() is None)
@@ -221,8 +220,42 @@ def main():
     check("hybrid_search still works without embeddings",
           isinstance(m.hybrid_search("praha"), list))
 
-    m.ENABLE_EMBEDDINGS = True
+    m.EMBEDDINGS_PREF = '1'
     check("embeddings re-enabled for the default profile", m.embeddings_enabled() is True)
+
+    # --- automatic resource-aware mode (mobile bonus) ----------------------
+    # 'auto' keeps vectors only while there is RAM/battery headroom; the probes
+    # must degrade gracefully on machines that expose neither.
+    m.EMBEDDINGS_PREF = 'auto'
+    original_free = m._available_memory_mb
+    original_batt = m._battery_status
+    try:
+        m._available_memory_mb = lambda: None
+        m._battery_status = lambda: (None, None)
+        check("auto keeps vectors when resources unknown",
+              m.embeddings_enabled() is True)
+
+        m._available_memory_mb = lambda: 50.0
+        check("auto drops vectors when RAM is low",
+              m.embeddings_enabled() is False)
+
+        m._available_memory_mb = lambda: 4000.0
+        m._battery_status = lambda: (5, False)
+        check("auto drops vectors on low, unplugged battery",
+              m.embeddings_enabled() is False)
+
+        m._battery_status = lambda: (5, True)
+        check("auto keeps vectors while charging despite low battery",
+              m.embeddings_enabled() is True)
+
+        m._available_memory_mb = lambda: 4000.0
+        m._battery_status = lambda: (80, False)
+        check("auto keeps vectors with healthy battery",
+              m.embeddings_enabled() is True)
+    finally:
+        m._available_memory_mb = original_free
+        m._battery_status = original_batt
+        m.EMBEDDINGS_PREF = '1'
 
     print()
     if failures:

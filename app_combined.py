@@ -120,9 +120,18 @@ RECRAWL_STALE_AFTER_SECONDS = 3 * 24 * 3600
 WORKER_COUNT = _env_int("MINISEARCH_WORKERS", 1 if LOW_MEMORY_MODE else 2, 1, 16)
 # Caps a single page's extracted body so one huge article cannot balloon the DB.
 MAX_BODY_CHARS = _env_int("MINISEARCH_MAX_BODY_CHARS", 3500, 200, 200000)
-# Embeddings are the biggest per-page cost (384 floats = 1.5 KB each). On low
-# memory devices they are skipped entirely and search falls back to FTS5.
-ENABLE_EMBEDDINGS = (not LOW_MEMORY_MODE) and _env_bool("MINISEARCH_EMBEDDINGS", True)
+# Embeddings are the biggest per-page cost (384 floats = 1.5 KB each) and the
+# hnswlib index adds more RAM on top, so on a phone they should only run when
+# there is headroom. ``MINISEARCH_EMBEDDINGS`` accepts:
+#   1/0/true/false - hard on/off (the historical behaviour)
+#   auto           - keep vector search unless RAM or battery is too low
+# The default is ``auto`` in low-memory mode and always-on elsewhere.
+EMBEDDINGS_PREF = os.environ.get(
+    "MINISEARCH_EMBEDDINGS", "auto" if LOW_MEMORY_MODE else "1").strip().lower()
+# Below this much free RAM (MB) automatic mode drops embeddings.
+EMBED_MIN_FREE_MB = _env_int("MINISEARCH_MIN_FREE_MB", 300, 50, 100000)
+# Below this battery percentage, and while unplugged, automatic mode drops them.
+EMBED_MIN_BATTERY_PCT = _env_int("MINISEARCH_MIN_BATTERY_PCT", 15, 0, 100)
 EMBED_MAX_CHARS = _env_int("MINISEARCH_EMBED_MAX_CHARS", 1000, 100, 8000)
 # Above this many stored embeddings the hnswlib index is skipped in low-memory
 # mode, because the in-RAM index (plus the vectors) can exceed a phone's budget.
@@ -377,7 +386,61 @@ def get_db():
             _migrate_db(_db_conn)
             _backfill_fts(_db_conn)
             _migrate_sources(_db_conn)
+            run_self_migration(_db_conn)
     return _db_conn
+
+
+def run_self_migration(conn=None):
+    """Verify the schema upgrade and drop legacy leftovers once it is proven.
+
+    Called automatically on every startup, so an existing install upgrades in
+    place the same way it always has — no manual step. Nothing is deleted until
+    the new shape is confirmed: the legacy ``site_sources_old`` table (if an
+    interrupted rebuild left one behind) is only removed after the live table
+    exists with all expected columns and has not lost rows relative to it.
+    Returns a short human-readable summary string.
+    """
+    conn = conn or get_db()
+    notes = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+
+        # 1) Confirm the upgraded site_sources shape.
+        expected = {'id', 'site_id', 'url', 'source_type', 'importer',
+                    'import_state', 'priority', 'notes', 'last_checked',
+                    'status', 'created_at'}
+        cursor.execute("PRAGMA table_info(site_sources)")
+        columns = {row[1] for row in cursor.fetchall()}
+        missing = expected - columns
+        if missing:
+            notes.append(f"site_sources missing columns: {sorted(missing)}")
+            return '; '.join(notes)  # do not delete anything on a bad shape
+
+        # 2) Verify the CHECK constraint accepts the new 'wiki' type.
+        cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='site_sources'")
+        row = cursor.fetchone()
+        if not row or "'wiki'" not in (row[0] or ''):
+            notes.append("site_sources CHECK not upgraded")
+            return '; '.join(notes)
+
+        # 3) Only now, with the upgrade proven, drop the legacy backup table.
+        if 'site_sources_old' in tables:
+            cursor.execute("SELECT COUNT(*) FROM site_sources")
+            new_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM site_sources_old")
+            old_count = cursor.fetchone()[0]
+            if new_count >= old_count:
+                cursor.execute("DROP TABLE site_sources_old")
+                conn.commit()
+                notes.append(f"dropped legacy site_sources_old ({old_count} rows migrated)")
+            else:
+                notes.append(f"kept site_sources_old (new {new_count} < old {old_count})")
+    except sqlite3.OperationalError as e:
+        notes.append(f"self-migration skipped: {e}")
+    return '; '.join(notes) if notes else 'ok'
 
 
 def _init_schema(conn):
@@ -2101,13 +2164,73 @@ def _init_hnsw(dim=384):
     return idx
 
 
+def _available_memory_mb():
+    """Best-effort free RAM in MB, or ``None`` when it cannot be determined.
+
+    Reads ``/proc/meminfo`` (Linux, incl. Termux) and falls back to
+    ``os.sysconf``; returns ``None`` on platforms that expose neither, which
+    callers treat as "don't know, don't block".
+    """
+    try:
+        with open('/proc/meminfo') as handle:
+            for line in handle:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        pages = os.sysconf('SC_AVPHYS_PAGES')
+        size = os.sysconf('SC_PAGE_SIZE')
+        if pages > 0 and size > 0:
+            return pages * size / (1024.0 * 1024.0)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def _battery_status():
+    """Return ``(percent, charging)`` from sysfs, or ``(None, None)`` if unknown."""
+    for base in ('/sys/class/power_supply/BAT0', '/sys/class/power_supply/battery'):
+        try:
+            with open(f"{base}/capacity") as handle:
+                percent = int(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+        charging = True
+        try:
+            with open(f"{base}/status") as handle:
+                charging = handle.read().strip().lower() in ('charging', 'full')
+        except OSError:
+            charging = True
+        return percent, charging
+    return None, None
+
+
+def _embeddings_allowed_by_resources():
+    """Automatic-mode gate: keep vectors only when RAM and battery allow."""
+    free_mb = _available_memory_mb()
+    if free_mb is not None and free_mb < EMBED_MIN_FREE_MB:
+        return False
+    percent, charging = _battery_status()
+    if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
+        return False
+    return True
+
+
 def embeddings_enabled():
     """Whether vector search should run at all in this configuration.
 
-    False when the user disabled embeddings (low-memory mode) *or* when the
-    numpy/hnswlib stack was not installed (mobile profile).
+    False when embeddings are explicitly disabled, or the numpy/hnswlib stack
+    is missing (mobile profile), or automatic mode finds the device low on RAM
+    or battery. In every one of those cases search falls back to FTS5.
     """
-    return bool(ENABLE_EMBEDDINGS) and np is not None and hnswlib is not None
+    if np is None or hnswlib is None:
+        return False
+    if EMBEDDINGS_PREF in ('0', 'false', 'off', 'no', 'ne'):
+        return False
+    if EMBEDDINGS_PREF in ('1', 'true', 'on', 'yes', 'ano'):
+        return True
+    return _embeddings_allowed_by_resources()
 
 
 def get_hnsw_index():
@@ -4036,6 +4159,323 @@ def _highlight_snippet(snippet, query):
     return ''.join(out)
 
 
+# --- Rich result cards ------------------------------------------------------
+# prepare_results() classifies each hit and precomputes every display value, so
+# the template only renders. Detection is best-effort: an untyped page always
+# falls back to a plain article card.
+
+_WIKI_HOST_RE = re.compile(
+    r'(?:^|\.)(?:wikipedia|wikimedia|wiktionary|wikinews|wikisource|wikiquote|'
+    r'wikibooks|wikiversity|wikivoyage|mediawiki)\.org$')
+
+CARD_WIKI = 'wiki'
+CARD_PRODUCT = 'product'
+CARD_RECIPE = 'recipe'
+CARD_ORGANIZATION = 'organization'
+CARD_ARTICLE = 'article'
+CARD_TYPES = (CARD_WIKI, CARD_RECIPE, CARD_PRODUCT, CARD_ORGANIZATION, CARD_ARTICLE)
+
+_RECIPE_SCHEMA_TYPES = frozenset(('recipe',))
+_PRODUCT_SCHEMA_TYPES = frozenset((
+    'product', 'individualproduct', 'productmodel', 'productgroup', 'offer',
+    'aggregateoffer', 'vehicle', 'book', 'movie', 'softwareapplication',
+    'mobileapplication', 'videogame', 'course', 'event', 'apispecification',
+))
+_ORGANIZATION_SCHEMA_TYPES = frozenset((
+    'organization', 'localbusiness', 'corporation', 'ngo',
+    'educationalorganization', 'governmentorganization', 'medicalorganization',
+    'sportsorganization', 'restaurant', 'store', 'professionalservice',
+    'hotel', 'dentist', 'physician', 'pharmacy', 'bank', 'library', 'museum',
+    'cafeorcoffeeshop', 'barorpub', 'grocery store', 'grocery', 'autodealer',
+    'travelagency',
+))
+# Schema.org availability values -> (Czech label, in-stock flag).
+_AVAILABILITY_LABELS = {
+    'instock': ('Skladem', True),
+    'limitedavailability': ('Omezená dostupnost', True),
+    'onlineonly': ('Pouze online', True),
+    'instoreonly': ('Pouze na prodejně', True),
+    'preorder': ('Předprodej', True),
+    'presale': ('Předprodej', True),
+    'backorder': ('Na objednávku', False),
+    'outofstock': ('Vyprodáno', False),
+    'soldout': ('Vyprodáno', False),
+    'discontinued': ('Ukončeno', False),
+}
+_CURRENCY_SYMBOLS = {'CZK': 'Kč', 'EUR': '€', 'USD': '$', 'GBP': '£',
+                     'PLN': 'zł', 'HUF': 'Ft', 'CHF': 'CHF'}
+_ISO_DURATION_RE = re.compile(
+    r'^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?'
+    r'(?:(?P<seconds>\d+)S)?)?$', re.IGNORECASE)
+
+
+def _schema_scalar(value):
+    """Best-effort plain string from a JSON-LD scalar or wrapper object."""
+    if value is None or isinstance(value, bool):
+        return ''
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ('name', 'value', '@id', 'url', 'text'):
+            if key in value:
+                found = _schema_scalar(value[key])
+                if found:
+                    return found
+        return ''
+    if isinstance(value, (list, tuple)):
+        for entry in value:
+            found = _schema_scalar(entry)
+            if found:
+                return found
+    return ''
+
+
+def _schema_number(value):
+    """Parse a numeric value, tolerating Czech decimal commas and spaces."""
+    text = _schema_scalar(value)
+    if not text:
+        return None
+    cleaned = text.replace(' ', '').replace('\u00a0', '')
+    if ',' in cleaned and '.' in cleaned:
+        cleaned = cleaned.replace('.', '').replace(',', '.')
+    else:
+        cleaned = cleaned.replace(',', '.')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _nested_scalar(node, path):
+    """Follow ``path`` through dicts/lists and return the first scalar found."""
+    current = node
+    for key in path:
+        if isinstance(current, (list, tuple)):
+            current = next((e for e in current if isinstance(e, dict)), None)
+        if not isinstance(current, dict):
+            return ''
+        current = current.get(key)
+    return _schema_scalar(current)
+
+
+def _format_price(amount, currency):
+    """Czech-friendly price: thousands separated by spaces, comma decimals."""
+    if amount is None:
+        return ''
+    currency = (currency or '').strip().upper()
+    if abs(amount - round(amount)) < 0.005:
+        text = f"{int(round(amount)):,}".replace(',', ' ')
+    else:
+        text = f"{amount:,.2f}".replace(',', ' ').replace('.', ',')
+    symbol = _CURRENCY_SYMBOLS.get(currency)
+    return f"{text} {symbol}" if symbol else f"{text} {currency}".strip()
+
+
+def _format_duration(value):
+    """Render an ISO-8601 duration (PT30M, PT1H20M) as Czech minutes/hours."""
+    text = _schema_scalar(value)
+    if not text:
+        return ''
+    match = _ISO_DURATION_RE.match(text)
+    if match:
+        minutes = (int(match.group('days') or 0) * 1440
+                   + int(match.group('hours') or 0) * 60
+                   + int(match.group('minutes') or 0)
+                   + (1 if int(match.group('seconds') or 0) >= 30 else 0))
+    else:
+        number = _schema_number(text)
+        minutes = int(round(number)) if number is not None else 0
+    if minutes <= 0:
+        return ''
+    hours, rest = divmod(minutes, 60)
+    if hours and rest:
+        return f"{hours} h {rest} min"
+    if hours:
+        return f"{hours} h"
+    return f"{rest} min"
+
+
+def _safe_image_url(value):
+    """Allow only absolute http(s) and root-relative image URLs.
+
+    Keeps ``javascript:``/``data:`` payloads out of ``<img src>`` even though a
+    stored page can carry arbitrary JSON-LD.
+    """
+    text = _schema_scalar(value)
+    if not text:
+        return ''
+    lower = text.lower()
+    if lower.startswith('http://') or lower.startswith('https://'):
+        return text
+    if text.startswith('/') and not text.startswith('//'):
+        return text
+    return ''
+
+
+def _first_image_url(item):
+    """First usable URL from the stored ``images`` list, or ``''``."""
+    images = page_json(item, 'images', [])
+    if isinstance(images, list):
+        for entry in images:
+            if isinstance(entry, dict):
+                safe = _safe_image_url(entry.get('url'))
+                if safe:
+                    return safe
+    return ''
+
+
+def _card_type_for(item, schema_types):
+    """Classify a result into a rich-card type (see ``CARD_TYPES``)."""
+    try:
+        host = (urlparse(page_string(item, 'url')).hostname or '').lower()
+    except Exception:
+        host = ''
+    if _WIKI_HOST_RE.search(host):
+        return CARD_WIKI
+    if schema_types & _RECIPE_SCHEMA_TYPES:
+        return CARD_RECIPE
+    if schema_types & _PRODUCT_SCHEMA_TYPES:
+        return CARD_PRODUCT
+    if schema_types & _ORGANIZATION_SCHEMA_TYPES:
+        return CARD_ORGANIZATION
+    return CARD_ARTICLE
+
+
+def _rich_card_fields(item):
+    """Derive card type and structured display fields for a result.
+
+    Every value is a plain pre-formatted string (already safe for autoescape),
+    so the template renders without branching on raw JSON-LD.
+    """
+    details = page_json(item, 'schema_details', {})
+    if not isinstance(details, dict):
+        details = {}
+    schema_types = set(_schema_types(details))
+    declared = (page_string(item, 'schema_type') or '').lower()
+    if declared:
+        schema_types.add(declared)
+
+    price_amount = None
+    for path in (('offers', 'price'), ('offers', 'lowPrice'), ('offers', 'highPrice'),
+                 ('price',), ('priceSpecification', 'price')):
+        price_amount = _schema_number(_nested_scalar(details, path))
+        if price_amount is not None:
+            break
+
+    card_type = _card_type_for(item, schema_types)
+    if card_type == CARD_ARTICLE and price_amount is not None:
+        card_type = CARD_PRODUCT
+
+    fields = {'card_type': card_type}
+    badge = page_string(item, 'schema_type')
+    if card_type == CARD_WIKI:
+        fields['card_badge'] = 'Wikipedie'
+    else:
+        fields['card_badge'] = badge or {
+            CARD_PRODUCT: 'Produkt', CARD_RECIPE: 'Recept',
+            CARD_ORGANIZATION: 'Organizace', CARD_ARTICLE: 'Článek',
+        }.get(card_type, 'Článek')
+
+    meta = details.get('_meta') if isinstance(details.get('_meta'), dict) else {}
+    breadcrumbs = meta.get('breadcrumbs')
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = []
+    fields['breadcrumbs'] = [str(b) for b in breadcrumbs if str(b).strip()][:6]
+    fields['meta_author'] = _schema_scalar(meta.get('author'))
+
+    rows = []
+
+    # Rating is shared by products and recipes.
+    rating_value = _schema_number(
+        _nested_scalar(details, ('aggregateRating', 'ratingValue')))
+    rating_count = _nested_scalar(
+        details, ('aggregateRating', 'ratingCount'))
+    rating_count = rating_count or _nested_scalar(
+        details, ('aggregateRating', 'reviewCount'))
+    if rating_value is not None and rating_value > 0:
+        best = _schema_number(
+            _nested_scalar(details, ('aggregateRating', 'bestRating'))) or 5.0
+        best = best if best > 0 else 5.0
+        fields['rating_value'] = f"{rating_value:.1f}".rstrip('0').rstrip('.')
+        fields['rating_pct'] = max(0, min(100, int(round(rating_value / best * 100))))
+        fields['rating_count'] = _schema_scalar(rating_count)
+
+    if card_type == CARD_PRODUCT:
+        currency = (_nested_scalar(details, ('offers', 'priceCurrency'))
+                    or _nested_scalar(details, ('priceCurrency',)))
+        fields['price_display'] = _format_price(price_amount, currency)
+        availability = _nested_scalar(details, ('offers', 'availability'))
+        if availability:
+            key = availability.rstrip('/').rsplit('/', 1)[-1].lower()
+            label, ok = _AVAILABILITY_LABELS.get(key, (availability, True))
+            fields['availability'] = label
+            fields['availability_ok'] = ok
+        brand = _nested_scalar(details, ('brand',)) or _nested_scalar(details, ('brand', 'name'))
+        sku = _nested_scalar(details, ('sku',)) or _nested_scalar(details, ('mpn',))
+        if brand:
+            rows.append(('Značka', brand))
+        if sku:
+            rows.append(('Kód', sku))
+
+    elif card_type == CARD_RECIPE:
+        time_display = _format_duration(_nested_scalar(details, ('totalTime',)))
+        if not time_display:
+            time_display = _format_duration(_nested_scalar(details, ('cookTime',)))
+        if not time_display:
+            time_display = _format_duration(_nested_scalar(details, ('prepTime',)))
+        fields['time_display'] = time_display
+        calories = _nested_scalar(details, ('nutrition', 'calories'))
+        if calories:
+            fields['calories'] = f"{calories} kcal" if calories.isdigit() else calories
+        yield_value = _nested_scalar(details, ('recipeYield',))
+        category = _nested_scalar(details, ('recipeCategory',))
+        cuisine = _nested_scalar(details, ('recipeCuisine',))
+        if yield_value:
+            rows.append(('Porce', yield_value))
+        if category:
+            rows.append(('Kategorie', category))
+        if cuisine:
+            rows.append(('Kuchyně', cuisine))
+
+    elif card_type == CARD_ORGANIZATION:
+        address = _nested_scalar(details, ('address', 'streetAddress'))
+        locality = _nested_scalar(details, ('address', 'addressLocality'))
+        if not address:
+            address = _nested_scalar(details, ('address',))
+        fields['address'] = ', '.join(p for p in (address, locality) if p)
+        fields['phone'] = _nested_scalar(details, ('telephone',))
+        logo = (_safe_image_url(_nested_scalar(details, ('logo',)))
+                or _safe_image_url(_nested_scalar(details, ('image',))))
+        if logo:
+            fields['logo'] = logo
+        hours = _nested_scalar(details, ('openingHours',))
+        if hours:
+            rows.append(('Otevírací doba', hours))
+
+    elif card_type == CARD_WIKI:
+        lang = ''
+        try:
+            host = (urlparse(page_string(item, 'url')).hostname or '').lower()
+            lang = host.split('.')[0] if host.endswith('.wikipedia.org') else ''
+        except Exception:
+            lang = ''
+        if lang:
+            rows.append(('Jazyk', f"Wikipedie ({lang})"))
+        if fields['breadcrumbs']:
+            rows.append(('Kategorie', ' › '.join(fields['breadcrumbs'])))
+        rows.append(('Zdroj', 'Wikimedia'))
+
+    if card_type != CARD_WIKI and fields['breadcrumbs']:
+        rows.append(('Zařazení', ' › '.join(fields['breadcrumbs'])))
+    if fields['meta_author'] and card_type != CARD_WIKI:
+        rows.append(('Autor', fields['meta_author']))
+
+    fields['rich_metadata'] = [{'label': label, 'value': value} for label, value in rows]
+    return fields
+
+
 def prepare_results(results, query):
     """Attach display-only fields so the template stays free of logic."""
     prepared = []
@@ -4047,8 +4487,17 @@ def prepare_results(results, query):
         item['relevance_pct'] = int(round(float(item.get('relevance') or 0)))
         item['display_title'] = (page_string(item, 'og_title') or page_string(item, 'title')
                                  or page_string(item, 'url'))
-        item['display_date'] = page_string(item, 'published_date')
-        item['thumb'] = page_string(item, 'og_image') or page_string(item, 'favicon_url')
+        item['display_date'] = page_string(item, 'published_date') or (
+            format_timestamp(item.get('published_timestamp'))
+            if item.get('published_timestamp') else '')
+
+        item.update(_rich_card_fields(item))
+
+        thumb = (_safe_image_url(page_string(item, 'og_image'))
+                 or _safe_image_url(page_string(item, 'favicon_url')))
+        if not thumb and item['card_type'] in (CARD_PRODUCT, CARD_RECIPE, CARD_ORGANIZATION):
+            thumb = _first_image_url(item)
+        item['thumb'] = item.get('logo') or thumb
         prepared.append(item)
     return prepared
 

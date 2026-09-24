@@ -20,6 +20,7 @@ python3 tests/test_local_sites.py            # local-network detection, robots b
 python3 tests/test_local_indexing_smoke.py   # live local HTTP server: crawl + index end to end
 python3 tests/test_wiki_import.py            # wiki dump/API importer, idempotency, resume
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
+python3 tests/test_rich_cards.py             # Rich Result cards, XSS, self-migration + cleanup
 ```
 
 All suites are deterministic and offline: network behaviour runs against a
@@ -51,6 +52,28 @@ Nav highlighting uses an `active_page` template variable. Current keys:
 (`domain`, `display_url_path`, `snippet_html`, `relevance_pct`, `display_title`,
 `thumb`, …) so templates only render. Follow that pattern rather than adding
 conditionals or filters to HTML.
+
+### Rich Result cards
+
+`prepare_results()` also sets `card_type` (`wiki` / `product` / `recipe` /
+`organization` / `article`) via `_rich_card_fields()`, plus every structured
+value already formatted for display (`card_badge`, `price_display`,
+`availability`, `rating_value`/`rating_pct`, `time_display`, `calories`,
+`address`, `phone`, `rich_metadata`, `breadcrumbs`). The template only picks a
+class (`card-<type>`) and prints them — never parse `schema_details` in Jinja.
+
+Rules when extending this:
+
+- Every rich value must be a plain pre-formatted string; autoescaping is the only
+  XSS defence, so never mark a rich field `|safe`.
+- Image URLs must pass `_safe_image_url()` (http(s) / root-relative only) before
+  reaching an `src` attribute.
+- Card classification is best-effort; an unknown page must fall back to
+  `article`, never raise.
+- Card CSS lives in `clay.css` (`.card-rich`, `.card-wiki`, `.price-tag`,
+  `.rating-stars`, `.rich-metadata`, `.card-thumbnail`, `.card-media-layout`…)
+  and must use the existing tokens. Keep `class="result-item"` on the outer
+  `<article>`: the search-page tests count that exact string.
 
 ### Escaping
 
@@ -164,7 +187,16 @@ use it rather than re-deriving those keys by hand.
 - `sentence_transformers` is usually unavailable, so vector search silently
   falls back to FTS5. Tests must not assume vector search works.
 - Expected console noise: `Model nelze nacist: ...` and `FTS5 table backfilled ...`.
-- Existing databases are migrated in place; never drop `console.db`.
+- Existing databases are migrated in place; never drop `console.db`. Migration
+  runs automatically inside `get_db()` and `run_self_migration()` only deletes a
+  leftover `site_sources_old` after the new shape and the `wiki` CHECK are both
+  verified and no rows were lost.
+- `MINISEARCH_EMBEDDINGS` accepts `auto` (default in lowmem mode): embeddings are
+  kept unless free RAM (`/proc/meminfo` or `os.sysconf`) is below
+  `MINISEARCH_MIN_FREE_MB` or the battery is low and unplugged. Probes return
+  `None`/unknown on platforms that expose neither, which must never block vector
+  search. Tests patch `_available_memory_mb()` / `_battery_status()` rather than
+  touching real hardware.
 
 ## Conventions
 
