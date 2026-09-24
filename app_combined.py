@@ -97,8 +97,16 @@ DB_PATH = os.environ.get("MINISEARCH_DB", "console.db")
 LOW_MEMORY_MODE = _env_bool("MINISEARCH_LOWMEM") or \
     os.environ.get("MINISEARCH_PROFILE", "").strip().lower() in ('lowmem', 'low-memory', 'mobile')
 
+# SQLite memory tuning. Negative cache_size means KiB rather than pages, which
+# is much easier to reason about on a phone; temp_store=MEMORY keeps sorts off
+# the flash where possible but falls back to a file under pressure.
+SQLITE_CACHE_KB = _env_int("MINISEARCH_SQLITE_CACHE_KB", 2048 if LOW_MEMORY_MODE else 16384, 128, 1048576)
+SQLITE_TEMP_STORE = _env_int("MINISEARCH_SQLITE_TEMP_STORE", 1 if LOW_MEMORY_MODE else 2, 0, 2)
+
 MAX_RETRIES = _env_int("MINISEARCH_MAX_RETRIES", 3, 0, 10)
-REQUEST_TIMEOUT = _env_int("MINISEARCH_REQUEST_TIMEOUT", 30, 1, 600)
+# 10s keeps a stalled host from hanging a worker for the whole request budget,
+# which matters most on a phone where a single worker crawls the queue.
+REQUEST_TIMEOUT = _env_int("MINISEARCH_REQUEST_TIMEOUT", 10, 1, 600)
 DISCOVERY_TIMEOUT = _env_int("MINISEARCH_DISCOVERY_TIMEOUT", 10, 1, 600)
 DISCOVERY_MAX_RETRIES = _env_int("MINISEARCH_DISCOVERY_MAX_RETRIES", 2, 0, 10)
 HTTP_FETCH_RETRY_BASE_DELAY = 1.0
@@ -120,6 +128,16 @@ RECRAWL_STALE_AFTER_SECONDS = 3 * 24 * 3600
 WORKER_COUNT = _env_int("MINISEARCH_WORKERS", 1 if LOW_MEMORY_MODE else 2, 1, 16)
 # Caps a single page's extracted body so one huge article cannot balloon the DB.
 MAX_BODY_CHARS = _env_int("MINISEARCH_MAX_BODY_CHARS", 3500, 200, 200000)
+# Link discovery: how many same-domain links one crawled page may contribute to
+# the queue. Bounded so a huge link hub cannot flood the queue on a phone.
+MAX_LINKS_PER_PAGE = _env_int("MINISEARCH_MAX_LINKS_PER_PAGE", 100, 0, 5000)
+# File extensions that are never crawled as HTML pages.
+SKIP_LINK_EXTENSIONS = (
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
+    '.css', '.js', '.json', '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz',
+    '.mp3', '.mp4', '.avi', '.mov', '.wav', '.ogg', '.webm', '.m4a', '.m4v',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.exe', '.dmg', '.apk',
+)
 # Embeddings are the biggest per-page cost (384 floats = 1.5 KB each) and the
 # hnswlib index adds more RAM on top, so on a phone they should only run when
 # there is headroom. ``MINISEARCH_EMBEDDINGS`` accepts:
@@ -135,7 +153,10 @@ EMBED_MIN_BATTERY_PCT = _env_int("MINISEARCH_MIN_BATTERY_PCT", 15, 0, 100)
 EMBED_MAX_CHARS = _env_int("MINISEARCH_EMBED_MAX_CHARS", 1000, 100, 8000)
 # Above this many stored embeddings the hnswlib index is skipped in low-memory
 # mode, because the in-RAM index (plus the vectors) can exceed a phone's budget.
-HNSW_MAX_ELEMENTS = _env_int("MINISEARCH_HNSW_MAX_ELEMENTS", 100000, 100, 5000000)
+# Measured: 30k vectors of dim 384 already cost ~175 MB RSS, so the phone
+# default is deliberately far smaller than the desktop one.
+HNSW_MAX_ELEMENTS = _env_int(
+    "MINISEARCH_HNSW_MAX_ELEMENTS", 20000 if LOW_MEMORY_MODE else 100000, 100, 5000000)
 
 # --- Czech Wikipedia importer -------------------------------------------------
 # Default language for a bare wiki source and the API batch size. The default
@@ -202,6 +223,7 @@ _db_lock = threading.Lock()
 _db_conn = None
 _hnsw_index = None
 _model = None
+_model_failed = False
 _scheduler = None
 _worker_threads = []
 _robots_cache = {}
@@ -364,6 +386,10 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_pages_indexed ON pages(indexed_at)",
     "CREATE INDEX IF NOT EXISTS idx_sources_site ON site_sources(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_sources_type ON site_sources(source_type)",
+    # A (site_id, url) pair is one source; the unique index lets INSERT OR
+    # IGNORE collapse repeated probes and keeps the legacy mirror honest.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sitemaps_feeds_site_url "
+    "ON sitemaps_feeds(site_id, url)",
 ]
 
 DB_TRIGGERS = [
@@ -417,6 +443,12 @@ def get_db():
             _db_conn.execute("PRAGMA busy_timeout=30000")
             _db_conn.execute("PRAGMA wal_autocheckpoint=1000")
             _db_conn.execute("PRAGMA synchronous=NORMAL")
+            # Termux/phone defaults: keep the page cache small and force any
+            # sort/temp b-trees onto disk instead of into RAM. A few MB of
+            # cache is plenty for this workload and leaves headroom for the
+            # rest of the process.
+            _db_conn.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_KB}")
+            _db_conn.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             _db_conn.row_factory = sqlite3.Row
             _init_schema(_db_conn)
             _migrate_db(_db_conn)
@@ -622,6 +654,31 @@ def _migrate_db(conn):
         except sqlite3.OperationalError:
             pass
 
+    _dedupe_sitemaps_feeds(cursor, conn)
+
+
+def _dedupe_sitemaps_feeds(cursor, conn):
+    """Collapse duplicate ``(site_id, url)`` rows, then add the unique index.
+
+    An older database may hold the same source several times (repeated probes
+    of ``/sitemap.xml`` etc.), and the unique index cannot be created over those
+    rows. The oldest row keeps its id so nothing else needs re-pointing.
+    """
+    try:
+        cursor.execute("""
+            DELETE FROM sitemaps_feeds
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM sitemaps_feeds GROUP BY site_id, url
+            )
+        """)
+        conn.commit()
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sitemaps_feeds_site_url "
+            "ON sitemaps_feeds(site_id, url)")
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        print(f"sitemaps_feeds dedup skipped: {e}")
+
 
 def _rebuild_site_sources(cursor):
     """Recreate site_sources with the extended CHECK constraint, preserving rows.
@@ -717,9 +774,19 @@ def log_error(message, exc=None):
 
 
 def close_db():
+    """Close the shared connection, checkpointing the WAL first.
+
+    Without an explicit checkpoint the ``-wal`` file keeps growing between
+    restarts (worst on a phone with little storage), and an interrupted process
+    leaves it behind. TRUNCATE folds it back into the main DB and empties it.
+    """
     global _db_conn
     with _db_lock:
         if _db_conn is not None:
+            try:
+                _db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
             _db_conn.close()
             _db_conn = None
 
@@ -1061,11 +1128,6 @@ def fold_diacritics(text):
     if not text:
         return ''
     return text.lower().translate(_FOLD_TRANSLATION)
-
-
-def _has_diacritics(text):
-    folded = fold_diacritics(text)
-    return folded != (text or '').lower()
 
 
 def _fold_tokenize(text):
@@ -2287,34 +2349,66 @@ def get_hnsw_index():
 
     In low-memory mode the index is never built: the per-page embeddings plus
     the hnswlib graph can easily exceed a phone's budget, and full-text search
-    still works. Callers must handle ``None``.
+    still works. The same applies when the embedding model is unavailable.
+    Callers must handle ``None``.
     """
     global _hnsw_index
     if not embeddings_enabled():
         return None
+    model = get_model()
+    if model is None:
+        return None
     if _hnsw_index is None:
-        dim = get_model().get_sentence_embedding_dimension()
-        _init_hnsw(dim)
+        # An approximate index over more than HNSW_MAX_ELEMENTS vectors costs
+        # more RAM than it is worth on a phone (and is slow to rebuild on every
+        # start), so we keep it unbuilt and let search fall back to FTS5.
+        try:
+            count = execute_db_fetchone(
+                "SELECT COUNT(*) FROM pages WHERE embedding IS NOT NULL")[0]
+        except Exception:
+            count = 0
+        if count > HNSW_MAX_ELEMENTS:
+            return None
+        _init_hnsw(model.get_sentence_embedding_dimension())
         _load_embeddings_into_index()
     return _hnsw_index
 
 
 def _load_embeddings_into_index():
-    """Load all stored embeddings from SQLite into _hnsw_index."""
-    rows = execute_db_fetchall("SELECT id, embedding FROM pages WHERE embedding IS NOT NULL")
-    if not rows:
+    """Stream stored embeddings from SQLite into ``_hnsw_index`` in batches.
+
+    Reading every embedding in one ``fetchall`` would spike RAM to the size of
+    the whole vector column, which is exactly what a phone cannot afford, so
+    the rows are paged instead.
+    """
+    if _hnsw_index is None:
         return
-    ids, vecs = [], []
-    for row in rows:
-        try:
-            emb = np.frombuffer(row[1], dtype=np.float32)
-            if emb.size > 0:
+    last_id = 0
+    while True:
+        rows = execute_db_fetchall(
+            """SELECT id, embedding FROM pages
+               WHERE embedding IS NOT NULL AND id > ?
+               ORDER BY id ASC LIMIT 500""",
+            (last_id,)
+        )
+        if not rows:
+            break
+        ids, vecs = [], []
+        for row in rows:
+            last_id = row[0]
+            try:
+                emb = np.frombuffer(row[1], dtype=np.float32)
+            except Exception:
+                continue
+            if emb.size:
                 ids.append(row[0])
                 vecs.append(emb)
-        except Exception:
-            pass
-    if vecs:
-        _hnsw_index.add_items(np.array(vecs), np.array(ids))
+        if vecs:
+            try:
+                _hnsw_index.add_items(np.array(vecs), np.array(ids))
+            except Exception as e:
+                log_error("Could not add embeddings to the vector index", e)
+                break
 
 
 def _rebuild_hnsw_index():
@@ -2323,37 +2417,82 @@ def _rebuild_hnsw_index():
     if not embeddings_enabled():
         _hnsw_index = None
         return
+    model = get_model()
+    if model is None:
+        _hnsw_index = None
+        return
     if _hnsw_index is not None:
         dim = _hnsw_index.dim
-        _init_hnsw(dim)
     else:
-        dim = get_model().get_sentence_embedding_dimension()
-        _init_hnsw(dim)
+        dim = model.get_sentence_embedding_dimension()
+    _init_hnsw(dim)
     _load_embeddings_into_index()
 
 
+class _HashingEmbedding:
+    """Dependency-free fallback embedder: a hashed bag-of-words vector.
+
+    When ``sentence-transformers`` cannot be installed (the usual Termux case)
+    this gives vector search *something* sensible on top of FTS5 while costing
+    no model download and no persistent RAM. It is a feature hash over folded
+    tokens, L2-normalised so cosine distance behaves; Czech diacritics fold to
+    ASCII, so ``Praha`` and ``praha`` land in the same bucket. Quality is far
+    below a real model, which is why the real model is always preferred.
+    """
+
+    dimension = 384
+
+    def get_sentence_embedding_dimension(self):
+        return self.dimension
+
+    def encode(self, text):
+        vec = np.zeros(self.dimension, dtype=np.float32)
+        for token in _fold_tokenize(text or ''):
+            digest = hashlib.md5(token.encode('utf-8')).digest()
+            index = int.from_bytes(digest[:4], 'little') % self.dimension
+            sign = 1.0 if digest[4] & 1 else -1.0
+            vec[index] += sign
+        norm = float(np.linalg.norm(vec))
+        if norm > 0:
+            vec /= norm
+        return vec
+
+
 def get_model():
-    global _model
-    if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        except Exception as e:
-            print(f"Model nelze nacist: {e}")
-            class DummyModel:
-                def get_sentence_embedding_dimension(self): return 384
-                def encode(self, text): return np.zeros(384, dtype=np.float32)
-            _model = DummyModel()
+    """Return the best available embedder for this install.
+
+    Prefers the real ``sentence-transformers`` model; if it is missing, falls
+    back to :class:`_HashingEmbedding` instead of a stub that returns zero
+    vectors (which would poison vector search). Returns ``None`` only when the
+    numpy/hnswlib stack itself is unavailable.
+    """
+    global _model, _model_failed
+    if _model is not None:
+        return _model
+    if _model_failed:
+        return _HashingEmbedding() if np is not None else None
+    try:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    except Exception as e:
+        print(f"Model nelze nacist: {e} (fallback: lokalni hashovaci embedding)")
+        _model_failed = True
+        return _HashingEmbedding() if np is not None else None
     return _model
 
 
 def generate_embedding(text):
+    """Return an embedding for ``text``, or ``None`` when vectors are off."""
     if not embeddings_enabled():
         return None
+    model = get_model()
+    if model is None:
+        return None
     try:
-        return get_model().encode(text[:EMBED_MAX_CHARS])
-    except Exception:
-        return np.zeros(384, dtype=np.float32)
+        return model.encode(text[:EMBED_MAX_CHARS])
+    except Exception as e:
+        log_error("Embedding generation failed", e)
+        return None
 
 
 def _jaccard(a, b):
@@ -2501,6 +2640,8 @@ def vector_search(query, limit=25, filter_type=None):
         return []
 
     query_embedding = generate_embedding(query)
+    if query_embedding is None:
+        return []
     k = min(limit * 3, idx.element_count)
     labels, distances = idx.knn_query(query_embedding, k=k)
 
@@ -2588,8 +2729,44 @@ def fts_search(query, limit=25):
 # CRAWLING
 # ============================================================================
 
+# Probe paths tried when no sitemap/feed is advertised in robots.txt. Kept in
+# preference order; identical bodies are collapsed so a soft-404 server does not
+# register the same document under several paths.
+DISCOVERY_PROBE_PATHS = (
+    '/sitemap.xml', '/sitemap_index.xml', '/sitemap.xml.gz',
+    '/feed', '/rss', '/atom.xml', '/feed.xml', '/rss.xml',
+    '/feed/rss', '/feed/atom', '/rss2.0.xml', '/rdf.xml',
+)
+
+
+def _classify_discovery_body(content, content_type):
+    """Return ``'sitemap'``, ``'rss'``, ``'atom'`` or ``''`` for a probe body.
+
+    Body markers win over the header, because mislabelled Content-Types are
+    common in the wild and a wrong guess here would drop a real source.
+    """
+    try:
+        text = _maybe_gunzip(content).decode('utf-8', errors='ignore')[:1000]
+    except Exception:
+        text = ''
+    ct = (content_type or '').lower()
+    if '<urlset' in text or '<sitemapindex' in text or 'sitemap' in ct:
+        return 'sitemap'
+    if '<rss' in text or 'rss' in ct:
+        return 'rss'
+    if '<feed' in text or 'atom' in ct:
+        return 'atom'
+    return ''
+
+
 def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
-    """Phase 1: detect sitemaps/feeds via GET with robots.txt check."""
+    """Phase 1: detect sitemaps/feeds via GET with robots.txt check.
+
+    Candidate URLs come from ``robots.txt`` first, then the well-known probe
+    paths. Bodies byte-identical to an already-accepted document are skipped,
+    so a server that answers every ``/sitemap*`` path with the same file yields
+    one source instead of several.
+    """
     parsed = urlparse(site_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -2600,6 +2777,14 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
 
     # Collect candidate URLs
     candidate_urls = []
+    seen_candidates = set()
+
+    def _add_candidate(candidate):
+        candidate = (candidate or '').strip()
+        if candidate and candidate not in seen_candidates:
+            seen_candidates.add(candidate)
+            candidate_urls.append(candidate)
+
     try:
         resp = _http_get(urljoin(base_url, '/robots.txt'),
                          timeout=DISCOVERY_TIMEOUT,
@@ -2608,21 +2793,15 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith('sitemap:'):
-                    sitemap_url = line.split(':', 1)[1].strip()
-                    candidate_urls.append(sitemap_url)
+                    _add_candidate(line.split(':', 1)[1].strip())
     except Exception as e:
         log_error(f"Could not probe robots.txt for {base_url}", e)
 
-    for path in [
-        '/sitemap.xml', '/sitemap_index.xml', '/sitemap.xml.gz',
-        '/feed', '/rss', '/atom.xml', '/feed.xml', '/rss.xml',
-        '/feed/rss', '/feed/atom', '/rss2.0.xml', '/rdf.xml'
-    ]:
-        u = urljoin(base_url, path)
-        if u not in candidate_urls:
-            candidate_urls.append(u)
+    for path in DISCOVERY_PROBE_PATHS:
+        _add_candidate(urljoin(base_url, path))
 
     discovered = []
+    seen_bodies = set()
     for url in candidate_urls:
         if len(discovered) >= max_pages:
             break
@@ -2637,73 +2816,103 @@ def discover_sitemaps_and_feeds(site_url, site_id, max_pages):
                              purpose='source-discovery')
             if resp.status_code != 200:
                 continue
-            ct = resp.headers.get('Content-Type', '')
-            body_start = resp.text[:500] if isinstance(resp.text, str) else resp.content[:500].decode('utf-8', errors='ignore')
-            
-            # Handle gzip content
-            if ct == 'application/gzip' or url.endswith('.gz'):
-                try:
-                    body_start = gzip.decompress(resp.content[:1000]).decode('utf-8', errors='ignore')[:500]
-                except Exception:
-                    pass
-            
-            if '<urlset' in body_start or '<sitemapindex' in body_start or 'xml' in ct:
-                item_type = 'sitemap'
-            elif '<rss' in body_start or '<feed' in body_start or 'rss' in ct or 'atom' in ct:
-                item_type = 'rss' if '<rss' in body_start else 'atom'
-            else:
+
+            item_type = _classify_discovery_body(resp.content,
+                                                 resp.headers.get('Content-Type', ''))
+            if not item_type:
                 continue
+
+            # A soft-404 that serves the homepage (or any identical body) for
+            # every probe must not register the same source several times.
+            body_hash = hashlib.sha1(resp.content[:5000]).hexdigest()
+            if body_hash in seen_bodies:
+                continue
+            seen_bodies.add(body_hash)
             discovered.append({'url': url, 'type': item_type})
         except Exception as e:
             log_error(f"Could not probe discovered source {url}", e)
 
-    for item in discovered:
-        try:
-            execute_db(
-                "INSERT OR IGNORE INTO sitemaps_feeds (site_id, url, type) VALUES (?, ?, ?)",
-                (site_id, item['url'], item['type']), commit=True
-            )
-        except Exception:
-            pass
     return discovered
 
 
+def _maybe_gunzip(content, url=''):
+    """Transparently decompress a gzip body, detected by magic bytes.
+
+    Servers routinely serve a ``.xml.gz`` sitemap with a wrong (or missing)
+    ``Content-Type``, so sniffing the ``\x1f\x8b`` magic is more reliable than
+    trusting the header or the file extension.
+    """
+    if not content or content[:2] != b'\x1f\x8b':
+        return content
+    try:
+        return gzip.decompress(content)
+    except Exception:
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(content)) as handle:
+                return handle.read()
+        except Exception:
+            return content
+
+
+def _parse_sitemap_locs(content):
+    """Return ``(locs, is_index)`` for a sitemap document.
+
+    Uses the XML parser (falling back to the lenient HTML one) and reads
+    ``<loc>`` regardless of XML namespace, so both ``<urlset>`` and
+    ``<sitemapindex>`` documents are handled uniformly.
+    """
+    soup = None
+    for parser in ('xml', 'lxml'):
+        try:
+            soup = BeautifulSoup(content, parser)
+            break
+        except Exception:
+            soup = None
+    if soup is None:
+        return [], False
+    locs = [loc.text.strip() for loc in soup.find_all('loc') if (loc.text or '').strip()]
+    return locs, bool(soup.find('sitemapindex'))
+
+
 def parse_sitemap(url, max_depth=MAX_SITEMAP_RECURSION, current_depth=0):
-    """Parse sitemap with gzip support and recursion limit."""
+    """Parse a sitemap (optionally gzipped) and return its page URLs.
+
+    Handles ``<sitemapindex>`` recursion, gzip served under any content type,
+    whitespace inside ``<loc>`` and de-duplicates the result. Recursion is
+    bounded by ``MAX_SITEMAP_RECURSION`` and the output by ``MAX_SITEMAP_URLS``.
+    """
     if current_depth > max_depth:
         return []
-    
-    urls = []
+
     try:
         resp = _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
                          purpose='sitemap-fetch')
         if resp.status_code != 200:
             return []
-        
-        content = resp.content
-        ct = resp.headers.get('Content-Type', '')
-        
-        # Handle gzip
-        if ct == 'application/gzip' or url.endswith('.gz'):
-            try:
-                content = gzip.decompress(content)
-            except Exception:
-                pass
-        
-        soup = BeautifulSoup(content, 'lxml')
-        if soup.find('sitemapindex'):
-            for s in soup.find_all('sitemap'):
-                loc = s.find('loc')
-                if loc:
-                    urls.extend(parse_sitemap(loc.text, max_depth, current_depth + 1))
-        else:
-            for u in soup.find_all('url'):
-                loc = u.find('loc')
-                if loc:
-                    urls.append(loc.text)
+        content = _maybe_gunzip(resp.content, url)
+    except Exception as e:
+        print(f"Error fetching sitemap {url}: {e}")
+        return []
+
+    try:
+        locs, is_index = _parse_sitemap_locs(content)
     except Exception as e:
         print(f"Error parsing sitemap {url}: {e}")
-    
+        return []
+
+    urls = []
+    seen = set()
+    for loc in locs:
+        if is_index:
+            candidates = parse_sitemap(loc, max_depth, current_depth + 1)
+        else:
+            candidates = [normalize_url(loc)]
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                urls.append(candidate)
+        if len(urls) >= MAX_SITEMAP_URLS:
+            break
     return urls[:MAX_SITEMAP_URLS]
 
 
@@ -2725,9 +2934,61 @@ def parse_feed(url):
     return urls
 
 
+def _is_crawlable_link(url, domain):
+    """True when ``url`` is a same-domain HTML page worth queueing.
+
+    Rejects non-HTTP schemes (``mailto:``, ``javascript:``, ``tel:``), links
+    that leave ``domain`` and obvious binary assets. Fragments are already
+    stripped by :func:`canonicalize_url`, so anchors collapse onto their page.
+    """
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    if domain and get_domain(url) != domain:
+        return False
+    path = (parsed.path or '').lower()
+    if path.endswith(SKIP_LINK_EXTENSIONS):
+        return False
+    return True
+
+
+def extract_links_from_soup(soup, base_url, domain=None, limit=None):
+    """Return canonical, same-domain page links found in a parsed document.
+
+    Resolves relative and absolute ``href`` values against ``base_url``, drops
+    assets/other domains and de-duplicates the result. Pure function so the
+    homepage crawler and the per-page link discovery share one implementation.
+    """
+    if limit is None:
+        limit = MAX_LINKS_PER_PAGE
+    if domain is None:
+        domain = get_domain(base_url)
+    seen = set()
+    links = []
+    for anchor in soup.find_all('a', href=True):
+        href = (anchor.get('href') or '').strip()
+        if not href or href.startswith(('#', 'mailto:', 'javascript:', 'tel:', 'data:')):
+            continue
+        try:
+            absolute = urljoin(base_url, href)
+        except Exception:
+            continue
+        canonical = canonicalize_url(absolute, base_url=base_url)
+        if not canonical or canonical in seen:
+            continue
+        if not _is_crawlable_link(canonical, domain):
+            continue
+        seen.add(canonical)
+        links.append(canonical)
+        if len(links) >= limit:
+            break
+    return links
+
+
 def crawl_homepage_for_links(site_url, max_pages):
     urls = []
-    domain = get_domain(site_url)
     try:
         if not is_allowed(site_url):
             return []
@@ -2736,15 +2997,54 @@ def crawl_homepage_for_links(site_url, max_pages):
                          purpose='homepage-crawl')
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content, 'lxml')
-            for a in soup.find_all('a', href=True):
-                full_url = normalize_url(urljoin(site_url, a['href']))
-                if get_domain(full_url) == domain and full_url not in urls:
-                    urls.append(full_url)
-                if len(urls) >= max_pages:
-                    break
+            urls = extract_links_from_soup(soup, site_url, limit=max_pages)
     except Exception as e:
         log_error(f"Homepage crawl failed for {site_url}", e)
     return urls
+
+
+def _site_remaining_budget(site_id):
+    """How many more URLs a site may still index before hitting ``max_pages``.
+
+    Counts indexed pages plus everything already queued, so following links
+    cannot push a site past the limit the user configured.
+    """
+    site = get_site_by_id(site_id) or {}
+    max_pages = int(site.get('max_pages') or 500)
+    try:
+        used = execute_db_fetchone(
+            """SELECT (SELECT COUNT(*) FROM pages WHERE site_id = ?)
+                    + (SELECT COUNT(*) FROM crawl_queue
+                       WHERE site_id = ? AND status IN ('pending', 'locked'))""",
+            (site_id, site_id)
+        )[0]
+    except Exception:
+        return 0
+    return max(0, max_pages - int(used or 0))
+
+
+def discover_page_links(site_id, base_url, html, remaining_budget):
+    """Queue same-domain links found on a just-crawled page.
+
+    This is what makes the crawl actually follow ``<a href>`` links instead of
+    only indexing whatever a sitemap happened to list. ``remaining_budget``
+    caps how many new URLs may be added so a site cannot exceed its max_pages.
+    Returns the number of links queued.
+    """
+    if remaining_budget <= 0 or MAX_LINKS_PER_PAGE <= 0 or not html:
+        return 0
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+    except Exception:
+        return 0
+    links = extract_links_from_soup(soup, base_url, limit=MAX_LINKS_PER_PAGE)
+    queued = 0
+    for link in links:
+        if queued >= remaining_budget:
+            break
+        if _queue_url(site_id, link, DEFAULT_QUEUE_PRIORITY):
+            queued += 1
+    return queued
 
 
 def _queue_url(site_id, url, priority=None, allow_indexed_refresh=False,
@@ -3055,8 +3355,12 @@ def phase_1_discovery(site_url, max_pages=500, allow_indexed_refresh=False):
             for u in parse_feed(item['url']):
                 _remember(u, 1)
 
-    if not urls_to_add:
-        for u in crawl_homepage_for_links(site_url, max_pages):
+    # Always walk the homepage for links, not only when no sitemap was found:
+    # sitemaps are often stale or partial, and following <a href> is what makes
+    # a crawl actually cover the site. Bounded by the remaining max_pages budget.
+    remaining_for_links = max(max_pages - added - len(urls_to_add), 0)
+    if remaining_for_links > 0:
+        for u in crawl_homepage_for_links(site_url, remaining_for_links):
             _remember(u, 5)
 
     for url, priority in urls_to_add:
@@ -3904,7 +4208,10 @@ def process_url(queue_id, site_id, url):
             )
             return
 
-        page_data = extract_page_content(url, site_id, response=resp)
+        # Decode once and hand the parsed HTML to both extraction and link
+        # discovery, so following <a href> costs no extra network round-trip.
+        _raw, html = _decode_response(resp)
+        page_data = extract_page_content(url, site_id, response=resp, html=html)
         if page_data is None:
             _set_queue_retry_or_error(queue_id, "Extraction returned no content", retryable=True)
             return
@@ -3915,6 +4222,16 @@ def process_url(queue_id, site_id, url):
             "UPDATE crawl_queue SET status='completed', locked_by='', scheduled_at=0, error_reason='' WHERE id=?",
             (queue_id,), commit=True
         )
+
+        # Follow the links on the page we just indexed. Budget counts what the
+        # site already holds so max_pages is respected across the whole crawl.
+        try:
+            remaining = _site_remaining_budget(site_id)
+            queued = discover_page_links(site_id, page_data['url'], html, remaining)
+            if queued:
+                print(f"Discovered {queued} new link(s) on {page_data['url']}")
+        except Exception as e:
+            log_error(f"Link discovery failed for {url}", e)
 
     except FetchError as e:
         log_error(f"Fetch failed for queue item {queue_id} ({url})", e.exc or e)
@@ -5581,17 +5898,15 @@ if __name__ == '__main__':
     get_db()
     print('Database initialized')
 
-    if embeddings_enabled():
-        get_hnsw_index()
+    # Vector search is a pure optimisation: crawl, sitemap and link discovery
+    # never depend on it, and lowmem only turns the embeddings off. If the
+    # hnswlib/model stack is unavailable we say so and fall back to FTS5.
+    if embeddings_enabled() and get_hnsw_index() is not None:
         print('hnswlib index initialized')
-
-    # Loading the sentence-transformer model is the single largest RAM cost; in
-    # low-memory mode we never touch it and search stays on FTS5.
-    if embeddings_enabled():
-        get_model()
+    if embeddings_enabled() and get_model() is not None:
         print('Model loaded')
     else:
-        print('Embeddings disabled (low-memory mode) - FTS5 fallback active')
+        print('Embeddings off - FTS5 fallback active (crawling unaffected)')
 
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(check_feeds,      IntervalTrigger(hours=1),  id='check_feeds')
