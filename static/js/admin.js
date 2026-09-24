@@ -30,14 +30,28 @@
 
         var typeSelect = form.querySelector('[name="source_type"]');
         var urlInput = form.querySelector('[name="url"]');
+        var wikiOptions = form.querySelector('#wiki-options');
+        var importerSelect = form.querySelector('[name="importer"]');
         var detected = false;
+
+        function syncWikiOptions() {
+            if (!wikiOptions || !typeSelect) return;
+            wikiOptions.style.display = typeSelect.value === 'wiki' ? '' : 'none';
+        }
+
+        if (typeSelect) {
+            typeSelect.addEventListener('change', syncWikiOptions);
+            syncWikiOptions();
+        }
 
         if (typeSelect && urlInput) {
             urlInput.addEventListener('input', function () {
                 if (detected || typeSelect.value !== 'url') return;
                 var value = urlInput.value.toLowerCase();
                 var guess = null;
-                if (value.indexOf('sitemap') !== -1 || /\.xml(\.gz)?$/.test(value)) {
+                if (value.indexOf('wikipedia.org') !== -1 || value.indexOf('wikimedia.org') !== -1 || value.indexOf('file://') === 0) {
+                    guess = 'wiki';
+                } else if (value.indexOf('sitemap') !== -1 || /\.xml(\.gz)?$/.test(value)) {
                     guess = 'sitemap';
                 } else if (value.indexOf('feed') !== -1 || value.indexOf('/rss') !== -1 || /\.(rss|atom)$/.test(value)) {
                     guess = 'rss';
@@ -45,6 +59,10 @@
                 if (guess) {
                     typeSelect.value = guess;
                     detected = true;
+                    syncWikiOptions();
+                    if (guess === 'wiki' && importerSelect && value.indexOf('file://') === 0) {
+                        importerSelect.value = 'dump';
+                    }
                 }
             });
         }

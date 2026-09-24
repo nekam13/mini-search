@@ -18,7 +18,13 @@ python3 tests/test_search_page.py            # public search page, filters, XSS,
 python3 tests/test_source_indexing.py        # new-source auto-indexing + dashboard data
 python3 tests/test_local_sites.py            # local-network detection, robots bypass, boost
 python3 tests/test_local_indexing_smoke.py   # live local HTTP server: crawl + index end to end
+python3 tests/test_wiki_import.py            # wiki dump/API importer, idempotency, resume
+python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 ```
+
+All suites are deterministic and offline: network behaviour runs against a
+throwaway local HTTP server, and the wiki importer test writes a small bz2 dump
+to a temp dir. Never point tests at the live Wikipedia.
 
 `tests/test_search_page.py` prints `PASS:` lines and an `ALL ... PASSED` summary;
 `test_admin_panel.py` prints `ALL ADMIN TESTS PASSED`.
@@ -74,6 +80,51 @@ broken to the user. `index_source(source_id)` holds the per-type queueing logic
 calls in `index_source_async()` / `recrawl_async()` so the HTTP request returns
 without waiting on robots.txt/sitemap fetches. Sources with `status='paused'`
 are skipped.
+
+## Czech Wikipedia importer
+
+`wiki` is a source type served by the importer, not the crawler.
+`normalize_wiki_source(url, importer)` maps `cs` / `wiki:cs` /
+`cs.wikipedia.org` / `file:///…/cswiki-….xml.bz2` onto `(site_url, importer,
+lang)`; the stored source URL is the language selector (or the dump path), and
+`lang_from_wiki_url()` infers the language from a dump filename.
+
+`run_wiki_import(source, max_pages, allow_indexed_refresh)` streams articles one
+at a time through `_iter_wiki_articles()`, which dispatches to
+`_iter_wiki_articles_dump()` (pull-mode `xml.etree.iterparse`, never loads the
+whole dump) or `_iter_wiki_articles_api()` (batched `allpages` + `extracts`).
+Facts to preserve:
+
+- Import is **idempotent** via `url_hash` dedup; progress (`next_title`,
+  `imported`) lives in `site_sources.import_state` so a paused/capped run
+  resumes instead of restarting.
+- Redirects become **site aliases**, not pages; non-encyclopaedic namespaces are
+  skipped (`_WIKI_SKIP_NAMESPACES`).
+- `max_pages` is honoured, and `index_source()` skips `status='paused'` sources.
+- `phase_1_discovery()` returns early for a site that already has a wiki source,
+  so the generic crawler never touches wikipedia.org.
+- `xml.etree` elements are falsy when childless — use `_xml_child()` instead of
+  `find(...) or find(...)`, which silently drops `<text>`.
+- CLI: `python3 app_combined.py --import-wiki …` / `--source-id N` runs an
+  import without starting the server.
+
+## Crawler metadata
+
+`extract_page_content()` parses the *decoded* text (not raw bytes) so a
+`windows-1250` Czech page is not mangled; raw bytes still go to `_extract_jsonld`.
+`_extract_jsonld()` tolerates malformed blocks by falling back to per-script
+parsing (`_jsonld_scripts`). Transient HTTP statuses are retried centrally in
+`_http_get()` (`RETRYABLE_HTTP_STATUSES`, `_retry_delay` / `_retry_after_delay`),
+so callers must not re-implement backoff.
+
+## Low-memory mode
+
+`MINISEARCH_PROFILE=lowmem` (or `MINISEARCH_LOWMEM=1`) sets `LOW_MEMORY_MODE`,
+which disables embeddings and drops the worker count. `embeddings_enabled()` is
+the runtime check: `get_hnsw_index()` returns `None`, `generate_embedding()`
+returns `None` and `vector_search()` returns `[]` when off, so `hybrid_search()`
+falls back to FTS5. `_recover_interrupted_queue()` runs at `start_workers()`
+and returns `locked` rows to `pending` after a crash.
 
 ## Site stats keys
 
