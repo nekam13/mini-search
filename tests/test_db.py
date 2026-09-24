@@ -255,6 +255,73 @@ def test_site_sources_table():
     print("Test 8: site_sources Table - PASSED")
 
 
+def test_migration_preserves_data():
+    """Test 9: Migrace stáří DB -> 7.5 nesmí ztratit řádky ani stav importu."""
+    import sys
+    import tempfile
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import app_combined as m
+
+    tmpdir = tempfile.mkdtemp()
+    old_path = os.path.join(tmpdir, "old.db")
+
+    # Postav databázi ve starém tvaru: CHECK bez 'wiki', bez importer sloupců.
+    old = sqlite3.connect(old_path)
+    old.execute("""CREATE TABLE sites (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        canonical_url TEXT UNIQUE, aliases TEXT DEFAULT '[]', status TEXT DEFAULT 'active',
+        error_count INTEGER DEFAULT 0, last_crawled INTEGER DEFAULT 0,
+        max_pages INTEGER DEFAULT 500, crawl_delay REAL DEFAULT 1.0,
+        created_at INTEGER DEFAULT 0)""")
+    old.execute("""CREATE TABLE site_sources (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_id INTEGER NOT NULL, url TEXT NOT NULL,
+        source_type TEXT NOT NULL CHECK(source_type IN ('domain','url','sitemap','feed','rss','atom')),
+        priority INTEGER DEFAULT 5, notes TEXT DEFAULT '', last_checked INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active', created_at INTEGER DEFAULT 0)""")
+    old.execute("INSERT INTO sites (canonical_url) VALUES ('https://example.com')")
+    old.execute("""INSERT INTO site_sources (site_id, url, source_type, notes, last_checked)
+                   VALUES (1, 'https://example.com/blog', 'url', 'starý zdroj', 12345)""")
+    old.commit()
+    old.close()
+
+    m.close_db()
+    m.DB_PATH = old_path
+    m._db_conn = None
+    try:
+        m.get_db()
+        # _migrate_sources adds a domain source per site; the original URL source
+        # must survive untouched alongside it.
+        rows = m.execute_db_fetchall(
+            "SELECT url, source_type, notes, last_checked FROM site_sources WHERE url = ?",
+            ("https://example.com/blog",))
+        assert len(rows) == 1, f"source row lost/duplicated: {rows}"
+        assert rows[0]["source_type"] == "url"
+        assert rows[0]["notes"] == "starý zdroj"
+        assert rows[0]["last_checked"] == 12345, rows[0]["last_checked"]
+
+        # Nové sloupce existují a mají výchozí hodnoty.
+        row = m.execute_db_fetchone(
+            "SELECT importer, import_state FROM site_sources WHERE url = ?",
+            ("https://example.com/blog",))
+        assert row["importer"] == "" and row["import_state"] == "", tuple(row)
+
+        # 'wiki' je nyní přijímán CHECK constraintem.
+        before = len(m.execute_db_fetchall("SELECT id FROM site_sources"))
+        m.execute_db(
+            "INSERT INTO site_sources (site_id, url, source_type) VALUES (1, 'cs', 'wiki')",
+            commit=True)
+
+        # Opakovaná migrace musí být bezpečná (idempotentní).
+        m._migrate_db(m.get_db())
+        assert len(m.execute_db_fetchall("SELECT id FROM site_sources")) == before + 1
+    finally:
+        m.close_db()
+        m.DB_PATH = os.path.join(tmpdir, "console.db")
+        m._db_conn = None
+        m.get_db()
+
+    print("Test 9: Migration preserves data - PASSED")
+
+
 if __name__ == "__main__":
     test_db_schema()
     test_db_indexes()
@@ -264,4 +331,5 @@ if __name__ == "__main__":
     test_foreign_keys_cascade()
     test_fts5_czech()
     test_site_sources_table()
-    print("\nVsech 8 testu prochazi!")
+    test_migration_preserves_data()
+    print("\nVsech 9 testu prochazi!")

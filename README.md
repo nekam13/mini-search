@@ -250,7 +250,12 @@ python3 tests/test_search_page.py            # vyhledávací stránka, filtry, X
 python3 tests/test_source_indexing.py        # auto-indexace nových zdrojů a data dashboardu
 python3 tests/test_local_sites.py            # lokální sítě: detekce, robots.txt, boost
 python3 tests/test_local_indexing_smoke.py   # živý lokální HTTP server: crawl a indexace
+python3 tests/test_wiki_import.py            # wiki importér: dump, API, idempotence, resume
+python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 ```
+
+Všechny testy jsou deterministické a běží bez živého internetu – síťová část
+používá lokální HTTP server a wiki import malý lokální dump.
 
 ## Lokální weby (místní síť)
 
@@ -288,6 +293,111 @@ Výsledky jsou řazeny kombinací:
 - **60% vektorové podobnosti** (hnswlib + SentenceTransformers)
 - **35% full-text vyhledávání** (FTS5 s unicode61 tokenizerem pro češtinu)
 - **5% SEO skóre** (přítomnost titulku, popisu, schema markup, atd.)
+
+## Česká Wikipedie
+
+Wikipedie se indexuje **nativním importérem**, ne obecným crawlerem. Jsou dvě
+varianty a obě streamují data po jednom článku, takže se nikdy nenačte celý
+dump do paměti:
+
+| Importér | Co dělá | Kdy se hodí |
+|---|---|---|
+| `api` (výchozí) | Prochází MediaWiki API po dávkách (`allpages` + `extracts`). Neukládá nic na disk. | Rychlý start, telefon, kdy není místo na dump. |
+| `dump` | Streamuje lokálně stažený `cswiki-*-pages-articles-multistream.xml.bz2` přes `xml.etree` v pull režimu. | Offline, hromadný import bez tisíců HTTP dotazů a bez rate limitů. |
+
+### Přidání v adminu
+
+V adminu na **Přidat zdroj** zvolte typ **Wikipedie** a jako URL zadejte:
+
+- `cs` nebo `wiki:cs` – jazykový kód (výchozí je `cs`),
+- `cs.wikipedia.org` – doména,
+- `file:///cesta/cswiki-latest-pages-articles-multistream.xml.bz2` – lokální dump.
+
+Importér (`api`/`dump`) se u `file://` předvyplní na `dump` automaticky.
+Do pole **Max stránek** u domény zadejte, kolik článků se má indexovat.
+
+### Import z příkazové řádky (Termux)
+
+Pro hromadný import doporučujeme jednorázový příkaz místo běžící aplikace:
+
+```bash
+# Stažení českého dumpu (jednorázově, ~1 GB; uložte mimo repozitář)
+mkdir -p ~/wiki-dumps
+cd ~/wiki-dumps
+curl -LO https://dumps.wikimedia.org/cswiki/latest/cswiki-latest-pages-articles-multistream.xml.bz2
+
+# Import prvních 5000 článků
+python3 app_combined.py --import-wiki "file://$HOME/wiki-dumps/cswiki-latest-pages-articles-multistream.xml.bz2" --max-pages 5000
+
+# Pokračování v přerušeném importu (stav se ukládá u zdroje)
+python3 app_combined.py --source-id 1 --max-pages 5000
+
+# Import celého dumpu (opakuje dávky, dokud nepřestanou přibývat články)
+python3 app_combined.py --import-wiki "file://$HOME/wiki-dumps/....xml.bz2" --all
+
+# Bez lokálního úložiště, rovnou z API
+python3 app_combined.py --import-wiki cs --max-pages 2000
+```
+
+- **Idempotence**: opakovaný import stejný článek nezdvojí (`url_hash` dedup).
+  Dump se čte od titulu podle uloženého `next_title`, takže navázání pokračuje
+  tam, kde se přestalo.
+- **Pozastavení**: zdroj se stavem `paused` importer přeskočí.
+- **Filtrování**: přesměrování se neukládají jako stránky, ale jako aliasy webu
+  (hledání na přesměrovaný název tak najde cílový článek). Diskusní, uživatelské,
+  kategoriální, šablonové a další neencyklopedické jmenné prostory se přeskakují.
+- **Diakritika**: text se ukládá v originále a zobrazuje se s diakritikou, ale FTS
+  dotazy se skládají z „odháčkované“ podoby. Dotaz `cesky` tedy najde `český`
+  a naopak; zvýraznění `<mark>` se aplikuje až po escapování (`_highlight_snippet`).
+
+### Úložiště a RAM
+
+Dump se **nikdy necommituje** (viz `.gitignore`) a drží se mimo repozitář. Během
+importu je v paměti vždy jeden článek. Vektorové embeddingy se v
+nízkopaměťovém režimu úplně vynechávají a hledání se opírá o FTS5.
+
+## Nízkopaměťový režim (Termux/Android)
+
+`MINISEARCH_PROFILE=lowmem` (nebo `MINISEARCH_LOWMEM=1`) přepne všechny drahé
+výchozí hodnoty najednou. Konfigurace se čte z prostředí:
+
+| Proměnná | Výchozí | Význam |
+|---|---|---|
+| `MINISEARCH_PROFILE` | – | `lowmem` = úsporný režim pro mobil |
+| `MINISEARCH_WORKERS` | 1 (lowmem) / 2 | Počet crawlovacích vláken |
+| `MINISEARCH_EMBEDDINGS` | 1 (0 v lowmem) | Zapnout vektorové embeddingy |
+| `MINISEARCH_REQUEST_TIMEOUT` | 30 | HTTP timeout (s) |
+| `MINISEARCH_MAX_RETRIES` | 3 | Počet pokusů u síťových chyb |
+| `MINISEARCH_RETRY_MAX_DELAY` | 5 | Strop exponenciálního backoffu (s) |
+| `MINISEARCH_MAX_BODY_CHARS` | 3500 | Max délka těla stránky |
+| `MINISEARCH_WIKI_LANG` | `cs` | Výchozí jazyk Wikipedie |
+| `MINISEARCH_WIKI_BATCH` | 50 | Dávka pro wiki API |
+| `MINISEARCH_WIKI_API_BASE` | – | Mirror MediaWiki API (např. pro testy) |
+
+```bash
+export MINISEARCH_PROFILE=lowmem
+export MINISEARCH_WORKERS=1
+./start.sh
+```
+
+Po přerušení (kill/crash) se při startu řádky fronty, které zůstaly v `locked`,
+vrátí zpět do `pending`, takže se zpracování samo obnoví.
+
+## Zpracování stránek a crawler
+
+- **Canonical URL**: přednostně se použije `<link rel="canonical">`, tracking
+  parametry se odstraňují, duplicitní stránky se sloučí pod stejný `url_hash`.
+- **Kódování**: respektuje se `charset` z HTTP hlavičky i z meta tagu
+  (včetně `windows-1250` pro staré české weby).
+- **Metadata**: OpenGraph, Twitter Card a Schema.org JSON-LD (vnořené `@graph`,
+  pole `@type`, poškozené bloky se přeskočí, ne zahodí) – autor, datum,
+  breadcrumbs, obrázky, audio a typ článku.
+- **robots.txt a crawl-delay**: načítají se přes společné HTTP vrstvy s timeoutem
+  a User-Agent; u lokálních webů a Wikipedie se robots.txt obchází.
+- **Retry/backoff**: přechodné stavy (429, 500, 502, 503, 504, 408, 425) se
+  opakují s exponenciálním zpožděním; `429` respektuje `Retry-After`.
+- **Odolnost**: jeden velký nebo poškozený článek nezastaví ostatní; těla stránek
+  se ořezávají na `MINISEARCH_MAX_BODY_CHARS`.
 
 ## Data a úložiště
 
