@@ -1,0 +1,78 @@
+{% extends "admin/base.html" %}
+{% block title %}Nastavení{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>Nastavení aplikace</h2>
+        <span class="muted">Hodnoty se ukládají do databáze a platí okamžitě</span>
+    </div>
+    <p class="hint">
+        Výchozí hodnoty pocházejí z proměnných prostředí (vhodné pro Termux/Ubuntu).
+        Co zde uložíte, má přednost před prostředím. Položky označené
+        <span class="badge restart-badge">restart</span> se projeví po restartu aplikace.
+    </p>
+    {% if restart_needed %}
+    <div class="msg msg-accent">Některé změny vyžadují restart aplikace, aby se projevily.</div>
+    {% endif %}
+</div>
+
+<form method="post" action="/admin/settings">
+    {% for group in groups %}
+    <div class="card">
+        <div class="card-header"><h2>{{ group.label }}</h2></div>
+        <div class="form-row">
+            {% for item in group['items'] %}
+            <div class="form-group">
+                <label for="setting__{{ item.key }}">
+                    {{ item.label }}
+                    {% if item.restart %}<span class="badge restart-badge" title="Vyžaduje restart">restart</span>{% endif %}
+                </label>
+                {% if item.kind == 'bool' %}
+                <label class="checkbox-label">
+                    <input type="checkbox" id="setting__{{ item.key }}"
+                           name="setting__{{ item.key }}" value="1"
+                           {% if item.value %}checked{% endif %}>
+                    Zapnuto
+                </label>
+                {% elif item.kind == 'choice' %}
+                <select id="setting__{{ item.key }}" name="setting__{{ item.key }}">
+                    {% for choice in item.choices %}
+                    <option value="{{ choice }}" {% if item.value|string == choice %}selected{% endif %}>
+                        {% if choice == 'auto' %}auto (podle RAM a baterie)
+                        {% elif choice == '1' %}zapnuto
+                        {% elif choice == '0' %}vypnuto
+                        {% else %}{{ choice }}{% endif %}
+                    </option>
+                    {% endfor %}
+                </select>
+                {% elif item.kind == 'int' %}
+                <input type="number" id="setting__{{ item.key }}" name="setting__{{ item.key }}"
+                       value="{{ item.value }}"
+                       {% if item.min is not none %}min="{{ item.min }}"{% endif %}
+                       {% if item.max is not none %}max="{{ item.max }}"{% endif %}>
+                {% else %}
+                <input type="text" id="setting__{{ item.key }}" name="setting__{{ item.key }}"
+                       value="{{ item.value }}">
+                {% endif %}
+                <div class="hint">
+                    {{ item.help }}
+                    {% if item.env %}<br>Proměnná prostředí: <code>{{ item.env }}</code>{% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+
+    <div class="card">
+        <div class="actions">
+            <button type="submit" class="btn btn-primary">Uložit nastavení</button>
+            <button type="submit" name="action" value="reset" class="btn btn-ghost"
+                    onclick="return confirm('Obnovit všechna nastavení na výchozí hodnoty z prostředí?')">
+                Obnovit výchozí
+            </button>
+        </div>
+    </div>
+</form>
+{% endblock %}

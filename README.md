@@ -2,7 +2,7 @@
 
 Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje stránky, ukládá jejich metadata a text do SQLite a používá vektorové vyhledávání pro sémanticky podobné výsledky.
 
-> **Aktuální vývojová větev: `beta-optimized` (v7.4)**
+> **Aktuální vývojová větev: `beta-optimized` (v7.5)**
 
 ## Funkce
 
@@ -184,11 +184,16 @@ i RAM na mobilu a zároveň zůstávají obrázky dostupné u výsledků.
 
 - `MINISEARCH_IMAGE_RESULTS` (výchozí 12, `0` sekci vypne) určuje, kolik
   obrázků se má nejvýše zobrazit.
+- Filtr **Obrázky** (`/?q=…&filter=images`) zobrazí obrázky jako hlavní
+  výsledek – prohledá širší okno indexu a vysbírá náhledy z nalezených stránek.
+  Kolik jich nejvýše vrátí, určuje `MINISEARCH_IMAGE_SEARCH_LIMIT` (výchozí 60).
 - URL obrázků projdou kontrolou `_safe_image_url()` – povoleny jsou jen
   `http(s)` adresy, `javascript:` a `data:` se zahazují (XSS ochrana).
 - Náhledy se načítají líně (`loading="lazy"`) a bez referreru.
 - Styly jsou v `static/css/search.css` (`.image-grid`, `.image-card`), tokeny
   zůstávají pouze v `clay.css`.
+- Import z Wikipedie ukládá k článku i obrázky (viz níže), takže sekce
+  „Obrázky" má co zobrazit i bez crawlování webu.
 
 ## Admin panel (Clay design)
 
@@ -204,6 +209,26 @@ Admin rozhraní je postavené na Flask šablonách (`templates/admin/`) a static
 | Přidat zdroj | `/admin/sources/new` | Doména, URL, sitemap, RSS/Atom feed |
 | Editace zdroje | `/admin/sources/<id>/edit` | URL, typ, priorita, poznámka, `max_pages` |
 | Hledat v indexu | `/admin/search` | Fulltext/hybridní vyhledávání v indexovaných stránkách |
+| Nastavení | `/admin/settings` | Runtime nastavení (váhy, crawler, wiki, údržba) |
+
+### Nastavení v adminu (`/admin/settings`)
+
+Většina voleb byla dříve jen v proměnných prostředí. Nyní je lze pohodlně měnit
+v adminu; hodnota se uloží do tabulky `app_settings` a **má přednost před
+prostředím**. Většina změn platí okamžitě, položky označené `restart` se
+projeví až po restartu aplikace (např. počet crawlovacích vláken nebo plán
+noční údržby).
+
+- Skupiny: **Vyhledávání**, **Crawler**, **Automatická obnova**, **Wikipedie**,
+  **Vektorové hledání**, **Noční údržba**.
+- U každé položky je vidět, kterou proměnnou prostředí se seeduje
+  (`MINISEARCH_*`), takže je jasné, odkud hodnota pochází.
+- Tlačítko **Obnovit výchozí** smaže všechny uložené přepisy a vrátí hodnoty
+  z prostředí.
+- JSON varianta pro skripty: `GET/POST /admin/api/settings`
+  (`{"settings": {"search.vector_weight": 55}}`, resp. `{"action": "reset"}`).
+
+Port aplikace se nastavuje přes `MINISEARCH_PORT` (výchozí `8070`).
 
 ### Hierarchie zdrojů
 
@@ -298,6 +323,7 @@ python3 tests/test_wiki_import.py            # wiki importér: dump, API, idempo
 python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/backoff, lowmem
 python3 tests/test_rich_cards.py             # Rich Results karty, XSS, auto-migrace a úklid
 python3 tests/test_maintenance.py            # noční údržba: dedup, vektory, wiki, mrtvé odkazy
+python3 tests/test_settings_images.py        # admin nastavení, filtr Obrázky, wiki obrázky
 ```
 
 Všechny testy jsou deterministické a běží bez živého internetu – síťová část
@@ -404,6 +430,13 @@ python3 app_combined.py --import-wiki cs --max-pages 2000
 - **Diakritika**: text se ukládá v originále a zobrazuje se s diakritikou, ale FTS
   dotazy se skládají z „odháčkované“ podoby. Dotaz `cesky` tedy najde `český`
   a naopak; zvýraznění `<mark>` se aplikuje až po escapování (`_highlight_snippet`).
+- **Obrázky**: k článku se ukládá i náhled pro samostatnou sekci „Obrázky".
+  API importér si vyžádá `pageimages` (jen URL, pár bajtů), dump importér sestaví
+  adresu z `[[Soubor:…]]` přes `Special:FilePath`. Na článek se ukládá nejvýše
+  `MINISEARCH_WIKI_IMAGES` (výchozí 3) obrázků, aby galerie nenafoukla úložiště.
+  Obrázky se **neindexují jako stránky**, jsou jen metadata u článku.
+- **Nastavení**: jazyk, velikost dávky a počet pokusů lze měnit i v adminu na
+  `/admin/settings` (skupina **Wikipedie**).
 
 ### Úložiště a RAM
 

@@ -24,6 +24,7 @@ python3 tests/test_rich_cards.py             # Rich Result cards, XSS, self-migr
 python3 tests/test_maintenance.py            # nightly maintenance: dedup, vectors, wiki, dead links
 python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, lowmem scope
 python3 tests/test_search_quality.py         # charset, asset filtering, weights, image section
+python3 tests/test_settings_images.py        # admin settings, images filter, wiki images
 ```
 
 `tests/test_crawler_discovery.py` and `tests/test_search_quality.py` run against a
@@ -56,7 +57,7 @@ Two Flask apps worth of UI live in one file, so keep them sharing assets:
   Both `templates/admin/base.html` and `templates/search.html` extend it.
 
 Nav highlighting uses an `active_page` template variable. Current keys:
-`search`, `dashboard`, `sites`, `add`, `index_search`.
+`search`, `dashboard`, `sites`, `add`, `index_search`, `settings`.
 
 ### Keep logic out of templates
 
@@ -120,13 +121,22 @@ Image URLs must never enter `pages`, the FTS index or the crawl queue:
   `_parse_sitemap_locs()`, which only reads direct-child `<loc>`.
 - Images are surfaced separately: `_collect_result_images(results, query, limit)`
   reads `og_image` and the `images` JSON column of the *already found* rows and
-  returns display-only dicts. `IMAGE_RESULTS_LIMIT` (12, 0 disables) caps it.
+  returns display-only dicts. `IMAGE_RESULTS_LIMIT` (12, 0 disables) caps the
+  section under the article list; `IMAGE_SEARCH_LIMIT` (60) caps the
+  `filter=images` mode, which searches a wider window and shows images as the
+  primary result (see the `filter_type == 'images'` branch in `search_index`).
 - `_safe_image_url()` only allows `http(s)` — reject `javascript:`/`data:` so a
   hostile `og:image` cannot become a script src. `prepare_results()` stays the
   place for display fields; `_collect_result_images` must accept raw
   `sqlite3.Row` objects (it normalises them to dicts internally).
 - The `templates/search.html` section is `.image-results`; its styling lives in
-  `static/css/search.css` (tokens still only in `clay.css`).
+  `static/css/search.css` (tokens still only in `clay.css`). The images section
+  sits *outside* the `{% if results %}` block so the images-only mode still
+  renders it; keep it there.
+- Wiki articles carry images too: the API importer requests `pageimages`
+  (`piprop=original`), the dump importer builds URLs from `[[Soubor:…]]` via
+  `Special:FilePath` (`_wiki_images_from_wikitext`), capped at
+  `WIKI_MAX_IMAGES_PER_ARTICLE` (3). Both land in the page's `images`/`og_image`.
 
 ## Charset handling
 
@@ -145,6 +155,25 @@ broken to the user. `index_source(source_id)` holds the per-type queueing logic
 calls in `index_source_async()` / `recrawl_async()` so the HTTP request returns
 without waiting on robots.txt/sitemap fetches. Sources with `status='paused'`
 are skipped.
+
+## Runtime settings
+
+`SETTINGS_SPEC` (near the top of `app_combined.py`) is the single source of truth
+for every admin-editable option: `global` names the module global it drives,
+`default` is seeded from the matching `MINISEARCH_*` var (`SETTINGS_ENV` maps the
+two), and `restart` flags the ones a background job only picks up on restart.
+
+- Persisted in the `app_settings` table; a stored value **overrides** the env.
+- `load_settings()` / `save_settings()` / `reset_settings()` validate (ints are
+  clamped, `choice` is whitelisted) and push values into the globals the code
+  already reads; `_refresh_derived_settings()` recomputes derived globals.
+- `settings_for_ui()` returns the grouped, display-ready structure
+  `templates/admin/settings.html` renders — no branching in HTML.
+- `get_db()` reads `app_settings` with the **raw cursor**, never via `execute_db`:
+  that would re-enter the non-reentrant `_db_lock` and deadlock.
+- Routes: `GET/POST /admin/settings`, `GET/POST /admin/api/settings`.
+- Port comes from `MINISEARCH_PORT` (`PORT`, default 8070) — `app.run` must use
+  it, not a literal.
 
 ## Czech Wikipedia importer
 

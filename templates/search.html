@@ -30,6 +30,7 @@
         <button type="button" class="filter-btn{% if current_filter == 'podcasts' %} active{% endif %}" data-filter="podcasts">Podcasty</button>
         <button type="button" class="filter-btn{% if current_filter == 'audio' %} active{% endif %}" data-filter="audio">Audio</button>
         <button type="button" class="filter-btn{% if current_filter == 'price' %} active{% endif %}" data-filter="price">Ceny</button>
+        <button type="button" class="filter-btn{% if current_filter == 'images' %} active{% endif %}" data-filter="images">Obrázky</button>
     </div>
 </div>
 
@@ -37,8 +38,14 @@
 <div class="card card-static">
     <div class="result-toolbar">
         <div>
-            <h2>Výsledky pro <span class="query-term">„{{ query }}“</span></h2>
-            <div class="result-count">{{ total_results }} {{ total_results|plural_cz('nalezený výsledek', 'nalezené výsledky', 'nalezených výsledků') }}{% if page > 1 %} · strana {{ page }}{% endif %}</div>
+            <h2>{% if current_filter == 'images' %}Obrázky pro{% else %}Výsledky pro{% endif %} <span class="query-term">„{{ query }}“</span></h2>
+            <div class="result-count">
+                {% if current_filter == 'images' %}
+                {{ image_results|length }} {{ image_results|length|plural_cz('obrázek', 'obrázky', 'obrázků') }}
+                {% else %}
+                {{ total_results }} {{ total_results|plural_cz('nalezený výsledek', 'nalezené výsledky', 'nalezených výsledků') }}{% if page > 1 %} · strana {{ page }}{% endif %}
+                {% endif %}
+            </div>
         </div>
         {% if results %}
         <div class="sort-control">
@@ -142,6 +149,7 @@
     </article>
     {% endfor %}
 </div>
+{% endif %}
 
 {% if image_results %}
 <section class="image-results" aria-label="Obrázky z nalezených stránek">
@@ -166,6 +174,26 @@
 </section>
 {% endif %}
 
+{% if not results and not image_results %}
+<div class="card card-static">
+    <div class="empty-state">
+        <div class="icon">∅</div>
+        <h3>Žádné výsledky</h3>
+        <p>
+            {% if current_filter == 'images' %}
+            Pro „{{ query }}“ se nenašly žádné obrázky. Zkuste jiný výraz nebo jiný filtr.
+            {% else %}
+            Pro „{{ query }}“ se nic nenašlo. Zkuste jiný výraz nebo přidejte zdroje ve správě.
+            {% endif %}
+        </p>
+        <div class="actions">
+            <a href="/admin/sources/new" class="btn btn-secondary">Přidat zdroj</a>
+            <a href="/" class="btn btn-ghost">Zrušit hledání</a>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {% if has_prev or has_next %}
 <nav class="pagination" aria-label="Stránkování výsledků">
     {% if has_prev %}
@@ -180,19 +208,6 @@
     <span class="disabled">Další</span>
     {% endif %}
 </nav>
-{% endif %}
-{% else %}
-<div class="card card-static">
-    <div class="empty-state">
-        <div class="icon">∅</div>
-        <h3>Žádné výsledky</h3>
-        <p>Pro „{{ query }}“ se nic nenašlo. Zkuste jiný výraz nebo přidejte zdroje ve správě.</p>
-        <div class="actions">
-            <a href="/admin/sources/new" class="btn btn-secondary">Přidat zdroj</a>
-            <a href="/" class="btn btn-ghost">Zrušit hledání</a>
-        </div>
-    </div>
-</div>
 {% endif %}
 
 {% else %}
