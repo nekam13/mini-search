@@ -163,6 +163,13 @@ MAX_LINKS_PER_PAGE = _env_int("MINISEARCH_MAX_LINKS_PER_PAGE", 100, 0, 5000)
 # Images come from the pages that matched, so this only bounds rendering, not
 # indexing; 0 hides the section entirely.
 IMAGE_RESULTS_LIMIT = _env_int("MINISEARCH_IMAGE_RESULTS", 12, 0, 100)
+# The dedicated image tab searches the whole page index and keeps every image
+# those pages carry, so it needs a wider window than the inline section.
+IMAGE_SEARCH_LIMIT = _env_int("MINISEARCH_IMAGE_SEARCH_LIMIT", 60, 0, 500)
+
+# Listening port. Kept at 8070 for existing installs, but overridable so a
+# hosted/Termux setup can bind whatever port its environment exposes.
+PORT = _env_int("MINISEARCH_PORT", 8070, 1, 65535)
 # File extensions that are never crawled as HTML pages.
 SKIP_LINK_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
@@ -205,6 +212,10 @@ HNSW_MAX_ELEMENTS = _env_int(
 WIKI_DEFAULT_LANG = os.environ.get("MINISEARCH_WIKI_LANG", "cs")
 WIKI_API_BATCH = _env_int("MINISEARCH_WIKI_BATCH", 50, 1, 50)
 WIKI_IMPORT_RETRIES = _env_int("MINISEARCH_WIKI_RETRIES", 3, 0, 10)
+# How many images per wiki article are stored for the image grid. The dump only
+# carries file names, so each one costs a short URL; a handful is plenty for a
+# thumbnail row and keeps a phone's storage flat.
+WIKI_MAX_IMAGES_PER_ARTICLE = _env_int("MINISEARCH_WIKI_IMAGES", 3, 0, 20)
 # Optional API base for a Wikimedia mirror or a deterministic test server. When
 # unset the standard ``https://<lang>.wikipedia.org`` host is used.
 WIKI_API_BASE = os.environ.get("MINISEARCH_WIKI_API_BASE", "").rstrip("/")
@@ -257,6 +268,329 @@ DEFAULT_QUEUE_PRIORITY = 5
 
 # Suffixes that only ever resolve inside a private network.
 LOCAL_HOST_SUFFIXES = ('.local', '.localhost', '.internal', '.lan', '.home.arpa')
+
+
+# ============================================================================
+# RUNTIME SETTINGS (admin-editable, persisted in ``app_settings``)
+# ============================================================================
+# Environment variables still provide the initial defaults, so an existing
+# Termux setup keeps working untouched; a value saved from the admin UI wins
+# over the env default. Most knobs are plain module globals that the code
+# re-reads on every use, so a change takes effect immediately. The few that
+# configure a background job (worker threads, scheduler intervals) are only
+# read once at startup, which is why ``restart`` marks them.
+
+SETTINGS_SPEC = {
+    'search.vector_weight': {
+        'group': 'search', 'global': 'VECTOR_WEIGHT', 'kind': 'int',
+        'min': 0, 'max': 100, 'default': VECTOR_WEIGHT, 'restart': False,
+        'label': 'Váha vektorového hledání (%)',
+        'help': 'Podíl vektorové podobnosti na výsledném skóre. Váhy by měly dát dohromady 100.',
+    },
+    'search.fts_weight': {
+        'group': 'search', 'global': 'FTS_WEIGHT', 'kind': 'int',
+        'min': 0, 'max': 100, 'default': FTS_WEIGHT, 'restart': False,
+        'label': 'Váha plnotextového hledání (%)',
+        'help': 'Podíl FTS5 na výsledném skóre. Když nejsou vektory, hledá se jen tímto dílem.',
+    },
+    'search.seo_weight': {
+        'group': 'search', 'global': 'SEO_WEIGHT', 'kind': 'int',
+        'min': 0, 'max': 100, 'default': SEO_WEIGHT, 'restart': False,
+        'label': 'Váha SEO skóre (%)',
+        'help': 'Doplňkové skóre podle titulku, popisu a strukturovaných dat.',
+    },
+    'search.image_results': {
+        'group': 'search', 'global': 'IMAGE_RESULTS_LIMIT', 'kind': 'int',
+        'min': 0, 'max': 100, 'default': IMAGE_RESULTS_LIMIT, 'restart': False,
+        'label': 'Obrázků v sekci výsledků',
+        'help': 'Kolik náhledů se zobrazí pod výsledky. 0 sekci úplně skryje.',
+    },
+    'search.image_search_limit': {
+        'group': 'search', 'global': 'IMAGE_SEARCH_LIMIT', 'kind': 'int',
+        'min': 0, 'max': 500, 'default': IMAGE_SEARCH_LIMIT, 'restart': False,
+        'label': 'Obrázků při hledání v obrázcích',
+        'help': 'Kolik obrázků nejvýše vrátí záložka Obrázky.',
+    },
+    'crawler.workers': {
+        'group': 'crawler', 'global': 'WORKER_COUNT', 'kind': 'int',
+        'min': 1, 'max': 16, 'default': WORKER_COUNT, 'restart': True,
+        'label': 'Crawlovacích vláken',
+        'help': 'Na telefonu stačí 1; vyšší číslo zrychlí crawling, ale zvedne RAM.',
+    },
+    'crawler.max_body_chars': {
+        'group': 'crawler', 'global': 'MAX_BODY_CHARS', 'kind': 'int',
+        'min': 200, 'max': 200000, 'default': MAX_BODY_CHARS, 'restart': False,
+        'label': 'Max. délka těla stránky (znaků)',
+        'help': 'Delší text se ořeže, aby jeden obří článek nenafoukl databázi.',
+    },
+    'crawler.max_links_per_page': {
+        'group': 'crawler', 'global': 'MAX_LINKS_PER_PAGE', 'kind': 'int',
+        'min': 0, 'max': 5000, 'default': MAX_LINKS_PER_PAGE, 'restart': False,
+        'label': 'Max. nových odkazů z jedné stránky',
+        'help': 'Omezuje, kolik odkazů přidá stránka do fronty. 0 sledování odkazů vypne.',
+    },
+    'crawler.request_timeout': {
+        'group': 'crawler', 'global': 'REQUEST_TIMEOUT', 'kind': 'int',
+        'min': 1, 'max': 600, 'default': REQUEST_TIMEOUT, 'restart': False,
+        'label': 'HTTP timeout (s)',
+        'help': 'Jak dlouho čekat na odpověď serveru.',
+    },
+    'crawler.max_retries': {
+        'group': 'crawler', 'global': 'MAX_RETRIES', 'kind': 'int',
+        'min': 0, 'max': 10, 'default': MAX_RETRIES, 'restart': False,
+        'label': 'Počet pokusů u síťových chyb',
+        'help': 'Opakování u 429/5xx s exponenciálním zpožděním.',
+    },
+    'recrawl.feed_hours': {
+        'group': 'recrawl', 'global': 'RECRAWL_FEED_HOURS', 'kind': 'int',
+        'min': 0, 'max': 8760, 'default': RECRAWL_FEED_HOURS, 'restart': True,
+        'label': 'Obnova feedů (hodiny)',
+        'help': '0 obnovu feedů úplně vypne.',
+    },
+    'recrawl.sitemap_hours': {
+        'group': 'recrawl', 'global': 'RECRAWL_SITEMAP_HOURS', 'kind': 'int',
+        'min': 0, 'max': 8760, 'default': RECRAWL_SITEMAP_HOURS, 'restart': True,
+        'label': 'Obnova sitemap (hodiny)',
+        'help': '0 obnovu sitemap úplně vypne.',
+    },
+    'recrawl.site_hours': {
+        'group': 'recrawl', 'global': 'RECRAWL_SITE_HOURS', 'kind': 'int',
+        'min': 0, 'max': 8760, 'default': RECRAWL_SITE_HOURS, 'restart': True,
+        'label': 'Obnova webů (hodiny)',
+        'help': '0 úplný recrawl úplně vypne – na mobilu šetří data i baterii.',
+    },
+    'recrawl.stale_hours': {
+        'group': 'recrawl', 'global': 'RECRAWL_PAGE_STALE_HOURS', 'kind': 'int',
+        'min': 0, 'max': 8760, 'default': RECRAWL_PAGE_STALE_HOURS, 'restart': False,
+        'label': 'Stáří stránky pro obnovu (hodiny)',
+        'help': 'Jak stará musí stránka být, než ji recrawl smí obnovit.',
+    },
+    'wiki.lang': {
+        'group': 'wiki', 'global': 'WIKI_DEFAULT_LANG', 'kind': 'str',
+        'default': WIKI_DEFAULT_LANG, 'restart': False,
+        'label': 'Výchozí jazyk Wikipedie',
+        'help': 'Použije se pro zdroj zadaný jen jako „cs“ nebo bez jazyka.',
+    },
+    'wiki.batch': {
+        'group': 'wiki', 'global': 'WIKI_API_BATCH', 'kind': 'int',
+        'min': 1, 'max': 50, 'default': WIKI_API_BATCH, 'restart': False,
+        'label': 'Dávka pro wiki API',
+        'help': 'Kolik článků stáhnout na jeden dotaz MediaWiki API.',
+    },
+    'wiki.retries': {
+        'group': 'wiki', 'global': 'WIKI_IMPORT_RETRIES', 'kind': 'int',
+        'min': 0, 'max': 10, 'default': WIKI_IMPORT_RETRIES, 'restart': False,
+        'label': 'Počet pokusů u wiki importu',
+        'help': 'Opakování při výpadku MediaWiki API.',
+    },
+    'embeddings.pref': {
+        'group': 'embeddings', 'global': 'EMBEDDINGS_PREF', 'kind': 'choice',
+        'choices': ('auto', '1', '0'), 'default': EMBEDDINGS_PREF, 'restart': False,
+        'label': 'Vektorové hledání',
+        'help': 'auto = jen při dostatku RAM a baterie; 1/0 = natvrdo zapnuto/vypnuto.',
+    },
+    'embeddings.min_free_mb': {
+        'group': 'embeddings', 'global': 'EMBED_MIN_FREE_MB', 'kind': 'int',
+        'min': 50, 'max': 100000, 'default': EMBED_MIN_FREE_MB, 'restart': False,
+        'label': 'Min. volná RAM pro vektory (MB)',
+        'help': 'Pod touto hranicí režim auto vektory vypne.',
+    },
+    'embeddings.min_battery_pct': {
+        'group': 'embeddings', 'global': 'EMBED_MIN_BATTERY_PCT', 'kind': 'int',
+        'min': 0, 'max': 100, 'default': EMBED_MIN_BATTERY_PCT, 'restart': False,
+        'label': 'Min. baterie pro vektory (%)',
+        'help': 'Pod touto hranicí (a bez nabíjení) režim auto vektory vypne.',
+    },
+    'embeddings.hnsw_max': {
+        'group': 'embeddings', 'global': 'HNSW_MAX_ELEMENTS', 'kind': 'int',
+        'min': 100, 'max': 5000000, 'default': HNSW_MAX_ELEMENTS, 'restart': False,
+        'label': 'Strop vektorů pro hnswlib index',
+        'help': 'Nad tímto počtem se in-RAM index přeskočí a hledá se přes FTS5.',
+    },
+    'maintenance.nightly': {
+        'group': 'maintenance', 'global': 'MAINTENANCE_NIGHTLY_ENABLED', 'kind': 'bool',
+        'default': MAINTENANCE_NIGHTLY_ENABLED, 'restart': True,
+        'label': 'Noční údržba',
+        'help': 'Zapne plánovanou noční údržbu (dedup, vektory, wiki, mrtvé odkazy).',
+    },
+    'maintenance.nightly_hour': {
+        'group': 'maintenance', 'global': 'MAINTENANCE_NIGHTLY_HOUR', 'kind': 'int',
+        'min': 0, 'max': 23, 'default': MAINTENANCE_NIGHTLY_HOUR, 'restart': True,
+        'label': 'Hodina noční údržby',
+        'help': 'V kolik hodin má noční údržba začít.',
+    },
+}
+
+SETTINGS_GROUPS = (
+    ('search', 'Vyhledávání'),
+    ('crawler', 'Crawler'),
+    ('recrawl', 'Automatická obnova'),
+    ('wiki', 'Wikipedie'),
+    ('embeddings', 'Vektorové hledání'),
+    ('maintenance', 'Noční údržba'),
+)
+
+# Environment variable that seeds each setting. Shown in the admin UI so an
+# operator can see whether a value came from the shell or the panel.
+SETTINGS_ENV = {
+    'search.vector_weight': 'MINISEARCH_VECTOR_WEIGHT',
+    'search.fts_weight': 'MINISEARCH_FTS_WEIGHT',
+    'search.seo_weight': 'MINISEARCH_SEO_WEIGHT',
+    'search.image_results': 'MINISEARCH_IMAGE_RESULTS',
+    'search.image_search_limit': 'MINISEARCH_IMAGE_SEARCH_LIMIT',
+    'crawler.workers': 'MINISEARCH_WORKERS',
+    'crawler.max_body_chars': 'MINISEARCH_MAX_BODY_CHARS',
+    'crawler.max_links_per_page': 'MINISEARCH_MAX_LINKS_PER_PAGE',
+    'crawler.request_timeout': 'MINISEARCH_REQUEST_TIMEOUT',
+    'crawler.max_retries': 'MINISEARCH_MAX_RETRIES',
+    'recrawl.feed_hours': 'MINISEARCH_RECRAWL_FEED_HOURS',
+    'recrawl.sitemap_hours': 'MINISEARCH_RECRAWL_SITEMAP_HOURS',
+    'recrawl.site_hours': 'MINISEARCH_RECRAWL_SITE_HOURS',
+    'recrawl.stale_hours': 'MINISEARCH_RECRAWL_STALE_HOURS',
+    'wiki.lang': 'MINISEARCH_WIKI_LANG',
+    'wiki.batch': 'MINISEARCH_WIKI_BATCH',
+    'wiki.retries': 'MINISEARCH_WIKI_RETRIES',
+    'embeddings.pref': 'MINISEARCH_EMBEDDINGS',
+    'embeddings.min_free_mb': 'MINISEARCH_MIN_FREE_MB',
+    'embeddings.min_battery_pct': 'MINISEARCH_MIN_BATTERY_PCT',
+    'embeddings.hnsw_max': 'MINISEARCH_HNSW_MAX_ELEMENTS',
+    'maintenance.nightly': 'MINISEARCH_NIGHTLY',
+    'maintenance.nightly_hour': 'MINISEARCH_NIGHTLY_HOUR',
+}
+for _key, _env_name in SETTINGS_ENV.items():
+    SETTINGS_SPEC[_key]['env'] = _env_name
+
+_settings_cache = {}
+
+
+def _coerce_setting(key, raw):
+    """Validate and coerce one stored setting. Returns ``None`` when invalid."""
+    spec = SETTINGS_SPEC.get(key)
+    if not spec:
+        return None
+    kind = spec['kind']
+    if kind == 'int':
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return max(spec['min'], min(spec['max'], value))
+    if kind == 'bool':
+        return str(raw).strip().lower() in ('1', 'true', 'on', 'yes', 'ano')
+    if kind == 'choice':
+        value = str(raw).strip().lower()
+        return value if value in spec['choices'] else None
+    return str(raw).strip()
+
+
+def get_setting(key):
+    """Current value of a setting: the live global, or its default."""
+    spec = SETTINGS_SPEC.get(key)
+    if not spec:
+        return None
+    return globals().get(spec['global'], spec['default'])
+
+
+def apply_settings(stored):
+    """Push stored settings into the module globals the code already reads."""
+    applied = 0
+    for key, raw in (stored or {}).items():
+        spec = SETTINGS_SPEC.get(key)
+        if not spec:
+            continue
+        value = _coerce_setting(key, raw)
+        if value is None:
+            continue
+        globals()[spec['global']] = value
+        _settings_cache[key] = value
+        applied += 1
+    _refresh_derived_settings()
+    return applied
+
+
+def _refresh_derived_settings():
+    """Recompute globals derived from a setting, so a change takes effect now."""
+    global RECRAWL_STALE_AFTER_SECONDS
+    RECRAWL_STALE_AFTER_SECONDS = RECRAWL_PAGE_STALE_HOURS * 3600
+
+
+def load_settings():
+    """Load persisted settings and apply them over the env-derived defaults.
+
+    Called on every startup right after the schema exists, so an upgrade picks
+    the saved values up without any manual step.
+    """
+    try:
+        rows = execute_db_fetchall("SELECT key, value FROM app_settings")
+    except Exception:
+        return 0
+    return apply_settings({row['key']: row['value'] for row in rows})
+
+
+def save_settings(updates):
+    """Persist a ``{key: value}`` mapping and apply it. Returns ``(ok, errors)``."""
+    errors = []
+    clean = {}
+    for key, raw in (updates or {}).items():
+        spec = SETTINGS_SPEC.get(key)
+        if not spec:
+            errors.append(f"Neznámé nastavení: {key}")
+            continue
+        value = _coerce_setting(key, raw)
+        if value is None:
+            errors.append(f"Neplatná hodnota pro {spec['label']}")
+            continue
+        clean[key] = value
+    if errors:
+        return False, errors
+    for key, value in clean.items():
+        store = '1' if value is True else '0' if value is False else str(value)
+        execute_db(
+            "INSERT INTO app_settings (key, value, updated_at) "
+            "VALUES (?, ?, strftime('%s','now')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, store), commit=True
+        )
+    apply_settings(clean)
+    return True, []
+
+
+def reset_settings():
+    """Delete every stored override so the env defaults apply again."""
+    execute_db("DELETE FROM app_settings", commit=True)
+    _settings_cache.clear()
+    for key, spec in SETTINGS_SPEC.items():
+        globals()[spec['global']] = spec['default']
+    _refresh_derived_settings()
+
+
+def settings_for_ui():
+    """Grouped, display-ready settings for the admin template."""
+    groups = []
+    for group_key, group_label in SETTINGS_GROUPS:
+        items = []
+        for key, spec in SETTINGS_SPEC.items():
+            if spec['group'] != group_key:
+                continue
+            value = get_setting(key)
+            if spec['kind'] == 'bool':
+                display = 'Ano' if value else 'Ne'
+            elif key == 'embeddings.pref':
+                display = {'auto': 'auto', '1': 'zapnuto', '0': 'vypnuto'}.get(str(value), str(value))
+            else:
+                display = str(value)
+            items.append({
+                'key': key, 'label': spec['label'], 'help': spec['help'],
+                'kind': spec['kind'], 'value': value, 'display': display,
+                'choices': spec.get('choices', ()),
+                'min': spec.get('min'), 'max': spec.get('max'),
+                'restart': spec['restart'],
+                'env': spec.get('env', ''),
+            })
+        if items:
+            groups.append({'key': group_key, 'label': group_label, 'items': items})
+    return groups
 
 
 _db_lock = threading.Lock()
@@ -395,6 +729,13 @@ DB_SCHEMA = {
             created_at INTEGER DEFAULT (strftime('%s','now')),
             FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
         )
+    ''',
+    'app_settings': '''
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER DEFAULT (strftime('%s','now'))
+        )
     '''
 }
 
@@ -471,6 +812,7 @@ def get_db():
     global _db_conn
     if _db_conn is not None:
         return _db_conn
+    stored_settings = None
     with _db_lock:
         if _db_conn is None:
             _db_conn = sqlite3.connect(
@@ -495,6 +837,17 @@ def get_db():
             _backfill_fts(_db_conn)
             _migrate_sources(_db_conn)
             run_self_migration(_db_conn)
+            # Read saved settings with the raw cursor: ``execute_db`` would try
+            # to take ``_db_lock`` again and deadlock this non-reentrant lock.
+            try:
+                rows = _db_conn.execute("SELECT key, value FROM app_settings").fetchall()
+                stored_settings = {row['key']: row['value'] for row in rows}
+            except sqlite3.OperationalError:
+                stored_settings = None
+    # Applied outside the lock, so a saved value overrides the env default
+    # without re-entering the connection lock.
+    if stored_settings:
+        apply_settings(stored_settings)
     return _db_conn
 
 
@@ -3656,6 +4009,24 @@ def _wiki_article_to_page(article, site_id, lang):
         page['published_timestamp'] = article['timestamp']
     page['schema_type'] = page.get('schema_type') or 'Article'
     page['seo_score'] = calculate_seo_score(page)
+
+    # Images surface in the separate image grid rather than as their own pages.
+    # The API importer yields the lead image; the dump importer yields a few
+    # file URLs. Either way the page keeps at most a thumbnail row's worth.
+    image_urls = []
+    lead = _safe_image_url(article.get('image'))
+    if lead:
+        image_urls.append(lead)
+    for url in (article.get('images') or []):
+        safe = _safe_image_url(url)
+        if safe and safe not in image_urls:
+            image_urls.append(safe)
+    if image_urls:
+        image_urls = image_urls[:WIKI_MAX_IMAGES_PER_ARTICLE]
+        page['images'] = [{'url': url} for url in image_urls]
+        if not page.get('og_image'):
+            page['og_image'] = image_urls[0]
+
     # The title carries the strongest signal for wiki lookups, so prepend it.
     body_for_index = f"{title}. {body}"
     page['body_text'] = re.sub(r'\s+', ' ', body_for_index).strip()[:MAX_BODY_CHARS]
@@ -3674,6 +4045,37 @@ _WIKI_SKIP_NAMESPACES = (
 )
 _WIKI_REDIRECT_RE = re.compile(r'^\s*#(?:REDIRECT|PŘESMĚRUJ|PŘESMĚROVAT)\s*:?\s*\[\[([^\]]+)\]\]',
                                re.IGNORECASE)
+
+
+def _wiki_images_from_wikitext(wikitext, lang):
+    """Lead/embedded ``[[File:...]]`` image URLs from a wiki article.
+
+    The dump only stores filenames, so the URL is built against Wikimedia's
+    thumbnail service. Only the first few are kept: the image grid needs a
+    thumbnail per article, not the whole gallery, and a phone should not store
+    hundreds of URLs per page. ``Special:FilePath`` resolves the name without an
+    extra API round-trip.
+    """
+    text = wikitext or ''
+    urls = []
+    seen = set()
+    for match in re.finditer(r'\[\[\s*(?:File|Soubor|Image)\s*:\s*([^\]\|]+)', text,
+                             re.IGNORECASE):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        # Skip the common non-content placeholders.
+        if name.lower().startswith(('commons-logo', 'wiki', 'padlock', 'symbol')):
+            continue
+        url = (f"https://{lang}.wikipedia.org/wiki/Special:FilePath/"
+               f"{quote(name.replace(' ', '_'))}?width=320")
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= WIKI_MAX_IMAGES_PER_ARTICLE:
+            break
+    return urls
 
 
 def _wiki_text_from_wikitext(wikitext):
@@ -3724,7 +4126,7 @@ def _iter_wiki_articles(lang, resume_title, max_pages, importer='api', dump_path
     Both are lazy, so the caller can stop after ``max_pages``.
     """
     if importer == 'dump' and dump_path:
-        yield from _iter_wiki_articles_dump(dump_path, resume_title, max_pages)
+        yield from _iter_wiki_articles_dump(dump_path, resume_title, max_pages, lang)
         return
     yield from _iter_wiki_articles_api(lang, resume_title, max_pages)
 
@@ -3744,7 +4146,7 @@ def _xml_child(element, name):
     return child
 
 
-def _wiki_page_from_element(page_el):
+def _wiki_page_from_element(page_el, lang=WIKI_DEFAULT_LANG):
     """Build an article dict from a parsed ``<page>`` XML element."""
     def _text(name):
         child = _xml_child(page_el, name)
@@ -3787,10 +4189,11 @@ def _wiki_page_from_element(page_el):
 
     article['skip'] = False
     article['text'] = _wiki_text_from_wikitext(raw_text)
+    article['images'] = _wiki_images_from_wikitext(raw_text, lang)
     return article
 
 
-def _iter_wiki_articles_dump(dump_path, resume_title, max_pages):
+def _iter_wiki_articles_dump(dump_path, resume_title, max_pages, lang=WIKI_DEFAULT_LANG):
     """Stream ``<page>`` elements out of a local (b)z2 XML dump.
 
     Uses ``ElementTree.iterparse`` so the file is consumed incrementally and
@@ -3820,7 +4223,7 @@ def _iter_wiki_articles_dump(dump_path, resume_title, max_pages):
         for _event, element in ET.iterparse(handle, events=('end',)):
             if not element.tag.endswith('page'):
                 continue
-            article = _wiki_page_from_element(element)
+            article = _wiki_page_from_element(element, lang)
             element.clear()
             if not article.get('title'):
                 continue
@@ -3885,14 +4288,20 @@ def _iter_wiki_articles_api(lang, resume_title, max_pages):
 
 
 def _fetch_wiki_api_batch(lang, titles):
-    """Fetch plaintext extracts for a batch of titles via the API."""
+    """Fetch plaintext extracts (plus the lead image) for a batch of titles.
+
+    ``pageimages`` is asked for the original image URL only: it is a handful of
+    bytes per article, so the image grid works for Wikipedia without paying for
+    full HTML parses on a phone.
+    """
     if not titles:
         return
     api = _wiki_api_url(lang)
     params = {
-        'action': 'query', 'format': 'json', 'prop': 'extracts|info',
+        'action': 'query', 'format': 'json',
+        'prop': 'extracts|pageimages|info',
         'explaintext': '1', 'exintro': '0', 'inprop': 'url',
-        'redirects': '1', 'titles': '|'.join(titles),
+        'piprop': 'original', 'redirects': '1', 'titles': '|'.join(titles),
     }
     try:
         resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
@@ -3906,6 +4315,7 @@ def _fetch_wiki_api_batch(lang, titles):
     for page in ((payload.get('query', {}) or {}).get('pages', {}) or {}).values():
         if 'missing' in page:
             continue
+        original = (page.get('original') or {}).get('source') or ''
         yield {
             'title': page.get('title') or '',
             'redirect': '',
@@ -3913,6 +4323,7 @@ def _fetch_wiki_api_batch(lang, titles):
             'text': page.get('extract') or '',
             'html': '',
             'skip': False,
+            'image': original,
         }
 
 
@@ -5433,22 +5844,32 @@ def search_index():
 
     results = []
     has_next = False
+    image_results = []
     if query:
-        # hybrid_search has no offset, so fetch the window for the requested
-        # page plus one peek row (to detect a next page) and slice it. The cap
-        # bounds how deep pagination can reach into the index.
-        fetch_limit = min(page * SEARCH_PAGE_SIZE + 1, SEARCH_MAX_RESULTS)
-        window = hybrid_search(
-            query, limit=fetch_limit,
-            filter_type=filter_type if filter_type != 'all' else None
-        )
-        start = (page - 1) * SEARCH_PAGE_SIZE
-        results = window[start:start + SEARCH_PAGE_SIZE]
-        has_next = len(window) > start + SEARCH_PAGE_SIZE
-
-    # The image section is built from the same window, so it never costs an
-    # extra query. Only shown on the first page, where it reads as a summary.
-    image_results = _collect_result_images(results) if query and page == 1 else []
+        if filter_type == 'images':
+            # The image tab wants breadth, not the article page window: search a
+            # wider slice of the index and keep the images those pages carry.
+            # Images are never indexed as their own pages, so this is the only
+            # way to browse them.
+            window = hybrid_search(query, limit=IMAGE_SEARCH_LIMIT)
+            image_results = _collect_result_images(window, limit=IMAGE_SEARCH_LIMIT)
+        else:
+            # hybrid_search has no offset, so fetch the window for the requested
+            # page plus one peek row (to detect a next page) and slice it. The
+            # cap bounds how deep pagination can reach into the index.
+            fetch_limit = min(page * SEARCH_PAGE_SIZE + 1, SEARCH_MAX_RESULTS)
+            window = hybrid_search(
+                query, limit=fetch_limit,
+                filter_type=filter_type if filter_type != 'all' else None
+            )
+            start = (page - 1) * SEARCH_PAGE_SIZE
+            results = window[start:start + SEARCH_PAGE_SIZE]
+            has_next = len(window) > start + SEARCH_PAGE_SIZE
+            # The image section is built from the same window, so it never costs
+            # an extra query. Only shown on the first page, where it reads as a
+            # summary.
+            if page == 1:
+                image_results = _collect_result_images(results)
 
     return render_template(
         'search.html',
@@ -5570,6 +5991,96 @@ def admin_index():
         message=message,
         message_ok=ok,
     )
+
+
+@app.route('/admin/settings', methods=['GET', 'POST'])
+def admin_settings():
+    """Admin page for the runtime settings that were env-only before.
+
+    A value saved here is persisted in ``app_settings`` and applied immediately
+    to the module globals the code already reads, so most changes need no
+    restart; the few that configure a background job say so in the UI.
+    """
+    if request.method == 'POST':
+        if request.form.get('action') == 'reset':
+            reset_settings()
+            return redirect('/admin/settings?ok=Nastavení+obnoveno+na+výchozí+hodnoty')
+
+        updates = {}
+        for key, spec in SETTINGS_SPEC.items():
+            field = 'setting__' + key
+            if spec['kind'] == 'bool':
+                # A checkbox only appears in the payload when ticked.
+                updates[key] = '1' if field in request.form else '0'
+            elif field in request.form:
+                updates[key] = request.form.get(field, '')
+
+        ok, errors = save_settings(updates)
+        if not ok:
+            return redirect('/admin/settings?error=' + quote('; '.join(errors)))
+        return redirect('/admin/settings?ok=Nastavení+uloženo')
+
+    message, ok = _admin_message()
+    restart_needed = any(
+        spec['restart'] for key, spec in SETTINGS_SPEC.items()
+        if _setting_overrides_env(key)
+    )
+    return render_template(
+        'admin/settings.html',
+        active_page='settings',
+        groups=settings_for_ui(),
+        restart_needed=restart_needed,
+        message=message,
+        message_ok=ok,
+    )
+
+
+def _setting_overrides_env(key):
+    """True when a stored value differs from the env-seeded default."""
+    spec = SETTINGS_SPEC.get(key)
+    if not spec:
+        return False
+    row = execute_db_fetchone("SELECT value FROM app_settings WHERE key = ?", (key,))
+    if not row:
+        return False
+    stored = _coerce_setting(key, row['value'])
+    if stored is None:
+        return False
+    default = spec['default']
+    if isinstance(default, bool):
+        return bool(stored) != default
+    if spec['kind'] == 'int':
+        return int(stored) != int(default)
+    return str(stored) != str(default)
+
+
+@app.route('/admin/api/settings', methods=['GET'])
+def admin_api_settings_get():
+    """JSON view of the current settings, grouped like the page."""
+    return jsonify({
+        'groups': [
+            {'key': group['key'], 'label': group['label'], 'items': [
+                {'key': item['key'], 'label': item['label'],
+                 'value': item['value'], 'display': item['display'],
+                 'restart': item['restart'], 'env': item['env']}
+                for item in group['items']
+            ]}
+            for group in settings_for_ui()
+        ]
+    })
+
+
+@app.route('/admin/api/settings', methods=['POST'])
+def admin_api_settings_post():
+    """Update settings from JSON, the way the admin JS posts forms."""
+    payload = request.get_json(silent=True) or {}
+    if payload.get('action') == 'reset':
+        reset_settings()
+        return jsonify({'message': 'Nastavení obnoveno na výchozí hodnoty'})
+    ok, errors = save_settings(payload.get('settings') or {})
+    if not ok:
+        return jsonify({'error': '; '.join(errors)}), 400
+    return jsonify({'message': 'Nastavení uloženo'})
 
 
 @app.route('/admin/sites')
@@ -6066,7 +6577,7 @@ if __name__ == '__main__':
         raise SystemExit(_cli_import_wiki(args))
 
     print('=' * 70)
-    print('Mini Search v7.4 - Hybrid Search Engine')
+    print('Mini Search v7.5 - Hybrid Search Engine')
     print('=' * 70)
 
     get_db()
@@ -6111,8 +6622,8 @@ if __name__ == '__main__':
     start_workers()
 
     print()
-    print('http://0.0.0.0:8070')
+    print(f'http://0.0.0.0:{PORT}')
     print('Ctrl+C to stop')
     print('=' * 70)
 
-    app.run(host='0.0.0.0', port=8070, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
