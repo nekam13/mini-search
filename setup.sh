@@ -30,9 +30,10 @@ echo "Python $PYTHON_VERSION"
 # Instalace systemovych zavislosti
 if command -v apt-get &> /dev/null; then
     echo "[*] Instalace systemovych zavislosti..."
-    sudo apt-get install -y python3-pip python3-venv lsof curl git build-essential cmake pkg-config libxml2-dev libxslt1-dev > /dev/null 2>&1
+    apt-get update && apt-get install -y python3-pip python3-venv lsof curl git build-essential cmake pkg-config libxml2-dev libxslt1-dev
     echo "Systemove zavislosti nainstalovany"
 fi
+
 
 echo ""
 
