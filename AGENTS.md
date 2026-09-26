@@ -23,10 +23,17 @@ python3 tests/test_crawl_metadata.py         # Schema.org/OG, charset, retry/bac
 python3 tests/test_rich_cards.py             # Rich Result cards, XSS, self-migration + cleanup
 python3 tests/test_maintenance.py            # nightly maintenance: dedup, vectors, wiki, dead links
 python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, lowmem scope
+python3 tests/test_search_quality.py         # charset, asset filtering, weights, image section
 ```
 
-`tests/test_crawler_discovery.py` runs against a loopback HTTP server, so it never
-touches the live internet — keep new crawler tests offline in the same way.
+`tests/test_crawler_discovery.py` and `tests/test_search_quality.py` run against a
+loopback HTTP server, so they never touch the live internet — keep new crawler and
+search-quality tests offline in the same way.
+
+`test_crawl_metadata.py` and `test_maintenance.py` need `hnswlib` installed.
+Without it `embeddings_enabled()` short-circuits on the missing stack and those
+suites fail with "auto keeps vectors" / embedding-batch errors even though the
+application code is fine.
 
 All suites are deterministic and offline: network behaviour runs against a
 throwaway local HTTP server, and the wiki importer test writes a small bz2 dump
@@ -98,6 +105,36 @@ It handles the teens exception (12–14 → many) and the last-digit rule
 Pagination is done at the route by fetching `page * SEARCH_PAGE_SIZE + 1` rows
 (the extra row detects whether a next page exists) and slicing.
 `SEARCH_MAX_RESULTS` caps how deep pagination can go.
+
+Score weights are env-configurable and must sum to 100:
+`VECTOR_WEIGHT` (50) + `FTS_WEIGHT` (40) + `SEO_WEIGHT` (10). The SEO term is
+`seo_score * SEO_WEIGHT/100`; both scorers contribute `(1 - i/2) * weight` by
+rank position, then `_site_priority_multiplier()` scales the total.
+
+## Images are not pages
+
+Image URLs must never enter `pages`, the FTS index or the crawl queue:
+
+- `ASSET_URL_EXTENSIONS` + `_looks_like_asset_url()` gate `_queue_url()` and
+  `_is_crawlable_link()`; sitemap `<image:loc>`/`<video:loc>` are excluded by
+  `_parse_sitemap_locs()`, which only reads direct-child `<loc>`.
+- Images are surfaced separately: `_collect_result_images(results, query, limit)`
+  reads `og_image` and the `images` JSON column of the *already found* rows and
+  returns display-only dicts. `IMAGE_RESULTS_LIMIT` (12, 0 disables) caps it.
+- `_safe_image_url()` only allows `http(s)` — reject `javascript:`/`data:` so a
+  hostile `og:image` cannot become a script src. `prepare_results()` stays the
+  place for display fields; `_collect_result_images` must accept raw
+  `sqlite3.Row` objects (it normalises them to dicts internally).
+- The `templates/search.html` section is `.image-results`; its styling lives in
+  `static/css/search.css` (tokens still only in `clay.css`).
+
+## Charset handling
+
+`_decode_response(resp)` decides the text encoding in this order: HTTP header
+charset → `<meta charset>`/`<meta http-equiv>` sniffed from the raw bytes →
+UTF-8 → `resp.apparent_encoding` → windows-1250 fallback. `requests` defaults
+`text/html` without a charset to ISO-8859-1, which mojibakes every Czech háček
+("KouzelnÃ©"), so never read `resp.text` directly for Czech sites.
 
 ## Source indexing
 
@@ -237,6 +274,22 @@ Three behaviours depend on it, so keep them consistent:
 `_decorate_site(site)` is the single place that adds derived display fields
 (stats, parsed aliases, `is_local`, `search_priority_multiplier`); routes must
 use it rather than re-deriving those keys by hand.
+
+## Recrawl scheduling
+
+Background refresh intervals are env-configurable in whole hours and **0
+disables the job entirely** (important on a phone, where background crawls cost
+data and battery):
+
+| Constant | Env var | Default |
+|---|---|---|
+| `RECRAWL_FEED_HOURS` | `MINISEARCH_RECRAWL_FEED_HOURS` | 1 |
+| `RECRAWL_SITE_HOURS` | `MINISEARCH_RECRAWL_SITE_HOURS` | 12 |
+| `RECRAWL_SITEMAP_HOURS` | `MINISEARCH_RECRAWL_SITEMAP_HOURS` | 24 |
+| `RECRAWL_PAGE_STALE_HOURS` | `MINISEARCH_RECRAWL_STALE_HOURS` | 72 |
+
+`RECRAWL_STALE_AFTER_SECONDS` is derived from `RECRAWL_PAGE_STALE_HOURS`; the
+scheduler only registers a job when its interval is non-zero.
 
 ## Environment notes
 

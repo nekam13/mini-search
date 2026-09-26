@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Mini Search - Complete Implementation v7.4
-Hybrid Search: 60% hnswlib vector + 35% FTS5 full-text + 5% SEO scoring
+Mini Search - Complete Implementation v7.5
+Hybrid Search: 50% hnswlib vector + 40% FTS5 full-text + 10% SEO scoring
 Database migration without deleting console.db
 FTS5 backfill for existing pages with triggers
 GitHub update checking with .commit_sha, .update_available, update_log
@@ -13,6 +13,12 @@ Robots checks before fetching discovery candidates
 Clay design system shared by the public search page and the admin panel
 Local-network (LAN) indexing: auto-detected private hosts skip robots.txt and
 receive a 3x search boost, tunable per site in the admin panel
+Czech Wikipedia importer (streaming API or local multistream dump)
+Czech charset handling: HTTP/meta charset sniffing so UTF-8 pages without a
+declared charset no longer mojibake ("KouzelnÃ©" bug)
+Sitemap/feed asset filtering: image/video sitemap extensions are never queued
+Separate image results section on the public page (images are not pages)
+Env-configurable recrawl intervals and hybrid search weights
 """
 
 import sqlite3
@@ -103,6 +109,15 @@ LOW_MEMORY_MODE = _env_bool("MINISEARCH_LOWMEM") or \
 SQLITE_CACHE_KB = _env_int("MINISEARCH_SQLITE_CACHE_KB", 2048 if LOW_MEMORY_MODE else 16384, 128, 1048576)
 SQLITE_TEMP_STORE = _env_int("MINISEARCH_SQLITE_TEMP_STORE", 1 if LOW_MEMORY_MODE else 2, 0, 2)
 
+# --- Hybrid search weights ----------------------------------------------------
+# Percent shares of the final relevance score. Vector search (the "AI" part)
+# leads, full-text is a close second and SEO is a light tie-breaker. They must
+# sum to 100 so the relevance meter stays comparable across configurations;
+# vector results simply contribute nothing when embeddings are off.
+VECTOR_WEIGHT = _env_int("MINISEARCH_VECTOR_WEIGHT", 50, 0, 100)
+FTS_WEIGHT = _env_int("MINISEARCH_FTS_WEIGHT", 40, 0, 100)
+SEO_WEIGHT = _env_int("MINISEARCH_SEO_WEIGHT", 10, 0, 100)
+
 MAX_RETRIES = _env_int("MINISEARCH_MAX_RETRIES", 3, 0, 10)
 # 10s keeps a stalled host from hanging a worker for the whole request budget,
 # which matters most on a phone where a single worker crawls the queue.
@@ -121,7 +136,20 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 SHUTDOWN_FLAG = False
 MAX_SITEMAP_RECURSION = _env_int("MINISEARCH_SITEMAP_RECURSION", 5, 1, 20)
 MAX_SITEMAP_URLS = _env_int("MINISEARCH_SITEMAP_MAX_URLS", 5000, 10, 500000)
-RECRAWL_STALE_AFTER_SECONDS = 3 * 24 * 3600
+
+# --- Scheduled recrawl intervals ---------------------------------------------
+# Hours between the background refresh passes. Sitemaps and feeds are cheap
+# (one HTTP fetch each) so they run often; a full site recrawl is expensive, so
+# it is rare. 0 disables a job entirely, which is what a phone on a metered
+# connection wants. All read once at startup, like the other knobs.
+RECRAWL_SITEMAP_HOURS = _env_int("MINISEARCH_RECRAWL_SITEMAP_HOURS", 24, 0, 8760)
+RECRAWL_FEED_HOURS = _env_int("MINISEARCH_RECRAWL_FEED_HOURS", 1, 0, 8760)
+RECRAWL_SITE_HOURS = _env_int("MINISEARCH_RECRAWL_SITE_HOURS", 12, 0, 8760)
+# How old an indexed page must be before a recrawl may refresh it. This is the
+# single global age gate shared by sitemap, feed and full-site passes; a lower
+# value re-checks pages sooner at the cost of more network traffic.
+RECRAWL_PAGE_STALE_HOURS = _env_int("MINISEARCH_RECRAWL_STALE_HOURS", 72, 0, 8760)
+RECRAWL_STALE_AFTER_SECONDS = RECRAWL_PAGE_STALE_HOURS * 3600
 
 # How many worker threads crawl the queue. One is plenty on a phone and keeps
 # SQLite contention and RAM low; desktop installs can raise it.
@@ -131,12 +159,24 @@ MAX_BODY_CHARS = _env_int("MINISEARCH_MAX_BODY_CHARS", 3500, 200, 200000)
 # Link discovery: how many same-domain links one crawled page may contribute to
 # the queue. Bounded so a huge link hub cannot flood the queue on a phone.
 MAX_LINKS_PER_PAGE = _env_int("MINISEARCH_MAX_LINKS_PER_PAGE", 100, 0, 5000)
+# How many images the public search page shows in its separate image section.
+# Images come from the pages that matched, so this only bounds rendering, not
+# indexing; 0 hides the section entirely.
+IMAGE_RESULTS_LIMIT = _env_int("MINISEARCH_IMAGE_RESULTS", 12, 0, 100)
 # File extensions that are never crawled as HTML pages.
 SKIP_LINK_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
     '.css', '.js', '.json', '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz',
     '.mp3', '.mp4', '.avi', '.mov', '.wav', '.ogg', '.webm', '.m4a', '.m4v',
     '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.exe', '.dmg', '.apk',
+)
+# Images/audio/video are never *pages*. A sitemap extension block or a feed
+# enclosure can point straight at an asset, so both the crawler and the
+# sitemap/feed queues drop these before they ever reach ``crawl_queue``.
+ASSET_URL_EXTENSIONS = (
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
+    '.tif', '.tiff', '.heic', '.mp3', '.m4a', '.wav', '.ogg', '.oga', '.opus',
+    '.aac', '.flac', '.mp4', '.m4v', '.avi', '.mov', '.webm', '.mkv', '.wmv',
 )
 # Embeddings are the biggest per-page cost (384 floats = 1.5 KB each) and the
 # hnswlib index adds more RAM on top, so on a phone they should only run when
@@ -2545,11 +2585,11 @@ def calculate_seo_score(page_data):
 
 
 def hybrid_search(query, limit=25, filter_type=None):
-    """Hybrid search: 60% vector + 35% FTS5 + 5% SEO, times the site boost."""
-    # Vector search (60%)
+    """Hybrid search: 50% vector + 40% FTS5 + 10% SEO, times the site boost."""
+    # Vector search (50%)
     vector_results = vector_search(query, limit=limit * 2, filter_type=None)
 
-    # FTS5 search (35%)
+    # FTS5 search (40%)
     fts_results = fts_search(query, limit=limit * 2)
 
     # Combine results
@@ -2561,7 +2601,7 @@ def hybrid_search(query, limit=25, filter_type=None):
         if result_id not in combined:
             combined[result_id] = {
                 'page': result,
-                'vector_score': (1 - (i / (len(vector_results) + 1))) * 60
+                'vector_score': (1 - (i / (len(vector_results) + 1))) * VECTOR_WEIGHT
             }
 
     # Add FTS5 results
@@ -2571,10 +2611,10 @@ def hybrid_search(query, limit=25, filter_type=None):
             combined[result_id] = {
                 'page': result,
                 'vector_score': 0,
-                'fts_score': (1 - (i / (len(fts_results) + 1))) * 35
+                'fts_score': (1 - (i / (len(fts_results) + 1))) * FTS_WEIGHT
             }
         else:
-            combined[result_id]['fts_score'] = (1 - (i / (len(fts_results) + 1))) * 35
+            combined[result_id]['fts_score'] = (1 - (i / (len(fts_results) + 1))) * FTS_WEIGHT
 
     # Calculate final scores
     final_results = []
@@ -2582,7 +2622,7 @@ def hybrid_search(query, limit=25, filter_type=None):
         page = _attach_priority(data['page'])
         vector_score = data.get('vector_score', 0)
         fts_score = data.get('fts_score', 0)
-        seo_score = page.get('seo_score', 0) * 0.05  # 5%
+        seo_score = page.get('seo_score', 0) * (SEO_WEIGHT / 100.0)
 
         multiplier = page['search_priority_multiplier']
         final_score = (vector_score + fts_score + seo_score) * multiplier
@@ -2857,9 +2897,12 @@ def _maybe_gunzip(content, url=''):
 def _parse_sitemap_locs(content):
     """Return ``(locs, is_index)`` for a sitemap document.
 
-    Uses the XML parser (falling back to the lenient HTML one) and reads
-    ``<loc>`` regardless of XML namespace, so both ``<urlset>`` and
-    ``<sitemapindex>`` documents are handled uniformly.
+    Only ``<loc>`` elements that are *direct children* of ``<url>`` or
+    ``<sitemap>`` are read. Google image/video/news sitemap extensions nest
+    their own ``<image:loc>``/``<video:loc>`` inside ``<url>``, and a blanket
+    ``find_all('loc')`` would queue those assets as if they were pages — which
+    is why a search used to surface bare ``.jpg`` URLs. The XML parser (falling
+    back to the lenient HTML one) handles both namespaced and plain documents.
     """
     soup = None
     for parser in ('xml', 'lxml'):
@@ -2870,7 +2913,21 @@ def _parse_sitemap_locs(content):
             soup = None
     if soup is None:
         return [], False
-    locs = [loc.text.strip() for loc in soup.find_all('loc') if (loc.text or '').strip()]
+
+    locs = []
+    for element in soup.find_all(['url', 'sitemap']):
+        for child in element.find_all(recursive=False):
+            # Skip extension ``<image:loc>``/``<video:loc>``: the lxml parser
+            # reports the name as ``image:loc`` while the xml parser splits it
+            # into ``name='loc'`` plus ``prefix='image'``, so both are checked.
+            name = (child.name or '')
+            if ':' in name or getattr(child, 'prefix', None):
+                continue
+            if name.lower() != 'loc':
+                continue
+            text = (child.text or '').strip()
+            if text:
+                locs.append(text)
     return locs, bool(soup.find('sitemapindex'))
 
 
@@ -2934,6 +2991,21 @@ def parse_feed(url):
     return urls
 
 
+def _looks_like_asset_url(url):
+    """True when a URL path ends in an image/audio/video extension.
+
+    Guards the queue against asset URLs that arrive from a sitemap extension,
+    a feed enclosure or a mislabelled ``<loc>``: such a URL is never an
+    indexable page, so indexing it would only add a useless row (and, in the
+    old behaviour, a bare ``.jpg`` hit in the results).
+    """
+    try:
+        path = (urlparse(url or '').path or '').lower()
+    except Exception:
+        return False
+    return path.endswith(ASSET_URL_EXTENSIONS)
+
+
 def _is_crawlable_link(url, domain):
     """True when ``url`` is a same-domain HTML page worth queueing.
 
@@ -2949,7 +3021,7 @@ def _is_crawlable_link(url, domain):
     if domain and get_domain(url) != domain:
         return False
     path = (parsed.path or '').lower()
-    if path.endswith(SKIP_LINK_EXTENSIONS):
+    if path.endswith(SKIP_LINK_EXTENSIONS) or path.endswith(ASSET_URL_EXTENSIONS):
         return False
     return True
 
@@ -3058,6 +3130,11 @@ def _queue_url(site_id, url, priority=None, allow_indexed_refresh=False,
         return False
     url = normalize_url(url)
     if not url:
+        return False
+    # A sitemap/feed can hand us an asset URL directly; never queue one, even
+    # when the site is local (robots.txt is skipped for local hosts, so this is
+    # the only filter standing between a feed enclosure and the page store).
+    if _looks_like_asset_url(url):
         return False
     site = get_site_by_id(site_id) if site_id else None
     is_local = bool(site and site.get('is_local'))
@@ -3852,22 +3929,67 @@ def empty_page_data(url, site_id):
     }
 
 
-def _decode_response(resp, content=None):
-    """Return bytes plus the best-effort decoded text of an HTTP response."""
-    raw = content if content is not None else resp.content
-    charset = None
+def _charset_from_html_meta(raw):
+    """Sniff a ``<meta charset>`` / ``<meta http-equiv>`` from the first bytes.
+
+    Checked before ``requests``' guess because requests reports ISO-8859-1 for
+    any ``text/html`` without a charset header, which silently mojibakes Czech
+    UTF-8 pages. Bounded to the first 4 KB, where the meta tag must live.
+    """
+    head = raw[:4096]
+    match = re.search(br'<meta[^>]+charset\s*=\s*["\']?\s*([\w-]+)', head, re.IGNORECASE)
+    if not match:
+        return ''
     try:
-        charset = resp.encoding
+        return match.group(1).decode('ascii', errors='ignore').strip().lower()
     except Exception:
-        charset = None
-    if not charset:
+        return ''
+
+
+def _decode_response(resp, content=None):
+    """Return bytes plus the best-effort decoded text of an HTTP response.
+
+    Charset order matters for Czech pages: an explicit HTTP header wins, then a
+    ``<meta charset>`` in the markup, then UTF-8. ``requests``' ``encoding`` is
+    deliberately *not* used first — for ``text/html`` without a charset it
+    returns the RFC 2616 default ISO-8859-1, which would render "Kouzelné" as
+    "KouzelnÃ©". ``apparent_encoding`` (chardet) is the last resort before the
+    windows-1250/UTF-8 replace fallbacks.
+    """
+    raw = content if content is not None else resp.content
+    header_charset = ''
+    try:
+        # Only trust a charset the server actually sent, not requests' default.
+        content_type = (resp.headers.get('Content-Type') or '') if resp.headers else ''
+        match = re.search(r'charset\s*=\s*["\']?\s*([\w-]+)', content_type, re.IGNORECASE)
+        if match:
+            header_charset = match.group(1).strip().lower()
+    except Exception:
+        header_charset = ''
+
+    apparent = ''
+    if not header_charset:
         try:
-            charset = resp.apparent_encoding
+            apparent = (resp.apparent_encoding or '').strip().lower()
         except Exception:
-            charset = None
-    for candidate in (charset, 'utf-8', 'windows-1250'):
-        if not candidate:
+            apparent = ''
+    # chardet guesses ISO-8859-1/Windows-1252 for short ASCII-ish samples; a
+    # declared meta charset and UTF-8 are both more trustworthy than that.
+    if apparent in ('iso-8859-1', 'latin-1', 'ascii', 'windows-1252'):
+        apparent = ''
+
+    candidates = [
+        header_charset,
+        _charset_from_html_meta(raw),
+        'utf-8',
+        apparent,
+        'windows-1250',
+    ]
+    tried = set()
+    for candidate in candidates:
+        if not candidate or candidate in tried:
             continue
+        tried.add(candidate)
         try:
             return raw, raw.decode(candidate, errors='strict')
         except (LookupError, UnicodeDecodeError):
@@ -5227,6 +5349,53 @@ def _rich_card_fields(item):
     return fields
 
 
+def _collect_result_images(results, limit=None):
+    """Build the separate image section from images found on matching pages.
+
+    Images are *not* indexed as pages (they would pollute the article results);
+    instead each hit contributes its og:image plus any ``<img>`` it stored, and
+    the public page renders them in their own grid. Every field is pre-formatted
+    so the template stays logic-free, mirroring :func:`prepare_results`.
+    """
+    if limit is None:
+        limit = IMAGE_RESULTS_LIMIT
+    if limit <= 0:
+        return []
+
+    images = []
+    seen = set()
+    for page in results:
+        # ``page_string``/``page_json`` read via ``.get``, so normalise a raw
+        # sqlite3.Row to a dict first (prepare_results does the same).
+        item = page if isinstance(page, dict) else dict(page)
+        candidates = []
+        og_image = _safe_image_url(page_string(item, 'og_image'))
+        if og_image:
+            candidates.append(og_image)
+        for entry in page_json(item, 'images', []):
+            if not isinstance(entry, dict):
+                continue
+            safe = _safe_image_url(entry.get('url'))
+            if safe:
+                candidates.append(safe)
+
+        title = (page_string(item, 'og_title') or page_string(item, 'title')
+                 or page_string(item, 'url'))
+        for url in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            images.append({
+                'url': url,
+                'title': title,
+                'domain': _result_domain(page_string(item, 'url')),
+                'source_url': page_string(item, 'url'),
+            })
+            if len(images) >= limit:
+                return images
+    return images
+
+
 def prepare_results(results, query):
     """Attach display-only fields so the template stays free of logic."""
     prepared = []
@@ -5277,11 +5446,16 @@ def search_index():
         results = window[start:start + SEARCH_PAGE_SIZE]
         has_next = len(window) > start + SEARCH_PAGE_SIZE
 
+    # The image section is built from the same window, so it never costs an
+    # extra query. Only shown on the first page, where it reads as a summary.
+    image_results = _collect_result_images(results) if query and page == 1 else []
+
     return render_template(
         'search.html',
         active_page='search',
         query=query,
         results=prepare_results(results, query),
+        image_results=image_results,
         total_results=len(results),
         current_filter=filter_type,
         page=page,
@@ -5909,9 +6083,19 @@ if __name__ == '__main__':
         print('Embeddings off - FTS5 fallback active (crawling unaffected)')
 
     _scheduler = BackgroundScheduler()
-    _scheduler.add_job(check_feeds,      IntervalTrigger(hours=1),  id='check_feeds')
-    _scheduler.add_job(check_sitemaps,   IntervalTrigger(hours=24), id='check_sitemaps')
-    _scheduler.add_job(recrawl_all_sites, IntervalTrigger(hours=12), id='recrawl_all')
+
+    # Interval jobs are registered only when their configured period is > 0,
+    # so setting e.g. MINISEARCH_RECRAWL_SITE_HOURS=0 on a phone skips the
+    # expensive full recrawl entirely instead of merely stretching it out.
+    def _add_interval(job, hours, job_id):
+        if hours <= 0:
+            print(f"Job {job_id} disabled (interval 0)")
+            return
+        _scheduler.add_job(job, IntervalTrigger(hours=hours), id=job_id)
+
+    _add_interval(check_feeds, RECRAWL_FEED_HOURS, 'check_feeds')
+    _add_interval(check_sitemaps, RECRAWL_SITEMAP_HOURS, 'check_sitemaps')
+    _add_interval(recrawl_all_sites, RECRAWL_SITE_HOURS, 'recrawl_all')
     _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
     if MAINTENANCE_NIGHTLY_ENABLED:
         # One nightly pass at the configured hour; a cron-style trigger keeps it

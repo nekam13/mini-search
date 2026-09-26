@@ -143,6 +143,29 @@
     {% endfor %}
 </div>
 
+{% if image_results %}
+<section class="image-results" aria-label="Obrázky z nalezených stránek">
+    <div class="image-results-head">
+        <h2>Obrázky</h2>
+        <span class="image-results-count">{{ image_results|length }} {{ image_results|length|plural_cz('obrázek', 'obrázky', 'obrázků') }}</span>
+    </div>
+    <p class="image-results-note">Náhledy z nalezených stránek. Obrázky se neindexují jako samostatné stránky.</p>
+    <div class="image-grid">
+        {% for img in image_results %}
+        <figure class="image-card">
+            <a href="{{ img.source_url }}" target="_blank" rel="noopener noreferrer" title="{{ img.title }}">
+                <img src="{{ img.url }}" alt="{{ img.title }}" loading="lazy" referrerpolicy="no-referrer">
+            </a>
+            <figcaption>
+                <span class="image-title">{{ img.title }}</span>
+                <span class="image-domain">{{ img.domain }}</span>
+            </figcaption>
+        </figure>
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
 {% if has_prev or has_next %}
 <nav class="pagination" aria-label="Stránkování výsledků">
     {% if has_prev %}

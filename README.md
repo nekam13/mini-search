@@ -133,6 +133,7 @@ Prvky rozhraní:
 | Filtry | Vše, Články, Podcasty, Audio, Ceny (tlačítka ve stylu chipů) |
 | Řazení | Podle relevance, názvu nebo data (klientsky, bez přenačtení) |
 | Karty výsledků | Strukturované „Rich Results" karty podle typu obsahu (viz níže) |
+| Obrázky | Samostatná sekce s náhledy obrázků z nalezených stránek (viz níže) |
 | Rich Results | Wikipedie, produkt, recept, organizace a článek – každý s vlastními informacemi |
 | Stránkování | 25 výsledků na stránku, parametr `page` (nad 500 výsledků se nepokračuje) |
 | Prázdné stavy | Vysvětlení a přímý odkaz do správy zdrojů, když se nic nenajde |
@@ -172,6 +173,22 @@ Styly karet jsou v `static/css/clay.css` (třídy `.card-rich`, `.card-wiki`,
 `.price-tag`, `.rating-stars`, `.rich-metadata`, `.card-thumbnail`,
 `.card-media-layout`) a používají výhradně existující tokeny design systému.
 Na malých obrazovkách se náhled přesune nad text a zmenší se.
+
+### Sekce obrázků
+
+Pod seznamem výsledků je samostatná sekce „Obrázky" (`.image-results`), která
+zobrazí náhledy z už nalezených stránek. Bere `og:image` a obrázky z JSON-LD
+(`images`), takže se **neukládají ani neindexují jako samostatné stránky** – do
+`pages`, FTS ani crawl fronty se obrázky nikdy nedostanou. Tím se šetří místo
+i RAM na mobilu a zároveň zůstávají obrázky dostupné u výsledků.
+
+- `MINISEARCH_IMAGE_RESULTS` (výchozí 12, `0` sekci vypne) určuje, kolik
+  obrázků se má nejvýše zobrazit.
+- URL obrázků projdou kontrolou `_safe_image_url()` – povoleny jsou jen
+  `http(s)` adresy, `javascript:` a `data:` se zahazují (XSS ochrana).
+- Náhledy se načítají líně (`loading="lazy"`) a bez referreru.
+- Styly jsou v `static/css/search.css` (`.image-grid`, `.image-card`), tokeny
+  zůstávají pouze v `clay.css`.
 
 ## Admin panel (Clay design)
 
@@ -318,10 +335,19 @@ doménu automaticky doménu označí jako lokální.
 
 ## Hybridní vyhledávání
 
-Výsledky jsou řazeny kombinací:
-- **60% vektorové podobnosti** (hnswlib + SentenceTransformers)
-- **35% full-text vyhledávání** (FTS5 s unicode61 tokenizerem pro češtinu)
-- **5% SEO skóre** (přítomnost titulku, popisu, schema markup, atd.)
+Výsledky jsou řazeny kombinací (váhy jdou nastavit přes prostředí):
+- **50% vektorové podobnosti** (hnswlib + SentenceTransformers, případně lokální hashovací fallback)
+- **40% full-text vyhledávání** (FTS5 s unicode61 tokenizerem pro češtinu)
+- **10% SEO skóre** (přítomnost titulku, popisu, schema markup, atd.)
+
+| Proměnná | Výchozí | Význam |
+|---|---|---|
+| `MINISEARCH_VECTOR_WEIGHT` | 50 | váha vektorové podobnosti |
+| `MINISEARCH_FTS_WEIGHT` | 40 | váha plnotextového hledání |
+| `MINISEARCH_SEO_WEIGHT` | 10 | váha SEO skóre |
+
+Váhy by měly dát dohromady 100. Všechny tři sečtou dílčí skóre, které se pak
+ještě vynásobí prioritou webu (místní sítě 3×).
 
 ## Česká Wikipedie
 
@@ -402,6 +428,14 @@ výchozí hodnoty najednou. Konfigurace se čte z prostředí:
 | `MINISEARCH_RETRY_MAX_DELAY` | 5 | Strop exponenciálního backoffu (s) |
 | `MINISEARCH_MAX_BODY_CHARS` | 3500 | Max délka těla stránky |
 | `MINISEARCH_MAX_LINKS_PER_PAGE` | 100 | Max nových odkazů z jedné stránky (0 = vypnuto) |
+| `MINISEARCH_IMAGE_RESULTS` | 12 | Kolik obrázků zobrazit v sekci výsledků (0 = sekce vypnutá) |
+| `MINISEARCH_VECTOR_WEIGHT` | 50 | Váha vektorového hledání (%) |
+| `MINISEARCH_FTS_WEIGHT` | 40 | Váha plnotextového hledání (%) |
+| `MINISEARCH_SEO_WEIGHT` | 10 | Váha SEO skóre (%) |
+| `MINISEARCH_RECRAWL_FEED_HOURS` | 1 | Interval obnovy feedů (0 = vypnuto) |
+| `MINISEARCH_RECRAWL_SITEMAP_HOURS` | 24 | Interval obnovy sitemap (0 = vypnuto) |
+| `MINISEARCH_RECRAWL_SITE_HOURS` | 12 | Interval obnovy webů (0 = vypnuto) |
+| `MINISEARCH_RECRAWL_STALE_HOURS` | 72 | Jak stará stránka se smí obnovit |
 | `MINISEARCH_SQLITE_CACHE_KB` | 2048 (lowmem) / 16384 | Cache SQLite (KiB) |
 | `MINISEARCH_SQLITE_TEMP_STORE` | 1 (lowmem) / 2 | Dočasné tabulky: 0=default, 1=soubor, 2=RAM |
 | `MINISEARCH_HNSW_MAX_ELEMENTS` | 20000 (lowmem) / 100000 | Strop vektorů pro hnswlib index |
@@ -497,8 +531,11 @@ Na pozadí lze údržbu zapnout přes `MINISEARCH_NIGHTLY=1`
 
 - **Canonical URL**: přednostně se použije `<link rel="canonical">`, tracking
   parametry se odstraňují, duplicitní stránky se sloučí pod stejný `url_hash`.
-- **Kódování**: respektuje se `charset` z HTTP hlavičky i z meta tagu
-  (včetně `windows-1250` pro staré české weby).
+- **Kódování**: respektuje se `charset` z HTTP hlavičky, z meta tagu
+  (`<meta charset>` i `<meta http-equiv>`) a nakonec se zkouší UTF-8 a
+  `windows-1250` pro staré české weby. Weby posílané jako `text/html` **bez**
+  uvedeného charsetu se dekódují jako UTF-8 (ať se nerozbijí háčky – dřív
+  vznikalo „KouzelnÃ©").
 - **Metadata**: OpenGraph, Twitter Card a Schema.org JSON-LD (vnořené `@graph`,
   pole `@type`, poškozené bloky se přeskočí, ne zahodí) – autor, datum,
   breadcrumbs, obrázky, audio a typ článku.
@@ -513,7 +550,12 @@ Na pozadí lze údržbu zapnout přes `MINISEARCH_NIGHTLY=1`
   `MINISEARCH_MAX_LINKS_PER_PAGE`. Celkový počet stránek drží `max_pages` webu.
 - **Sitemapy**: `robots.txt` (`Sitemap:`), indexové sitemapy se rekurzivně
   rozbalí, gzip se pozná podle magic bytes (i při špatném `Content-Type`),
-  duplicitní a prázdné `<loc>` se vyčistí a poškozené XML se přeskočí.
+  duplicitní a prázdné `<loc>` se vyčistí a poškozené XML se přeskočí. Čtou se
+  jen přímé potomky `<loc>`, takže se do fronty nedostanou obrázky z rozšíření
+  `<image:loc>`/`<video:loc>`.
+- **Obrázky a přílohy**: URL končící na obrázek/audio/video (`.jpg`, `.png`,
+  `.mp3`, …) se nikdy nezařadí do fronty ani do indexu – zobrazují se pouze
+  v samostatné sekci výsledků.
 - **Odolnost**: jeden velký nebo poškozený článek nezastaví ostatní; těla stránek
   se ořezávají na `MINISEARCH_MAX_BODY_CHARS`.
 
