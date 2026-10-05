@@ -1,0 +1,65 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'cz.minisearch.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "cz.minisearch.app"
+        minSdk 30
+        targetSdk 34
+        versionCode 1
+        versionName "7.5"
+        ndk {
+            // Only 64-bit ARM matters for real phones; keep the APK small.
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        // The bundled Python server is Python 3.13 (matches app_combined.py).
+        version = "3.13"
+        pip {
+            install "-r", rootProject.file("requirements-android.txt").absolutePath
+        }
+        // Flask reads templates/ and static/ from the filesystem, so they must
+        // exist as real files inside the APK, not only as packed assets.
+        extractPackages("templates", "static")
+    }
+    sourceSets {
+        main {
+            // app_combined.py lives at the repository root, one level above
+            // android/. Use an absolute path and whitelist exactly the runtime
+            // files so the Gradle build tree under android/ is never scanned.
+            srcDir(rootProject.projectDir.parentFile)
+            include("app_combined.py", "android_entry.py", "templates/**", "static/**")
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

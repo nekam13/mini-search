@@ -48,7 +48,13 @@ import requests.packages.urllib3.util.connection as urllib3_cn
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 import feedparser
-import extruct
+
+# extruct parses JSON-LD, but drags in rdflib/jstyleson, which have no Android
+# wheels. It is optional: _extract_jsonld() falls back to per-script parsing.
+try:
+    import extruct
+except ImportError:  # pragma: no cover - depends on install profile
+    extruct = None
 
 # numpy/hnswlib are only needed for vector search. The mobile profile
 # (requirements-mobile.txt) omits them, so import defensively and let the
@@ -170,6 +176,11 @@ IMAGE_SEARCH_LIMIT = _env_int("MINISEARCH_IMAGE_SEARCH_LIMIT", 60, 0, 500)
 # Listening port. Kept at 8070 for existing installs, but overridable so a
 # hosted/Termux setup can bind whatever port its environment exposes.
 PORT = _env_int("MINISEARCH_PORT", 8070, 1, 65535)
+# The Android app bundles the server and runs offline: the periodic GitHub
+# update check only makes sense for a git checkout, so it can be switched off
+# (MINISEARCH_UPDATE_CHECK=0) to keep the phone quiet.
+UPDATE_CHECK_ENABLED = os.environ.get(
+    "MINISEARCH_UPDATE_CHECK", "1").strip().lower() not in ("0", "false", "no")
 # File extensions that are never crawled as HTML pages.
 SKIP_LINK_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
@@ -751,7 +762,7 @@ WIKI_IMPORTERS = ('dump', 'api')
 VALID_SITE_STATUSES = ('active', 'blocked', 'paused')
 MAX_PAGES_MIN = 1
 MAX_PAGES_MAX = 10000
-ERROR_LOG_PATH = "logs/errors.log"
+ERROR_LOG_PATH = os.environ.get("MINISEARCH_ERROR_LOG", "logs/errors.log")
 
 DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status)",
@@ -1665,14 +1676,15 @@ def _extract_jsonld(content, base_url=''):
     """
     nodes = []
     types = set()
-    try:
-        data = extruct.extract(content, base_url=base_url or None, syntaxes=['json-ld'])
-        for doc in data.get('json-ld', []):
-            for node in _iter_jsonld_nodes(doc):
-                nodes.append(node)
-                types.update(_schema_types(node))
-    except Exception:
-        nodes = []
+    if extruct is not None:
+        try:
+            data = extruct.extract(content, base_url=base_url or None, syntaxes=['json-ld'])
+            for doc in data.get('json-ld', []):
+                for node in _iter_jsonld_nodes(doc):
+                    nodes.append(node)
+                    types.update(_schema_types(node))
+        except Exception:
+            nodes = []
 
     if not nodes:
         # extruct refuses the whole document when any block is malformed; parse
@@ -2659,8 +2671,11 @@ def recrawl_async(site_id):
 # ============================================================================
 
 def _init_hnsw(dim=384):
-    """Create a fresh hnswlib index with given dimension."""
+    """Create a fresh hnswlib index with given dimension (no-op without hnswlib)."""
     global _hnsw_index
+    if hnswlib is None:
+        _hnsw_index = None
+        return None
     idx = hnswlib.Index(space='cosine', dim=dim)
     idx.init_index(max_elements=HNSW_MAX_ELEMENTS, ef_construction=200, M=16)
     idx.set_ef(50)
@@ -2724,11 +2739,12 @@ def _embeddings_allowed_by_resources():
 def embeddings_enabled():
     """Whether vector search should run at all in this configuration.
 
-    False when embeddings are explicitly disabled, or the numpy/hnswlib stack
-    is missing (mobile profile), or automatic mode finds the device low on RAM
-    or battery. In every one of those cases search falls back to FTS5.
+    False when embeddings are explicitly disabled, or the numpy stack is
+    missing, or automatic mode finds the device low on RAM or battery. When
+    hnswlib is absent (the Android build) vector search still runs through the
+    numpy brute-force path, so only numpy is required here.
     """
-    if np is None or hnswlib is None:
+    if np is None:
         return False
     if EMBEDDINGS_PREF in ('0', 'false', 'off', 'no', 'ne'):
         return False
@@ -2750,6 +2766,10 @@ def get_hnsw_index():
         return None
     model = get_model()
     if model is None:
+        return None
+    if hnswlib is None:
+        # Android build: no approximate index, but vector search still runs via
+        # the numpy brute-force path in vector_search().
         return None
     if _hnsw_index is None:
         # An approximate index over more than HNSW_MAX_ELEMENTS vectors costs
@@ -2807,7 +2827,7 @@ def _load_embeddings_into_index():
 def _rebuild_hnsw_index():
     """Rebuild index from scratch (called after delete). No-op if disabled."""
     global _hnsw_index
-    if not embeddings_enabled():
+    if not embeddings_enabled() or hnswlib is None:
         _hnsw_index = None
         return
     model = get_model()
@@ -3022,6 +3042,47 @@ def _site_priority_multiplier(site_id):
         return PUBLIC_SITE_PRIORITY_MULTIPLIER
 
 
+def _bruteforce_neighbours(query_embedding, k):
+    """Exact cosine neighbours over the stored embeddings, using numpy only.
+
+    Fallback for builds without hnswlib (the Android APK): the whole vector
+    column is streamed in pages and scored in one vectorised pass, so a
+    phone-sized index stays fast enough without the approximate index.
+    """
+    q = np.asarray(query_embedding, dtype=np.float32).ravel()
+    q_norm = float(np.linalg.norm(q)) or 1.0
+    scored = []
+    last_id = 0
+    while True:
+        rows = execute_db_fetchall(
+            """SELECT id, embedding FROM pages
+               WHERE embedding IS NOT NULL AND id > ?
+               ORDER BY id ASC LIMIT 1000""",
+            (last_id,)
+        )
+        if not rows:
+            break
+        ids, vecs = [], []
+        for row in rows:
+            last_id = row[0]
+            try:
+                emb = np.frombuffer(row[1], dtype=np.float32)
+            except Exception:
+                continue
+            if emb.size == q.size:
+                ids.append(row[0])
+                vecs.append(emb)
+        if vecs:
+            matrix = np.vstack(vecs)
+            norms = np.linalg.norm(matrix, axis=1)
+            norms[norms == 0] = 1.0
+            sims = (matrix @ q) / (norms * q_norm)
+            for page_id, sim in zip(ids, sims):
+                scored.append((page_id, 1.0 - float(sim)))
+    scored.sort(key=lambda item: item[1])
+    return scored[:k]
+
+
 def vector_search(query, limit=25, filter_type=None):
     """Search with hnswlib; local sites are boosted by their multiplier.
 
@@ -3029,19 +3090,27 @@ def vector_search(query, limit=25, filter_type=None):
     :func:`hybrid_search` silently falls back to full-text search.
     """
     idx = get_hnsw_index()
-    if idx is None or idx.element_count == 0:
+    if idx is not None and idx.element_count == 0:
         return []
 
     query_embedding = generate_embedding(query)
     if query_embedding is None:
         return []
-    k = min(limit * 3, idx.element_count)
-    labels, distances = idx.knn_query(query_embedding, k=k)
+
+    # hnswlib is optional (it is not available for the Android build). Without
+    # it, score the stored vectors directly with numpy: slower, but exact and
+    # it keeps vector search alive on a phone instead of dropping to FTS5.
+    if idx is None:
+        neighbours = _bruteforce_neighbours(query_embedding, limit * 3)
+    else:
+        k = min(limit * 3, idx.element_count)
+        labels, distances = idx.knn_query(query_embedding, k=k)
+        neighbours = list(zip(labels[0], distances[0]))
 
     results = []
     seen_texts = []
 
-    for label, distance in zip(labels[0], distances[0]):
+    for label, distance in neighbours:
         if len(results) >= limit:
             break
         if label < 0:
@@ -5326,8 +5395,14 @@ def handle_shutdown(signum, frame):
     sys.exit(0)
 
 
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
+# Embedded runtimes (e.g. Chaquopy on Android) may import this module off the
+# main thread, where signal.signal raises ValueError. Shutdown handlers are a
+# nicety for the desktop/CLI server, not a requirement, so ignore that case.
+try:
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+except (ValueError, OSError):
+    pass
 
 
 # ============================================================================
@@ -5349,6 +5424,30 @@ def _plural_cz(count, one, few, many):
 app = Flask(__name__)
 app.secret_key = 'mini-search-secret-key'
 app.jinja_env.filters['plural_cz'] = _plural_cz
+
+# The Android app runs this same server on 127.0.0.1 and shows the public
+# search page in a WebView, so /admin must not be reachable from the LAN when
+# the desktop server binds 0.0.0.0. MINISEARCH_ADMIN_LOCAL_ONLY=1 (the app
+# sets it) keeps the admin panel loopback-only, while the public search page
+# stays available to the network.
+ADMIN_LOCAL_ONLY = os.environ.get(
+    "MINISEARCH_ADMIN_LOCAL_ONLY", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _request_is_local():
+    """True when the request originates from this device (loopback)."""
+    addr = (request.remote_addr or '').strip()
+    return addr in ('127.0.0.1', '::1', 'localhost') or addr.startswith('127.')
+
+
+@app.before_request
+def _guard_admin_to_localhost():
+    if not ADMIN_LOCAL_ONLY:
+        return None
+    path = request.path or ''
+    if (path == '/admin' or path.startswith('/admin/')) and not _request_is_local():
+        return ('Administrace je dostupná jen z tohoto zařízení.', 403)
+    return None
 
 SEARCH_PAGE_SIZE = 25
 # Hard ceiling on how many results a single query may pull from the index.
@@ -6533,6 +6632,68 @@ def _cli_maintenance(args):
     return 0
 
 
+def run_server(host=None, port=None):
+    """Start the Flask server plus background workers.
+
+    Used both by the CLI entry point below and by the Android wrapper
+    (``android_entry.py``), which runs the server in a background thread.
+    ``host`` defaults to ``MINISEARCH_HOST`` / 0.0.0.0 so the desktop server
+    stays reachable on the LAN, while the app binds to loopback only.
+    """
+    global _scheduler
+    host = host or os.environ.get('MINISEARCH_HOST', '0.0.0.0')
+    port = int(port or PORT)
+
+    get_db()
+    print('Database initialized')
+
+    # Vector search is a pure optimisation: crawl, sitemap and link discovery
+    # never depend on it, and lowmem only turns the embeddings off. If the
+    # hnswlib/model stack is unavailable we say so and fall back to FTS5.
+    if embeddings_enabled() and get_hnsw_index() is not None:
+        print('hnswlib index initialized')
+    if embeddings_enabled() and get_model() is not None:
+        print('Model loaded')
+    else:
+        print('Embeddings off - FTS5 fallback active (crawling unaffected)')
+
+    _scheduler = BackgroundScheduler()
+
+    # Interval jobs are registered only when their configured period is > 0,
+    # so setting e.g. MINISEARCH_RECRAWL_SITE_HOURS=0 on a phone skips the
+    # expensive full recrawl entirely instead of merely stretching it out.
+    def _add_interval(job, hours, job_id):
+        if hours <= 0:
+            print(f"Job {job_id} disabled (interval 0)")
+            return
+        _scheduler.add_job(job, IntervalTrigger(hours=hours), id=job_id)
+
+    _add_interval(check_feeds, RECRAWL_FEED_HOURS, 'check_feeds')
+    _add_interval(check_sitemaps, RECRAWL_SITEMAP_HOURS, 'check_sitemaps')
+    _add_interval(recrawl_all_sites, RECRAWL_SITE_HOURS, 'recrawl_all')
+    if UPDATE_CHECK_ENABLED:
+        _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
+    if MAINTENANCE_NIGHTLY_ENABLED:
+        # One nightly pass at the configured hour; a cron-style trigger keeps it
+        # out of the user's way far better than an interval job.
+        from apscheduler.triggers.cron import CronTrigger
+        _scheduler.add_job(maintenance_scheduled,
+                           CronTrigger(hour=MAINTENANCE_NIGHTLY_HOUR),
+                           id='nightly_maintenance')
+        print(f"Nightly maintenance scheduled at {MAINTENANCE_NIGHTLY_HOUR:02d}:00")
+    _scheduler.start()
+    print('Scheduler started')
+
+    start_workers()
+
+    print()
+    print(f'http://{host}:{port}')
+    print('Ctrl+C to stop')
+    print('=' * 70)
+
+    app.run(host=host, port=port, debug=False, threaded=True)
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -6580,50 +6741,4 @@ if __name__ == '__main__':
     print('Mini Search v7.5 - Hybrid Search Engine')
     print('=' * 70)
 
-    get_db()
-    print('Database initialized')
-
-    # Vector search is a pure optimisation: crawl, sitemap and link discovery
-    # never depend on it, and lowmem only turns the embeddings off. If the
-    # hnswlib/model stack is unavailable we say so and fall back to FTS5.
-    if embeddings_enabled() and get_hnsw_index() is not None:
-        print('hnswlib index initialized')
-    if embeddings_enabled() and get_model() is not None:
-        print('Model loaded')
-    else:
-        print('Embeddings off - FTS5 fallback active (crawling unaffected)')
-
-    _scheduler = BackgroundScheduler()
-
-    # Interval jobs are registered only when their configured period is > 0,
-    # so setting e.g. MINISEARCH_RECRAWL_SITE_HOURS=0 on a phone skips the
-    # expensive full recrawl entirely instead of merely stretching it out.
-    def _add_interval(job, hours, job_id):
-        if hours <= 0:
-            print(f"Job {job_id} disabled (interval 0)")
-            return
-        _scheduler.add_job(job, IntervalTrigger(hours=hours), id=job_id)
-
-    _add_interval(check_feeds, RECRAWL_FEED_HOURS, 'check_feeds')
-    _add_interval(check_sitemaps, RECRAWL_SITEMAP_HOURS, 'check_sitemaps')
-    _add_interval(recrawl_all_sites, RECRAWL_SITE_HOURS, 'recrawl_all')
-    _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
-    if MAINTENANCE_NIGHTLY_ENABLED:
-        # One nightly pass at the configured hour; a cron-style trigger keeps it
-        # out of the user's way far better than an interval job.
-        from apscheduler.triggers.cron import CronTrigger
-        _scheduler.add_job(maintenance_scheduled,
-                           CronTrigger(hour=MAINTENANCE_NIGHTLY_HOUR),
-                           id='nightly_maintenance')
-        print(f"Nightly maintenance scheduled at {MAINTENANCE_NIGHTLY_HOUR:02d}:00")
-    _scheduler.start()
-    print('Scheduler started')
-
-    start_workers()
-
-    print()
-    print(f'http://0.0.0.0:{PORT}')
-    print('Ctrl+C to stop')
-    print('=' * 70)
-
-    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+    run_server()

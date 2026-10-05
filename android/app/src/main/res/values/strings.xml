@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Mini Search</string>
+    <string name="tab_search">Vyhledávač</string>
+    <string name="tab_admin">Správa</string>
+    <string name="service_channel">Běh serveru</string>
+    <string name="service_text">Mini Search indexuje na pozadí</string>
+</resources>

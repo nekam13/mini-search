@@ -1,0 +1,19 @@
+# Mini Search – Android APK.
+#
+# Python packages bundled into the APK. This mirrors requirements-mobile.txt
+# (no torch / sentence-transformers), so search uses the dependency-free
+# hashing embedder. numpy is included so vector search still works: hnswlib is
+# not available for Android, but app_combined.py falls back to an exact numpy
+# brute-force neighbour search. lxml is included because the crawler parses
+# pages with BeautifulSoup(..., 'lxml').
+flask>=3.0.0
+apscheduler>=3.10.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+feedparser>=6.0.0
+markupsafe
+numpy
+# extruct is intentionally omitted: it needs rdflib/jstyleson, which have no
+# Android wheels. app_combined.py falls back to its own per-script JSON-LD
+# parser when extruct is not importable.

@@ -346,3 +346,34 @@ scheduler only registers a job when its interval is non-zero.
   stated requirement.
 - Prefer editing `app_combined.py` directly; the project deliberately keeps a
   single-file backend.
+
+## Android APK (`android/`)
+
+An APK bundles the same `app_combined.py` server via Chaquopy (Python 3.13) and
+shows it in a WebView; it does **not** need Termux. `android_entry.py` is the
+Python entry point (sets lowmem/loopback env, starts `run_server()` in a thread);
+Kotlin `MainActivity` + `ServerService` keep it running. Build with
+`cd android && gradle :app:assembleDebug`; the built APK is committed as
+`mini-search-*-debug.apk`.
+
+Facts to preserve:
+
+- `chaquopy.sourceSets.main.srcDir(rootProject.projectDir.parentFile)` with an
+  `include(...)` whitelist is required: a plain relative `srcDir("..")` resolves
+  under `src/main` and silently bundles no Python, and pointing the source root
+  at the repo without the whitelist makes Gradle scan its own build tree
+  (circular task dependency).
+- `templates/` and `static/` are bundled inside `app.imy` and extracted
+  automatically because they are non-Python top-level dirs (see Chaquopy
+  `importer.py`); `extractPackages` is only needed for Python packages.
+- `extruct` is **not** in `requirements-android.txt` (needs rdflib/jstyleson,
+  no Android wheels); the import is guarded and `_extract_jsonld()` falls back
+  to per-script parsing.
+- `hnswlib` has no Android wheel, but `numpy` does. `vector_search()` falls
+  back to `_bruteforce_neighbours()` (exact numpy cosine) when `hnswlib` is
+  `None`, so vectors keep working in the APK; `embeddings_enabled()` only
+  requires numpy. `get_hnsw_index()` / `_init_hnsw()` / `_rebuild_hnsw_index()`
+  must all tolerate `hnswlib is None`.
+- `MINISEARCH_ADMIN_LOCAL_ONLY=1` (set by `android_entry.py`) keeps `/admin`
+  loopback-only so the admin panel never leaks onto the LAN.
+
