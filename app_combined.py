@@ -223,6 +223,7 @@ HNSW_MAX_ELEMENTS = _env_int(
 WIKI_DEFAULT_LANG = os.environ.get("MINISEARCH_WIKI_LANG", "cs")
 WIKI_API_BATCH = _env_int("MINISEARCH_WIKI_BATCH", 50, 1, 50)
 WIKI_IMPORT_RETRIES = _env_int("MINISEARCH_WIKI_RETRIES", 3, 0, 10)
+WIKI_API_USER_AGENT = "mini-search/7.5 (https://github.com/nekam13/mini-search)"
 # How many images per wiki article are stored for the image grid. The dump only
 # carries file names, so each one costs a short URL; a handful is plenty for a
 # thumbnail row and keeps a phone's storage flat.
@@ -1834,6 +1835,11 @@ def _http_get(url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES, purpose='fe
 
     attempts = max(1, int(max_retries or 1))
     session = _get_http_session()
+    headers = dict(kwargs.pop('headers', {}) or {})
+    if purpose == 'wiki-api':
+        headers['User-Agent'] = WIKI_API_USER_AGENT
+    if headers:
+        kwargs['headers'] = headers
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -2185,7 +2191,8 @@ def normalize_wiki_source(url, importer=None):
     # A local dump path implies the dump importer; the site it belongs to is
     # still the corresponding language wiki, inferred from the filename.
     if value.lower().startswith('file://'):
-        return f"https://{lang_from_wiki_url(value)}.wikipedia.org", 'dump', lang
+        lang = lang_from_wiki_url(value)
+        return f"https://{lang}.wikipedia.org", 'dump', lang
 
     if value.lower().startswith('wiki:'):
         lang = value.split(':', 1)[1].strip() or lang
@@ -2734,6 +2741,22 @@ def _embeddings_allowed_by_resources():
     if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
         return False
     return True
+
+
+def _embeddings_resource_status():
+    """Return resource decision details for auto embeddings mode."""
+    free_mb = _available_memory_mb()
+    percent, charging = _battery_status()
+    allowed = True
+    reasons = []
+    if free_mb is not None and free_mb < EMBED_MIN_FREE_MB:
+        allowed = False
+        reasons.append(f"volná RAM {free_mb:.0f} MB < {EMBED_MIN_FREE_MB} MB")
+    if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
+        allowed = False
+        reasons.append(
+            f"baterie {percent}% < {EMBED_MIN_BATTERY_PCT}% (není na nabíječce)")
+    return allowed, free_mb, percent, charging, reasons
 
 
 def embeddings_enabled():
@@ -3913,7 +3936,7 @@ def wiki_lang_and_importer(source):
     ``dump_path`` is set only when the source points at a local dump file.
     """
     raw = (source.get('url') or '').strip()
-    importer = (source.get('importer') or 'dump').strip().lower()
+    importer = (source.get('importer') or 'api').strip().lower()
     if importer not in WIKI_IMPORTERS:
         importer = 'api'
     dump_path = ''
@@ -3929,10 +3952,12 @@ def lang_from_wiki_url(url):
     if match:
         return match.group(1)
     value = (url or '').strip().lower()
+    if value.startswith('wiki:'):
+        value = value.split(':', 1)[1].strip()
     if re.fullmatch(r'[a-z]{2,3}(-[a-z]+)?', value):
         return value
     # A local dump filename looks like ``cswiki-latest-pages-articles...``.
-    match = re.search(r'/([a-z\-]+)wiki-', value)
+    match = re.search(r'(?:^|[\\/])([a-z\-]+)wiki-', value)
     if match:
         return match.group(1)
     return WIKI_DEFAULT_LANG
@@ -3948,6 +3973,8 @@ def run_wiki_import(source, max_pages=None, allow_indexed_refresh=False):
     """
     source_id = source['id']
     site_id = source['site_id']
+    if source.get('status') == 'paused':
+        return 0
     lang, importer, dump_path = wiki_lang_and_importer(source)
 
     try:
@@ -4331,11 +4358,21 @@ def _iter_wiki_articles_api(lang, resume_title, max_pages):
     if resume_title:
         params['apfrom'] = resume_title
     yielded = 0
+    throttled = 0
     while yielded < max_pages:
         try:
             resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
                              params=params, purpose='wiki-api')
+            if resp.status_code == 429:
+                throttled += 1
+                if throttled > max(1, WIKI_IMPORT_RETRIES + 2):
+                    log_error(f"Wiki API list rate-limited too long for {lang}")
+                    return
+                time.sleep(_retry_after_delay(resp) or _retry_delay(throttled))
+                continue
+            throttled = 0
             if resp.status_code != 200:
+                log_error(f"Wiki API list HTTP {resp.status_code} for {lang}")
                 return
             payload = resp.json()
         except Exception as e:
@@ -4372,28 +4409,48 @@ def _fetch_wiki_api_batch(lang, titles):
         'explaintext': '1', 'exintro': '0', 'inprop': 'url',
         'piprop': 'original', 'redirects': '1', 'titles': '|'.join(titles),
     }
-    try:
-        resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
-                         params=params, purpose='wiki-api')
-        if resp.status_code != 200:
+    seen_titles = set()
+    throttled = 0
+    while True:
+        try:
+            resp = _http_get(api, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
+                             params=params, purpose='wiki-api')
+            if resp.status_code == 429:
+                throttled += 1
+                if throttled > max(1, WIKI_IMPORT_RETRIES + 2):
+                    log_error(f"Wiki API extract rate-limited too long for {lang}")
+                    return
+                time.sleep(_retry_after_delay(resp) or _retry_delay(throttled))
+                continue
+            throttled = 0
+            if resp.status_code != 200:
+                log_error(f"Wiki API extract HTTP {resp.status_code} for {lang}")
+                return
+            payload = resp.json()
+        except Exception as e:
+            log_error(f"Wiki API extract failed for {lang}", e)
             return
-        payload = resp.json()
-    except Exception as e:
-        log_error(f"Wiki API extract failed for {lang}", e)
-        return
-    for page in ((payload.get('query', {}) or {}).get('pages', {}) or {}).values():
-        if 'missing' in page:
-            continue
-        original = (page.get('original') or {}).get('source') or ''
-        yield {
-            'title': page.get('title') or '',
-            'redirect': '',
-            'timestamp': 0,
-            'text': page.get('extract') or '',
-            'html': '',
-            'skip': False,
-            'image': original,
-        }
+        for page in ((payload.get('query', {}) or {}).get('pages', {}) or {}).values():
+            if 'missing' in page:
+                continue
+            title = page.get('title') or ''
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            original = (page.get('original') or {}).get('source') or ''
+            yield {
+                'title': title,
+                'redirect': '',
+                'timestamp': 0,
+                'text': page.get('extract') or '',
+                'html': '',
+                'skip': False,
+                'image': original,
+            }
+        cont = payload.get('continue', {}) or {}
+        if not cont:
+            return
+        params.update(cont)
 
 
 def empty_page_data(url, site_id):
@@ -5153,6 +5210,18 @@ def maintenance_backfill_embeddings(batch=None):
     embeddings, and processes a bounded batch so one night cannot exhaust RAM
     or battery. Returns the number of pages embedded.
     """
+    if EMBEDDINGS_PREF == 'auto':
+        allowed, free_mb, percent, charging, reasons = _embeddings_resource_status()
+        if not allowed:
+            charging_label = 'ano' if charging else 'ne'
+            percent_label = "neznámé" if percent is None else f"{percent}%"
+            free_label = "neznámá" if free_mb is None else f"{free_mb:.0f} MB"
+            maintenance_log(
+                "embeddings odloženo: "
+                + "; ".join(reasons)
+                + f" (volná RAM: {free_label}, baterie: {percent_label}, nabíjení: {charging_label})"
+            )
+            return 0
     if not embeddings_enabled():
         return 0
     if batch is None:
@@ -6632,6 +6701,14 @@ def _cli_maintenance(args):
     return 0
 
 
+def _cli_recrawl_feeds():
+    """Run feed recrawl once from CLI and exit (no Flask server)."""
+    get_db()
+    check_feeds()
+    print("Kontrola feedů dokončena")
+    return 0
+
+
 def run_server(host=None, port=None):
     """Start the Flask server plus background workers.
 
@@ -6729,6 +6806,8 @@ if __name__ == '__main__':
                         help='Přeskočit PRAGMA optimize / VACUUM')
     parser.add_argument('--link-check', type=int, default=None,
                         help='Kolik nejstarších stránek ověřit na 404 (0 vypne)')
+    parser.add_argument('--recrawl-feeds', action='store_true',
+                        help='Spustit okamžitou kontrolu feed zdrojů a skončit')
     args = parser.parse_args()
 
     if args.maintenance:
@@ -6736,6 +6815,8 @@ if __name__ == '__main__':
 
     if args.import_wiki or args.source_id:
         raise SystemExit(_cli_import_wiki(args))
+    if args.recrawl_feeds:
+        raise SystemExit(_cli_recrawl_feeds())
 
     print('=' * 70)
     print('Mini Search v7.5 - Hybrid Search Engine')
