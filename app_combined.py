@@ -7451,7 +7451,7 @@ def admin_errors(site_id):
     return jsonify([{'url': r[0], 'error': r[1]} for r in rows])
 
 
-@app.route('/admin/check-update')
+@app.route('/admin/check-update', methods=['POST'])
 def admin_check_update():
     if BUNDLED_RUNTIME:
         return redirect('/admin?error=V aplikaci se aktualizace z Gitu nepoužívá.')
@@ -7465,7 +7465,7 @@ def admin_check_update():
         return redirect(f'/admin?error=Chyba při kontrole aktualizace: {str(e)}')
 
 
-@app.route('/admin/apply-update')
+@app.route('/admin/apply-update', methods=['POST'])
 def admin_apply_update():
     if BUNDLED_RUNTIME:
         return redirect('/admin?error=Aplikace běží z APK a sama sebe neaktualizuje.')

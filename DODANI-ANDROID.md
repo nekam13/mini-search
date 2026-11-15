@@ -188,7 +188,26 @@ Release se podepisuje jen dodatečným klíčem přes bezpečnou konfiguraci; kl
 hesla nejsou součástí repozitáře a žádný produktivně podepsaný release není
 tvzen.
 
-## 8. Omezení prostředí během práce
+## 8. Reprodukovatelnost
+
+Build byl ověřen dvakrát z čistého klonu (commit `36735a1`) a výsledek je
+**funkčně shodný**:
+
+- V plné variantě má zabalený model přesně SHA-256
+  `783fea82d71a58179b830a4dbd2d58447e640609e98eedf9ffa12622d375a672` (shodný
+  s připnutou hodnotou v `build.gradle`), tokenizer i nativní knihovny
+  `libonnxruntime*.so` jsou přítomné.
+- V malé variantě jsou `templates/` (13 souborů) i `static/` (8) v `app.imy`
+  a v zabalené podobě obsahují opravené POST formuláře.
+- Těla přeložených modulů (`app_combined.pyc`, `android_entry.pyc`) jsou
+  **bajtově shodná**; liší se jen 4bajtová hlavička s časem překladu.
+
+Bajtová shoda celého APK není zaručena: ZIP záznamy nesou časové značky,
+Python `.pyc` obsahuje mtime a `classes*.dex` / `requirements-common.imy` nesou
+metadata nástrojů. Ověřená je proto **obsahová** reprodukovatelnost, ne
+bit-identický soubor.
+
+## 9. Omezení prostředí během práce
 
 Prostředí bylo v průběhu práce restartováno a přišlo o `/opt/jdk17`,
 `/opt/android-sdk` i Python závislosti. Vše bylo znovu nainstalováno (JDK 17

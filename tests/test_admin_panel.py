@@ -166,6 +166,13 @@ check("all active", all(s["status"] == "active" for s in m.get_all_sites()))
 resp = client.get("/admin/pause-all", follow_redirects=False)
 check("GET pause-all is refused", resp.status_code == 405, str(resp.status_code))
 
+# --- 16b. update endpoints are POST-only (never a GET link) ---
+for path in ("/admin/check-update", "/admin/apply-update"):
+    resp = client.get(path, follow_redirects=False)
+    check(f"GET {path} is refused", resp.status_code == 405, str(resp.status_code))
+resp = client.post("/admin/check-update", follow_redirects=False)
+check("POST check-update redirects", resp.status_code == 302, str(resp.status_code))
+
 # --- 17. migration from legacy sites/sitemaps_feeds ---
 legacy_conn = m.get_db()
 legacy_conn.execute("INSERT INTO sites (canonical_url) VALUES ('legacy.test')")

@@ -60,10 +60,14 @@
         <div class="stat-card"><div class="stat-value" style="font-size:1.1rem">{{ update_status.last_check_str }}</div><div class="stat-label">Poslední kontrola</div></div>
     </div>
     <div class="actions">
-        <a href="/admin/check-update" class="btn btn-secondary">Zkontrolovat aktualizace</a>
+        <form method="post" action="/admin/check-update" class="inline-form">
+            <button type="submit" class="btn btn-secondary">Zkontrolovat aktualizace</button>
+        </form>
         {% if update_status.update_available %}
-        <a href="/admin/apply-update" class="btn btn-primary"
-           onclick="return confirm('Opravdu provést aktualizaci?')">Aktualizovat</a>
+        <form method="post" action="/admin/apply-update" class="inline-form"
+              onsubmit="return confirm('Opravdu provést aktualizaci?')">
+            <button type="submit" class="btn btn-primary">Aktualizovat</button>
+        </form>
         {% endif %}
     </div>
 </div>
