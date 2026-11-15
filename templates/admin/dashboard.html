@@ -44,6 +44,7 @@
     </div>
 </div>
 
+{% if not bundled_runtime %}
 <div class="card">
     <div class="card-header"><h2>Stav aktualizací</h2></div>
     <div class="stats-grid">
@@ -60,6 +61,7 @@
         {% endif %}
     </div>
 </div>
+{% endif %}
 
 <div class="card">
     <div class="card-header">

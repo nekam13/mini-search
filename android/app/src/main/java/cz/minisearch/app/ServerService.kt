@@ -60,7 +60,7 @@ class ServerService : Service() {
 
     private fun stopServerAndSelf() {
         UserState.serverEnabled = false
-        ServerController.stop(this)
+        ServerController.stop()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

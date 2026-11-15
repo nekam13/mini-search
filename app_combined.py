@@ -6995,6 +6995,7 @@ def admin_index():
         stats=get_db_stats(),
         sites=get_all_sites()[:6],
         update_status=get_update_status(),
+        bundled_runtime=BUNDLED_RUNTIME,
         message=message,
         message_ok=ok,
     )

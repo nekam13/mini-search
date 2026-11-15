@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
-import android.os.Build
 
 /**
  * Real device battery and memory facts for the ``auto`` embeddings mode.
@@ -89,7 +88,7 @@ object SystemStatus {
         val ctx = appContext ?: return null
         return try {
             val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) am.isLowRamDevice else null
+            am.isLowRamDevice
         } catch (t: Throwable) {
             null
         }

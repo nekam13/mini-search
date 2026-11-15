@@ -139,6 +139,17 @@ def main():
           str(resp.status_code))
 
     # ------------------------------------------------------------------
+    # 3b. A bundled runtime hides the misleading git-update controls
+    # ------------------------------------------------------------------
+    m.BUNDLED_RUNTIME = True
+    bundled_html = client.get("/admin").get_data(as_text=True)
+    check("bundled runtime hides the update card",
+          "Stav aktualizací" not in bundled_html, "update card still shown")
+    check("bundled runtime hides the check-update action",
+          "/admin/check-update" not in bundled_html, "link still shown")
+    m.BUNDLED_RUNTIME = False
+
+    # ------------------------------------------------------------------
     # 4. Stop tears everything down
     # ------------------------------------------------------------------
     check("stop returns True", m.stop_server() is True)

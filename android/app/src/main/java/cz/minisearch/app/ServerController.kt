@@ -111,7 +111,7 @@ object ServerController {
     }
 
     /** Stop the server and release its resources; safe to call when stopped. */
-    fun stop(context: Context) {
+    fun stop() {
         synchronized(lock) {
             if (inFlight) {
                 Log.i(TAG, "stop requested while busy; will retry")
