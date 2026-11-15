@@ -3331,14 +3331,20 @@ class _SpmTokenizer:
         return [token_id for _, _, token_id in fused]
 
     def encode(self, text, max_length=128):
-        """Ids with ``<s>``/``</s>``, truncated to ``max_length`` tokens."""
+        """Ids with ``<s>``/``</s>``, truncated to ``max_length`` tokens.
+
+        Truncation keeps the special tokens and cuts the *content*, matching the
+        reference pipeline's ``max_seq_length`` behaviour: the model always sees
+        a leading ``<s>`` and a trailing ``</s>``, never a dangling content run.
+        """
         words = self.normalize(text or '').split()
         if not words:
             content = []
         else:
             joined = '\u2581' + '\u2581'.join(words)
             content = self._unigram(joined)
-        return ([0] + content + [2])[:max_length]
+        budget = max(max_length - 2, 0)
+        return [0] + content[:budget] + [2]
 
     def tokenize(self, text):
         """Content pieces (no special tokens); used by tests and diagnostics."""
@@ -3367,11 +3373,11 @@ def get_tokenizer():
         return None
     path = os.environ.get('MINISEARCH_TOKENIZER')
     if not path:
+        root = os.path.dirname(os.path.abspath(__file__))
         candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         'android', 'ml', 'tokenizer_spm.bin'),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+            os.path.join(root, 'android', 'app', 'src', 'main', 'assets',
                          'ml', 'tokenizer_spm.bin'),
+            os.path.join(root, 'ml', 'tokenizer_spm.bin'),
         ]
         for candidate in candidates:
             if os.path.exists(candidate):

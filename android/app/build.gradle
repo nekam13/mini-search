@@ -4,6 +4,137 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// ---------------------------------------------------------------------------
+// Real multilingual embedding model (paraphrase-multilingual-MiniLM-L12-v2).
+//
+// The model is the ONNX export pinned to one revision; it is bundled inside the
+// APK so the phone runs genuine semantic search offline, with no hidden download
+// and no PyTorch. The 118 MB artifact is fetched once at build time and verified
+// against its SHA-256, so a clean checkout reproduces the same APK.
+//
+//   ./gradlew :app:assembleDebug                       # bundles the model
+//   ./gradlew :app:assembleDebug -PskipEmbeddingModel  # small APK, hash fallback
+//   ./gradlew :app:assembleDebug -PembeddingModel=/path/to/model.onnx
+// ---------------------------------------------------------------------------
+def embeddingModelRevision = "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+def embeddingModelSha256 = "783fea82d71a58179b830a4dbd2d58447e640609e98eedf9ffa12622d375a672"
+def embeddingModelUrl = "https://huggingface.co/sentence-transformers/" +
+        "paraphrase-multilingual-MiniLM-L12-v2/resolve/${embeddingModelRevision}/" +
+        "onnx/model_qint8_arm64.onnx"
+def embeddingModelAsset = file("${projectDir}/src/main/assets/embedding/model_qint8_arm64.onnx")
+def skipEmbeddingModel = project.hasProperty("skipEmbeddingModel")
+
+// The sentencepiece tokenizer asset is *derived* from the upstream
+// ``tokenizer.json`` at the same pinned revision. It is generated (not committed)
+// so the APK's vocabulary provably comes from the pinned model, exactly like the
+// weights. ``tools/build_tokenizer.py`` only needs the stdlib.
+def tokenizerJsonSha256 = "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8"
+def tokenizerJsonUrl = "https://huggingface.co/sentence-transformers/" +
+        "paraphrase-multilingual-MiniLM-L12-v2/resolve/${embeddingModelRevision}/tokenizer.json"
+def tokenizerAsset = file("${projectDir}/src/main/assets/ml/tokenizer_spm.bin")
+
+def sha256Of = { File f ->
+    def digest = java.security.MessageDigest.getInstance("SHA-256")
+    f.withInputStream { stream ->
+        byte[] buffer = new byte[1 << 16]
+        int read
+        while ((read = stream.read(buffer)) > 0) digest.update(buffer, 0, read)
+    }
+    return digest.digest().collect { String.format("%02x", it) }.join()
+}
+
+tasks.register("fetchEmbeddingModel") {
+    description = "Downloads and verifies the pinned multilingual MiniLM ONNX model."
+    def override = project.findProperty("embeddingModel")
+    outputs.file(embeddingModelAsset)
+    outputs.upToDateWhen { embeddingModelAsset.exists() &&
+            (skipEmbeddingModel || sha256Of(embeddingModelAsset) == embeddingModelSha256) }
+    doLast {
+        if (skipEmbeddingModel) {
+            logger.lifecycle("skipEmbeddingModel set: APK will use the hash fallback")
+            return
+        }
+        if (override) {
+            def src = file(override)
+            if (!src.exists()) throw new GradleException("embeddingModel not found: $src")
+            if (sha256Of(src) != embeddingModelSha256) {
+                throw new GradleException("embeddingModel checksum mismatch: $src")
+            }
+            embeddingModelAsset.parentFile.mkdirs()
+            embeddingModelAsset.bytes = src.bytes
+            logger.lifecycle("Embedding model copied from $src")
+            return
+        }
+        if (embeddingModelAsset.exists() &&
+                sha256Of(embeddingModelAsset) == embeddingModelSha256) {
+            logger.lifecycle("Embedding model already present and verified")
+            return
+        }
+        embeddingModelAsset.parentFile.mkdirs()
+        def tmp = new File(embeddingModelAsset.parentFile, "model.download")
+        logger.lifecycle("Downloading embedding model (118 MB) from $embeddingModelUrl")
+        new URL(embeddingModelUrl).withInputStream { input ->
+            tmp.withOutputStream { output -> output << input }
+        }
+        def actual = sha256Of(tmp)
+        if (actual != embeddingModelSha256) {
+            tmp.delete()
+            throw new GradleException(
+                    "Embedding model checksum mismatch: expected $embeddingModelSha256, got $actual")
+        }
+        if (!tmp.renameTo(embeddingModelAsset)) {
+            embeddingModelAsset.bytes = tmp.bytes
+            tmp.delete()
+        }
+        logger.lifecycle("Embedding model verified (${embeddingModelAsset.length()} bytes)")
+    }
+}
+
+tasks.register("fetchTokenizerAsset") {
+    description = "Builds the compact sentencepiece asset from the pinned tokenizer.json."
+    def override = project.findProperty("tokenizerJson")
+    outputs.file(tokenizerAsset)
+    outputs.upToDateWhen { tokenizerAsset.exists() && tokenizerAsset.length() > 0 }
+    doLast {
+        if (tokenizerAsset.exists() && tokenizerAsset.length() > 0) {
+            logger.lifecycle("Tokenizer asset already present (${tokenizerAsset.length()} bytes)")
+            return
+        }
+        tokenizerAsset.parentFile.mkdirs()
+        def json = new File(tokenizerAsset.parentFile, "tokenizer.json.download")
+        if (override) {
+            def src = file(override)
+            if (!src.exists()) throw new GradleException("tokenizerJson not found: $src")
+            if (sha256Of(src) != tokenizerJsonSha256) {
+                throw new GradleException("tokenizerJson checksum mismatch: $src")
+            }
+            json.bytes = src.bytes
+        } else {
+            logger.lifecycle("Downloading tokenizer.json from $tokenizerJsonUrl")
+            new URL(tokenizerJsonUrl).withInputStream { input ->
+                json.withOutputStream { output -> output << input }
+            }
+            def actual = sha256Of(json)
+            if (actual != tokenizerJsonSha256) {
+                json.delete()
+                throw new GradleException(
+                        "tokenizer.json checksum mismatch: expected $tokenizerJsonSha256, got $actual")
+            }
+        }
+        def script = new File(rootProject.projectDir.parentFile, "tools/build_tokenizer.py")
+        if (!script.exists()) throw new GradleException("missing ${script}")
+        def python = System.getenv("PYTHON") ?: "python3"
+        def proc = [python, script.absolutePath, json.absolutePath, tokenizerAsset.absolutePath]
+                .execute(null, rootProject.projectDir.parentFile)
+        proc.waitFor()
+        if (proc.exitValue() != 0 || !tokenizerAsset.exists()) {
+            throw new GradleException("build_tokenizer.py failed: ${proc.err.text}")
+        }
+        json.delete()
+        logger.lifecycle("Tokenizer asset built (${tokenizerAsset.length()} bytes)")
+    }
+}
+
 android {
     namespace 'cz.minisearch.app'
     compileSdk 34
@@ -12,8 +143,10 @@ android {
         applicationId "cz.minisearch.app"
         minSdk 30
         targetSdk 34
-        versionCode 1
-        versionName "7.5"
+        // Bumped from 1 so the new build upgrades an installed 7.5 APK instead
+        // of being rejected as a downgrade.
+        versionCode 2
+        versionName "7.6"
         ndk {
             // Only 64-bit ARM matters for real phones; keep the APK small.
             abiFilters "arm64-v8a"
@@ -34,7 +167,21 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+    // Kotlin unit tests need the golden tokenizer vectors on the test classpath,
+    // and ``android.util.Log`` must not throw when called from a plain JVM test.
+    testOptions {
+        unitTests.includeAndroidResources = true
+        unitTests.returnDefaultValues = true
+    }
 }
+
+// The APK must always carry the verified model and tokenizer, so the assets are
+// produced before the packaging tasks run.
+tasks.matching { it.name == "preBuild" || it.name.startsWith("merge") && it.name.endsWith("Assets") }
+        .configureEach {
+            dependsOn("fetchEmbeddingModel")
+            dependsOn("fetchTokenizerAsset")
+        }
 
 chaquopy {
     defaultConfig {
@@ -62,4 +209,28 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.webkit:webkit:1.11.0'
+    // Real on-device inference for the multilingual embedding model. This is
+    // the Maven ``onnxruntime-android`` AAR (native .so for arm64-v8a), *not*
+    // the Python ``onnxruntime`` package, which has no Chaquopy wheel.
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.19.2'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    // The JVM unit tests exercise the same ai.onnxruntime API, but need the
+    // desktop native library instead of the Android .so bundled in the AAR, so
+    // the AAR is excluded from the unit-test classpath.
+    testImplementation 'com.microsoft.onnxruntime:onnxruntime:1.19.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:rules:1.6.1'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
+}
+
+// The unit tests must use the desktop onnxruntime native library, not the
+// Android .so from the AAR. Excluding it lazily avoids creating a second
+// native-library clash; ``configureEach`` applies before the classpath resolves.
+configurations.matching {
+    (it.name == "testRuntimeClasspath" || it.name == "testCompileClasspath")
+}.configureEach {
+    exclude group: 'com.microsoft.onnxruntime', module: 'onnxruntime-android'
 }

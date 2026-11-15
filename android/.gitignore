@@ -2,3 +2,9 @@
 build/
 local.properties
 .cxx/
+
+# Build-time downloaded/derived assets (reproduced from pinned revisions):
+# the 118 MB ONNX model and the packed tokenizer are fetched by the Gradle
+# tasks fetchEmbeddingModel / fetchTokenizerAsset, never committed.
+app/src/main/assets/embedding/
+app/src/main/assets/ml/
