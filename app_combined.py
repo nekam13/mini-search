@@ -29,6 +29,10 @@ import signal
 import sys
 import os
 import hashlib
+import base64
+import struct
+import zlib
+import heapq
 import re
 import gzip
 import io
@@ -176,11 +180,22 @@ IMAGE_SEARCH_LIMIT = _env_int("MINISEARCH_IMAGE_SEARCH_LIMIT", 60, 0, 500)
 # Listening port. Kept at 8070 for existing installs, but overridable so a
 # hosted/Termux setup can bind whatever port its environment exposes.
 PORT = _env_int("MINISEARCH_PORT", 8070, 1, 65535)
+# When the server runs from inside the Android APK it has no git checkout and
+# must never mutate its own bundled code. android_entry.py sets this flag; the
+# git-based update check *and* the manual mutation endpoints are then disabled
+# entirely, so the panel cannot offer an action that would silently do nothing
+# (or, worse, try to run git/pip against a read-only asset tree).
+BUNDLED_RUNTIME = os.environ.get(
+    "MINISEARCH_BUNDLED_RUNTIME", "0").strip().lower() in ("1", "true", "yes")
 # The Android app bundles the server and runs offline: the periodic GitHub
 # update check only makes sense for a git checkout, so it can be switched off
 # (MINISEARCH_UPDATE_CHECK=0) to keep the phone quiet.
 UPDATE_CHECK_ENABLED = os.environ.get(
     "MINISEARCH_UPDATE_CHECK", "1").strip().lower() not in ("0", "false", "no")
+# Inside the APK the bundled code is not a git checkout, so the update check is
+# meaningless there; force it off regardless of the env var.
+if BUNDLED_RUNTIME:
+    UPDATE_CHECK_ENABLED = False
 # File extensions that are never crawled as HTML pages.
 SKIP_LINK_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif',
@@ -209,6 +224,30 @@ EMBED_MIN_FREE_MB = _env_int("MINISEARCH_MIN_FREE_MB", 300, 50, 100000)
 # Below this battery percentage, and while unplugged, automatic mode drops them.
 EMBED_MIN_BATTERY_PCT = _env_int("MINISEARCH_MIN_BATTERY_PCT", 15, 0, 100)
 EMBED_MAX_CHARS = _env_int("MINISEARCH_EMBED_MAX_CHARS", 1000, 100, 8000)
+
+# --- Embedding space identity -------------------------------------------------
+# Vectors from different models are not comparable even when they share a
+# dimension, so every stored vector is tagged with the space that produced it.
+# Rows whose ``embedding_space`` does not match the active space are ignored by
+# vector search (and recomputed by maintenance), which makes switching the
+# backend safe instead of silently mixing incomparable vectors.
+#
+#   hash:<dim>  - the dependency-free _HashingEmbedding fallback
+#   minilm...   - a real model (the pinned multilingual MiniLM ONNX model)
+HASH_EMBEDDING_DIM = 384
+HASH_EMBEDDING_SPACE = f"hash:{HASH_EMBEDDING_DIM}"
+# Pinned revision of sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2.
+# The commit SHA freezes weights and tokenizer, so an index built on one machine
+# stays comparable with another; changing it starts a new vector space.
+MINILM_REVISION = os.environ.get(
+    "MINISEARCH_MINILM_REVISION", "e8f8c211226b894fcb81acc59f3b34ba3efd5f42")
+MINILM_SPACE = f"minilm-l12-v2:{MINILM_REVISION}"
+MINILM_DIM = 384
+# Backend selection for a real model. ``auto`` uses the Android ONNX bridge when
+# it is present and sentence-transformers on desktop; ``hash`` forces the
+# dependency-free fallback and ``off`` disables vector search entirely.
+EMBEDDING_BACKEND = os.environ.get("MINISEARCH_EMBEDDING_BACKEND", "auto").strip().lower()
+
 # Above this many stored embeddings the hnswlib index is skipped in low-memory
 # mode, because the in-RAM index (plus the vectors) can exceed a phone's budget.
 # Measured: 30k vectors of dim 384 already cost ~175 MB RSS, so the phone
@@ -608,10 +647,26 @@ def settings_for_ui():
 _db_lock = threading.Lock()
 _db_conn = None
 _hnsw_index = None
+_hnsw_space = None
 _model = None
 _model_failed = False
 _scheduler = None
 _worker_threads = []
+
+# --- Server lifecycle (shared by the desktop CLI and the Android wrapper) -----
+# ``SHUTDOWN_FLAG`` alone cannot express a restart in the same process, so the
+# runtime keeps an explicit state machine and a stop event that workers wait on.
+# ``_stop_event`` makes the worker sleep interruptible, so a stop is prompt
+# instead of waiting out the 5 s poll.
+_stop_event = threading.Event()
+_server_lock = threading.RLock()
+_server_handle = None
+_server_thread = None
+_server_state = 'STOPPED'
+_server_error = ''
+_server_host = ''
+_server_port = 0
+_server_started_at = 0
 _robots_cache = {}
 _robots_lock = threading.Lock()
 _domain_crawl_delay = {}
@@ -697,6 +752,7 @@ DB_SCHEMA = {
             has_audio INTEGER DEFAULT 0,
             published_timestamp INTEGER DEFAULT 0,
             embedding BLOB,
+            embedding_space TEXT DEFAULT '',
             indexed_at INTEGER DEFAULT 0,
             seo_score REAL DEFAULT 0.0,
             last_link_check INTEGER DEFAULT 0,
@@ -777,6 +833,7 @@ DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_pages_url_hash ON pages(url_hash)",
     "CREATE INDEX IF NOT EXISTS idx_pages_title ON pages(og_title)",
     "CREATE INDEX IF NOT EXISTS idx_pages_indexed ON pages(indexed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_pages_embedding_space ON pages(embedding_space)",
     "CREATE INDEX IF NOT EXISTS idx_sources_site ON site_sources(site_id)",
     "CREATE INDEX IF NOT EXISTS idx_sources_type ON site_sources(source_type)",
     # A (site_id, url) pair is one source; the unique index lets INSERT OR
@@ -993,12 +1050,28 @@ def _migrate_db(conn):
     for column, ddl in (
         ("last_link_check", "ALTER TABLE pages ADD COLUMN last_link_check INTEGER DEFAULT 0"),
         ("link_status", "ALTER TABLE pages ADD COLUMN link_status TEXT DEFAULT ''"),
+        # Which embedding space produced ``embedding``. Existing vectors have no
+        # tag, so they are stamped with the legacy hash space: that is what the
+        # old code always wrote, and leaving them blank would silently drop them
+        # from vector search on the first start after the upgrade.
+        ("embedding_space", "ALTER TABLE pages ADD COLUMN embedding_space TEXT DEFAULT ''"),
     ):
         try:
             cursor.execute(ddl)
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+    # Backfill the space tag for rows written before the column existed.
+    try:
+        cursor.execute(
+            "UPDATE pages SET embedding_space = ? "
+            "WHERE embedding IS NOT NULL AND (embedding_space IS NULL OR embedding_space = '')",
+            (HASH_EMBEDDING_SPACE,)
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     
     # Add recursion_depth column to sitemaps_feeds if not exists
     try:
@@ -2677,16 +2750,18 @@ def recrawl_async(site_id):
 # VECTOR SEARCH (hnswlib)
 # ============================================================================
 
-def _init_hnsw(dim=384):
+def _init_hnsw(dim=384, space=None):
     """Create a fresh hnswlib index with given dimension (no-op without hnswlib)."""
-    global _hnsw_index
+    global _hnsw_index, _hnsw_space
     if hnswlib is None:
         _hnsw_index = None
+        _hnsw_space = None
         return None
     idx = hnswlib.Index(space='cosine', dim=dim)
     idx.init_index(max_elements=HNSW_MAX_ELEMENTS, ef_construction=200, M=16)
     idx.set_ef(50)
     _hnsw_index = idx
+    _hnsw_space = space if space is not None else active_embedding_space()
     return idx
 
 
@@ -2784,7 +2859,7 @@ def get_hnsw_index():
     still works. The same applies when the embedding model is unavailable.
     Callers must handle ``None``.
     """
-    global _hnsw_index
+    global _hnsw_index, _hnsw_space
     if not embeddings_enabled():
         return None
     model = get_model()
@@ -2794,18 +2869,25 @@ def get_hnsw_index():
         # Android build: no approximate index, but vector search still runs via
         # the numpy brute-force path in vector_search().
         return None
+    space = active_embedding_space()
+    # A cached index built for a different space holds incomparable vectors;
+    # drop it so it is rebuilt from the rows of the active space.
+    if _hnsw_index is not None and _hnsw_space != space:
+        _hnsw_index = None
+        _hnsw_space = None
     if _hnsw_index is None:
         # An approximate index over more than HNSW_MAX_ELEMENTS vectors costs
         # more RAM than it is worth on a phone (and is slow to rebuild on every
         # start), so we keep it unbuilt and let search fall back to FTS5.
         try:
             count = execute_db_fetchone(
-                "SELECT COUNT(*) FROM pages WHERE embedding IS NOT NULL")[0]
+                "SELECT COUNT(*) FROM pages WHERE embedding IS NOT NULL AND embedding_space = ?",
+                (space,))[0]
         except Exception:
             count = 0
         if count > HNSW_MAX_ELEMENTS:
             return None
-        _init_hnsw(model.get_sentence_embedding_dimension())
+        _init_hnsw(model.get_sentence_embedding_dimension(), space)
         _load_embeddings_into_index()
     return _hnsw_index
 
@@ -2819,13 +2901,14 @@ def _load_embeddings_into_index():
     """
     if _hnsw_index is None:
         return
+    space = _hnsw_space if _hnsw_space is not None else active_embedding_space()
     last_id = 0
     while True:
         rows = execute_db_fetchall(
             """SELECT id, embedding FROM pages
-               WHERE embedding IS NOT NULL AND id > ?
+               WHERE embedding IS NOT NULL AND embedding_space = ? AND id > ?
                ORDER BY id ASC LIMIT 500""",
-            (last_id,)
+            (space, last_id)
         )
         if not rows:
             break
@@ -2849,34 +2932,482 @@ def _load_embeddings_into_index():
 
 def _rebuild_hnsw_index():
     """Rebuild index from scratch (called after delete). No-op if disabled."""
-    global _hnsw_index
+    global _hnsw_index, _hnsw_space
     if not embeddings_enabled() or hnswlib is None:
         _hnsw_index = None
+        _hnsw_space = None
         return
     model = get_model()
     if model is None:
         _hnsw_index = None
+        _hnsw_space = None
         return
     if _hnsw_index is not None:
         dim = _hnsw_index.dim
     else:
         dim = model.get_sentence_embedding_dimension()
-    _init_hnsw(dim)
+    _init_hnsw(dim, active_embedding_space())
     _load_embeddings_into_index()
+
+
+# ============================================================================
+# MULTILINGUAL TOKENIZER (XLM-R sentencepiece Unigram, pure Python)
+# ============================================================================
+#
+# The pinned multilingual MiniLM model ships a HuggingFace ``tokenizer.json``
+# whose normalizer is a sentencepiece ``precompiled_charsmap`` and whose model is
+# a Unigram vocabulary. This is a byte-for-byte reimplementation of the reference
+# pipeline (``tokenizers`` 0.20.3 / ``spm_precompiled`` 0.1.2):
+#
+#   1. Grapheme-cluster segmentation (UAX #29) with the same property tables.
+#   2. Precompiled charsmap: for every grapheme shorter than 6 UTF-8 bytes, the
+#      *first* (shortest) match in a Darts double-array trie replaces it; failing
+#      that each code point is rewritten individually.
+#   3. Whitespace tokenisation with a U+2581 prefix on the joined string, exactly
+#      as the reference ``Metaspace`` pre-tokenizer does.
+#   4. Unigram Viterbi over the vocabulary, with fused unknown tokens.
+#
+# It is used both by the pure-Python embedding path (tests, desktop without
+# sentence-transformers) and as the reference the Kotlin ONNX bridge is checked
+# against. It never loads the 9 MB JSON: ``tools/build_tokenizer.py`` packs only
+# the charsmap and the vocabulary into ``tokenizer_spm.bin``.
+#
+# This is a *tokenizer*, not a model: it turns text into the integer ids the
+# ONNX model consumes. It carries no semantics by itself.
+
+_GRAPHEME_TABLE_B64 = (
+    "eNrtV02IHFUQrnr1db/unp6Z3bjZTXY3s6suYROzm9momzExRBRWcpEkIoIKG4IRFIIIxkMuWREUkaCggVUxiOBB"
+    "PelJkIAnPUbEg7oR1IMeouSiCP5Xvde9M3j1OsxQvH5dr6q+etXwfRsF5ULkiNUyjcrqrDRJPsfjeNmleM7tAROY"
+    "w5/QS3xR6EIWxzBCOJWCyHMCp28F1+ua0JnEgwUOZMgJ2wScgR0YuMnhFvapx+4JO0UzarNlMkuawmXkQWJr4oxT"
+    "FIwdYd0jS60LEk2U6V99NLg6TJKl1gi9GEHTMJyDaBlstjH4FoZCHzlEGGOMJ1XkHlWvBlN4Zyk6hIN1keopLrNQ"
+    "oYB53Qnr/RbfijekAs+Wd6D46mwFLVq2aqNnm7KSbXM/95FynUh7lVG/GysKI/q4cDWp+Wzh7FBMlKL0OBnXGRop"
+    "jjCmQgPZ8GdLzYAltCLRq7zRgDwiYTMJTQiFTQQLhxFBM0ZjpKSl4uRqTncXdH/jG230B9okPTodmreDret3xEbq"
+    "aPgad2FJFsxTpwxnGDcQngoN06jaQsTeJIZpo6qBcFvsW4gV63c+OOVwhG4HS6HsvWl9O6jy7cxQhiI64UIjIvNx"
+    "6MWAXF1c3FSHrg/jFzzX7RbLKrFGVdgunPmED+MFBAxEiX4y21JZasuJWfw94XBeCzwxg3eR4FHGF1d1EDjHLOMo"
+    "4yUtWMLFTdTF6Ppezva17XFy1Jq802N7YTWU07mEtu6th6GC4LI5wl1J/RhsabDNeZFwc5hD/SKSMEi7qHJLQn9+"
+    "Yv7PIIbRoZImmzS0Qzu0Qzu0Qzu0Qzu0/9uW4wW6jbeUsH+XtDHSxmUVTheV3h5tyNNK/75XinZBSfazTRfYuGDe"
+    "GUV8Wx8uQfCMqKvDSmFE92xNhm9tKa8zjlcEirjg+vzQGYVFQX6fwxwCgfUY4WwPVXy460wUBPXhNV0kgA+5igNT"
+    "zY0D4cUbHOWNx9ZBcRLrENNIzmVBhmWqFAX4uNJwQZpEvwnCscg4k76E2swT7dW+uJP+7hTj+Ga4+sBjA0JsM+Ip"
+    "ZbxSiZo1FxEG7185aAI2PVefU91pi2iVsruo+CrhKapkcsxXkb2+0qB5UkGaTzyVVewLEmVJXcTxrZX6GkR2NjHS"
+    "b8o5jZlxp5UD3oRE2HChuTlXtXXZcMiAx8+72qY40hZeOw0cTLGuHrycebHeNjh771WLKXJlbgFuHBdR6xoJPSEv"
+    "2ka9oo7gFZUHH7WXgSVD1iKMqxBs4bNCoYyYj0UCHia8qTX/plNwSPCnCL71KU6neH10e/qHXvXaendGaBV0Tuia"
+    "lv7itNzzjrX7/GEd/S+ZxumBpM3XHJe0SiukusZ9yvQjc0E5HRBOuMFPFGdcwcSUqqRKqeA2Obtam25qqF7MqaW/"
+    "XxxfFncdq7ihr3MN/5X5/PB7+g833QzdnpTcIpdv6U21ChrTiWXJ35fkksued91zTzbu211KzxfJvO8cKxc55w9l"
+    "zf3l/wWrP8HG"
+)
+
+_GRAPHEME_CLASS_OTHER = 0
+_GRAPHEME_CLASS_CR = 1
+_GRAPHEME_CLASS_LF = 2
+_GRAPHEME_CLASS_CONTROL = 3
+_GRAPHEME_CLASS_EXTEND = 4
+_GRAPHEME_CLASS_ZWJ = 5
+_GRAPHEME_CLASS_RI = 6
+_GRAPHEME_CLASS_PREPEND = 7
+_GRAPHEME_CLASS_SPACINGMARK = 8
+_GRAPHEME_CLASS_L = 9
+_GRAPHEME_CLASS_V = 10
+_GRAPHEME_CLASS_T = 11
+_GRAPHEME_CLASS_LV = 12
+_GRAPHEME_CLASS_LVT = 13
+
+_grapheme_tables = None
+
+
+def _load_grapheme_tables():
+    """Decode the packed UAX #29 tables (grapheme break + Extended_Pictographic).
+
+    Packed as varint ``(start_delta, length)`` ranges plus a class byte for the
+    grapheme table, and plain ranges for the emoji property, then zlib+base64 so
+    the literal stays small. Returns ``(gbr, ep)``: two sorted ``(start, end,
+    class)`` / ``(start, end)`` lists.
+    """
+    global _grapheme_tables
+    if _grapheme_tables is not None:
+        return _grapheme_tables
+    raw = zlib.decompress(base64.b64decode(''.join(_GRAPHEME_TABLE_B64)))
+
+    def read_varint(buf, pos):
+        shift = 0
+        value = 0
+        while True:
+            byte = buf[pos]
+            pos += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value, pos
+            shift += 7
+
+    pos = 0
+    count, pos = read_varint(raw, pos)
+    gbr = []
+    start = 0
+    for _ in range(count):
+        delta, pos = read_varint(raw, pos)
+        length, pos = read_varint(raw, pos)
+        cls = raw[pos]
+        pos += 1
+        start += delta
+        end = start + length
+        gbr.append((start, end, cls))
+        start = end + 1
+    count, pos = read_varint(raw, pos)
+    ep = []
+    start = 0
+    for _ in range(count):
+        delta, pos = read_varint(raw, pos)
+        length, pos = read_varint(raw, pos)
+        start += delta
+        end = start + length
+        ep.append((start, end))
+        start = end + 1
+    _grapheme_tables = (gbr, ep)
+    return _grapheme_tables
+
+
+def _grapheme_class(cp):
+    """UAX #29 grapheme break class of a code point (0 = Other)."""
+    gbr, _ = _load_grapheme_tables()
+    lo, hi = 0, len(gbr) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        start, end, cls = gbr[mid]
+        if cp < start:
+            hi = mid - 1
+        elif cp > end:
+            lo = mid + 1
+        else:
+            return cls
+    return _GRAPHEME_CLASS_OTHER
+
+
+def _is_extended_pictographic(cp):
+    """Extended_Pictographic property, needed for GB11 (emoji ZWJ sequences)."""
+    _, ep = _load_grapheme_tables()
+    lo, hi = 0, len(ep) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        start, end = ep[mid]
+        if cp < start:
+            hi = mid - 1
+        elif cp > end:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
+def _grapheme_clusters(text):
+    """Split ``text`` into extended grapheme clusters (UAX #29 rules GB1–GB13)."""
+    if not text:
+        return []
+    cps = [ord(c) for c in text]
+    classes = [_grapheme_class(cp) for cp in cps]
+    pictographic = [_is_extended_pictographic(cp) for cp in cps]
+    n = len(cps)
+    out = []
+    i = 0
+    while i < n:
+        start = i
+        i += 1
+        while i < n:
+            prev = classes[i - 1]
+            cur = classes[i]
+            if prev == _GRAPHEME_CLASS_CR and cur == _GRAPHEME_CLASS_LF:
+                i += 1
+                continue
+            if cur in (_GRAPHEME_CLASS_CR, _GRAPHEME_CLASS_LF, _GRAPHEME_CLASS_CONTROL):
+                break
+            if prev in (_GRAPHEME_CLASS_CR, _GRAPHEME_CLASS_LF, _GRAPHEME_CLASS_CONTROL):
+                break
+            if prev == _GRAPHEME_CLASS_L and cur in (
+                    _GRAPHEME_CLASS_L, _GRAPHEME_CLASS_V,
+                    _GRAPHEME_CLASS_LV, _GRAPHEME_CLASS_LVT):
+                i += 1
+                continue
+            if prev in (_GRAPHEME_CLASS_LV, _GRAPHEME_CLASS_V) and cur in (
+                    _GRAPHEME_CLASS_V, _GRAPHEME_CLASS_T):
+                i += 1
+                continue
+            if prev in (_GRAPHEME_CLASS_LVT, _GRAPHEME_CLASS_T) and cur == _GRAPHEME_CLASS_T:
+                i += 1
+                continue
+            if cur in (_GRAPHEME_CLASS_EXTEND, _GRAPHEME_CLASS_ZWJ):
+                i += 1
+                continue
+            if cur == _GRAPHEME_CLASS_SPACINGMARK:
+                i += 1
+                continue
+            if prev == _GRAPHEME_CLASS_PREPEND:
+                i += 1
+                continue
+            if prev == _GRAPHEME_CLASS_ZWJ and pictographic[i]:
+                k = i - 2
+                while k >= start and classes[k] == _GRAPHEME_CLASS_EXTEND:
+                    k -= 1
+                if k >= start and pictographic[k]:
+                    i += 1
+                    continue
+            if prev == _GRAPHEME_CLASS_RI and cur == _GRAPHEME_CLASS_RI:
+                count = 0
+                k = i - 1
+                while k >= start and classes[k] == _GRAPHEME_CLASS_RI:
+                    count += 1
+                    k -= 1
+                if count % 2 == 1:
+                    i += 1
+                    continue
+            break
+        out.append(text[start:i])
+    return out
+
+
+class _SpmTokenizer:
+    """Pure-Python XLM-R sentencepiece Unigram tokenizer.
+
+    Reproduces ``PreTrainedTokenizerFast`` from the pinned multilingual MiniLM
+    repository. ``encode()`` returns the ids *including* ``<s>``/``</s>`` and
+    truncates to ``max_length`` tokens, which is what the ONNX model expects.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._charsmap = None
+        self._trie = None
+        self._pool = b''
+        self._pieces = []
+        self._scores = {}
+        self._ids = {}
+        self._unk_id = 0
+        self._unk_score = 0.0
+        self._max_piece_chars = 0
+        self._max_piece_bytes = 0
+        self._load()
+
+    def _load(self):
+        with open(self.path, 'rb') as handle:
+            data = handle.read()
+        if data[:4] != b'MSPT':
+            raise ValueError('tokenizer_spm.bin: neplatné magic')
+        (version,) = struct.unpack_from('<H', data, 4)
+        if version != 1:
+            raise ValueError(f'tokenizer_spm.bin: nepodporovaná verze {version}')
+        offset = 6
+        unk_id, max_piece = struct.unpack_from('<ii', data, offset)
+        offset += 8
+        (charsmap_len,) = struct.unpack_from('<I', data, offset)
+        offset += 4
+        charsmap = data[offset:offset + charsmap_len]
+        offset += charsmap_len
+        (vocab_len,) = struct.unpack_from('<I', data, offset)
+        offset += 4
+
+        # Darts double-array trie: <u32 trie_size><trie><normalized pool>.
+        (trie_size,) = struct.unpack_from('<I', charsmap, 0)
+        trie_blob = charsmap[4:4 + trie_size]
+        pool = charsmap[4 + trie_size:]
+        units = list(struct.unpack_from('<%dI' % (len(trie_blob) // 4), trie_blob))
+
+        pieces = []
+        scores = {}
+        ids = {}
+        for i in range(vocab_len):
+            (plen,) = struct.unpack_from('<H', data, offset)
+            offset += 2
+            piece = data[offset:offset + plen].decode('utf-8')
+            offset += plen
+            (score,) = struct.unpack_from('<f', data, offset)
+            offset += 4
+            pieces.append(piece)
+            scores[piece] = score
+            ids[piece] = i
+
+        self._charsmap = charsmap
+        self._trie = units
+        self._pool = pool
+        self._pieces = pieces
+        self._scores = scores
+        self._ids = ids
+        self._unk_id = unk_id
+        self._unk_score = min(scores.values()) - 10.0
+        self._max_piece_chars = max_piece
+        self._max_piece_bytes = max(len(p.encode('utf-8')) for p in pieces)
+
+    # -- normalizer --------------------------------------------------------
+    def _trie_common_prefix(self, key):
+        """Shortest match of ``key`` (bytes) in the charsmap trie, or ``None``."""
+        units = self._trie
+        node = 0
+        unit = units[node]
+        node ^= _darts_offset(unit)
+        for byte in key:
+            if byte == 0:
+                break
+            node ^= byte
+            if node >= len(units):
+                return None
+            unit = units[node]
+            if unit & (1 << 31) or (unit & 0xFF) != byte:
+                return None
+            node ^= _darts_offset(unit)
+            if (unit >> 8) & 1:
+                return units[node] & ((1 << 31) - 1)
+        return None
+
+    def _transform(self, chunk):
+        index = self._trie_common_prefix(chunk.encode('utf-8'))
+        if index is None:
+            return None
+        end = self._pool.index(b'\x00', index)
+        return self._pool[index:end].decode('utf-8')
+
+    def normalize(self, text):
+        """Apply the sentencepiece precompiled charsmap normalizer."""
+        out = []
+        for grapheme in _grapheme_clusters(text):
+            if len(grapheme.encode('utf-8')) < 6:
+                replaced = self._transform(grapheme)
+                if replaced is not None:
+                    out.append(replaced)
+                    continue
+            for char in grapheme:
+                replaced = self._transform(char)
+                out.append(replaced if replaced is not None else char)
+        return ''.join(out)
+
+    # -- model -------------------------------------------------------------
+    def _unigram(self, sentence):
+        """Viterbi best path over the vocabulary with fused unknown tokens."""
+        if not sentence:
+            return []
+        scores = self._scores
+        ids = self._ids
+        unk_id = self._unk_id
+        unk_score = self._unk_score
+        max_piece = self._max_piece_chars
+        n = len(sentence)
+        # (best_score, start_index, token_id) for each end position.
+        best = [None] * (n + 1)
+        best[0] = (0.0, 0, 0)
+        pos = 0
+        while pos < n:
+            here = best[pos][0]
+            mblen = len(sentence[pos].encode('utf-8'))
+            has_single = False
+            limit = min(n - pos, max_piece)
+            for k in range(1, limit + 1):
+                piece = sentence[pos:pos + k]
+                score = scores.get(piece)
+                if score is None:
+                    continue
+                target = pos + k
+                candidate = score + here
+                cur = best[target]
+                if cur is None or candidate > cur[0]:
+                    best[target] = (candidate, pos, ids[piece])
+                if len(piece.encode('utf-8')) == mblen:
+                    has_single = True
+            if not has_single:
+                target = pos + 1
+                candidate = unk_score + here
+                cur = best[target]
+                if cur is None or candidate > cur[0]:
+                    best[target] = (candidate, pos, unk_id)
+            pos += 1
+        # Backtrack, then fuse adjacent unknown tokens into one.
+        nodes = []
+        end = n
+        while end > 0:
+            score, start, token_id = best[end]
+            nodes.append((start, end, token_id))
+            end = start
+        nodes.reverse()
+        fused = []
+        for start, stop, token_id in nodes:
+            if token_id == unk_id and fused and fused[-1][2] == unk_id:
+                fused[-1] = (fused[-1][0], stop, unk_id)
+            else:
+                fused.append((start, stop, token_id))
+        return [token_id for _, _, token_id in fused]
+
+    def encode(self, text, max_length=128):
+        """Ids with ``<s>``/``</s>``, truncated to ``max_length`` tokens."""
+        words = self.normalize(text or '').split()
+        if not words:
+            content = []
+        else:
+            joined = '\u2581' + '\u2581'.join(words)
+            content = self._unigram(joined)
+        return ([0] + content + [2])[:max_length]
+
+    def tokenize(self, text):
+        """Content pieces (no special tokens); used by tests and diagnostics."""
+        words = self.normalize(text or '').split()
+        if not words:
+            return []
+        ids = self._unigram('\u2581' + '\u2581'.join(words))
+        return [self._pieces[i] for i in ids]
+
+
+def _darts_offset(unit):
+    """Byte offset encoded in a Darts array unit."""
+    return (unit >> 10) << ((unit & (1 << 9)) >> 6)
+
+
+_tokenizer = None
+_tokenizer_failed = False
+
+
+def get_tokenizer():
+    """Return the shared :class:`_SpmTokenizer`, or ``None`` when unavailable."""
+    global _tokenizer, _tokenizer_failed
+    if _tokenizer is not None:
+        return _tokenizer
+    if _tokenizer_failed:
+        return None
+    path = os.environ.get('MINISEARCH_TOKENIZER')
+    if not path:
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'android', 'ml', 'tokenizer_spm.bin'),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'ml', 'tokenizer_spm.bin'),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                path = candidate
+                break
+    if not path or not os.path.exists(path):
+        _tokenizer_failed = True
+        return None
+    try:
+        _tokenizer = _SpmTokenizer(path)
+    except Exception as e:
+        print(f"Tokenizer nelze nacist: {e}")
+        _tokenizer_failed = True
+        return None
+    return _tokenizer
 
 
 class _HashingEmbedding:
     """Dependency-free fallback embedder: a hashed bag-of-words vector.
 
-    When ``sentence-transformers`` cannot be installed (the usual Termux case)
-    this gives vector search *something* sensible on top of FTS5 while costing
-    no model download and no persistent RAM. It is a feature hash over folded
-    tokens, L2-normalised so cosine distance behaves; Czech diacritics fold to
-    ASCII, so ``Praha`` and ``praha`` land in the same bucket. Quality is far
-    below a real model, which is why the real model is always preferred.
+    When neither the Android ONNX bridge nor ``sentence-transformers`` is
+    available this gives vector search *something* usable on top of FTS5 while
+    costing no model download and no persistent RAM. It is a feature hash over
+    folded tokens, L2-normalised so cosine distance behaves; Czech diacritics
+    fold to ASCII, so ``Praha`` and ``praha`` land in the same bucket.
+
+    This is **not** a language model and carries no semantic understanding: it
+    only measures token overlap. Callers and the UI must present it as a
+    fallback, never as "AI search". Vectors live in their own space
+    (:data:`HASH_EMBEDDING_SPACE`) so they are never compared with real-model
+    vectors.
     """
 
-    dimension = 384
+    dimension = HASH_EMBEDDING_DIM
+    space = HASH_EMBEDDING_SPACE
+    is_real_model = False
 
     def get_sentence_embedding_dimension(self):
         return self.dimension
@@ -2894,27 +3425,158 @@ class _HashingEmbedding:
         return vec
 
 
+class _OnnxBridgeEmbedding:
+    """Real multilingual model executed by the Android ONNX Runtime bridge.
+
+    The heavy inference runs in Kotlin (``cz.minisearch.app.EmbeddingBridge``)
+    through ONNX Runtime for Android; Python only calls it over Chaquopy. The
+    tokenizer, pooling and normalisation therefore match the reference
+    ``sentence-transformers`` pipeline exactly (see the Kotlin bridge), and the
+    returned vectors are directly comparable with the desktop model.
+    """
+
+    dimension = MINILM_DIM
+    space = MINILM_SPACE
+    is_real_model = True
+
+    def __init__(self, bridge):
+        self._bridge = bridge
+
+    def get_sentence_embedding_dimension(self):
+        return self.dimension
+
+    def encode(self, text):
+        values = self._bridge.encode((text or '')[:EMBED_MAX_CHARS])
+        vec = np.asarray(list(values), dtype=np.float32)
+        if vec.size != self.dimension:
+            raise ValueError(
+                f"ONNX bridge returned {vec.size} dims, expected {self.dimension}")
+        return vec
+
+
+class _SentenceTransformerEmbedding:
+    """Desktop real model, wrapped so it exposes the same small interface."""
+
+    def __init__(self, model, space):
+        self._model = model
+        self.space = space
+        self.is_real_model = True
+
+    def get_sentence_embedding_dimension(self):
+        try:
+            return int(self._model.get_sentence_embedding_dimension())
+        except Exception:
+            return MINILM_DIM
+
+    def encode(self, text):
+        vec = self._model.encode((text or '')[:EMBED_MAX_CHARS])
+        return np.asarray(vec, dtype=np.float32)
+
+
+def _android_onnx_model():
+    """Return an :class:`_OnnxBridgeEmbedding` when the Kotlin bridge is ready.
+
+    Importing ``java`` only works inside Chaquopy, and the bridge returns
+    ``None``/raises while the model files are missing, so every failure path
+    here simply means "no real model on this device".
+    """
+    if EMBEDDING_BACKEND in ('hash', 'off'):
+        return None
+    try:
+        from java import jclass  # type: ignore
+    except Exception:
+        return None
+    try:
+        bridge_cls = jclass("cz.minisearch.app.EmbeddingBridge")
+        bridge = bridge_cls.get()
+        if bridge is None or not bridge.isReady():
+            return None
+        model = _OnnxBridgeEmbedding(bridge)
+        # Fail fast on a broken bridge instead of poisoning the index.
+        probe = model.encode("test")
+        if probe.size != model.dimension:
+            print("ONNX most nevrátil očekávaný rozměr, přeskakuji")
+            return None
+        return model
+    except Exception as e:
+        print(f"ONNX bridge nedostupný: {e}")
+        return None
+
+
+def _sentence_transformer_model():
+    """Load the desktop model, pinned to the same revision as the ONNX model."""
+    if EMBEDDING_BACKEND in ('hash', 'off'):
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        print(f"Model nelze nacist: {e}")
+        return None
+    model_id = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+    last_error = None
+    for kwargs in (
+        {'revision': MINILM_REVISION},
+        {},  # an offline cache may not know the revision; the model id still pins it
+    ):
+        try:
+            return _SentenceTransformerEmbedding(
+                SentenceTransformer(model_id, **kwargs), MINILM_SPACE)
+        except Exception as e:
+            last_error = e
+    print(f"Model nelze nacist: {last_error}")
+    return None
+
+
 def get_model():
     """Return the best available embedder for this install.
 
-    Prefers the real ``sentence-transformers`` model; if it is missing, falls
-    back to :class:`_HashingEmbedding` instead of a stub that returns zero
-    vectors (which would poison vector search). Returns ``None`` only when the
-    numpy/hnswlib stack itself is unavailable.
+    Order of preference: the Android ONNX bridge (a real multilingual model),
+    the desktop ``sentence-transformers`` model, then :class:`_HashingEmbedding`
+    as a clearly-labelled fallback. Returns ``None`` only when the numpy stack
+    itself is unavailable.
     """
     global _model, _model_failed
     if _model is not None:
         return _model
     if _model_failed:
         return _HashingEmbedding() if np is not None else None
-    try:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    except Exception as e:
-        print(f"Model nelze nacist: {e} (fallback: lokalni hashovaci embedding)")
+    if EMBEDDING_BACKEND == 'off':
         _model_failed = True
-        return _HashingEmbedding() if np is not None else None
-    return _model
+        return None
+    model = _android_onnx_model() or _sentence_transformer_model()
+    if model is not None:
+        _model = model
+        return _model
+    print("Reálný model není k dispozici (fallback: lokalni hashovaci embedding)")
+    _model_failed = True
+    return _HashingEmbedding() if np is not None else None
+
+
+def active_embedding_space():
+    """Identifier of the vector space the active backend writes into.
+
+    Stored next to every embedding so vectors from different models are never
+    compared just because their dimension happens to match. Returns ``''`` when
+    embeddings are off, which is a space nothing matches.
+    """
+    if not embeddings_enabled():
+        return ''
+    model = get_model()
+    if model is None:
+        return ''
+    return getattr(model, 'space', HASH_EMBEDDING_SPACE)
+
+
+def embedding_backend_label():
+    """Czech, honest description of what is actually running (for the UI)."""
+    if not embeddings_enabled():
+        return 'vypnuto'
+    model = get_model()
+    if model is None:
+        return 'nedostupné'
+    if getattr(model, 'is_real_model', False):
+        return 'model (paraphrase-multilingual-MiniLM-L12-v2)'
+    return 'náhradní hashovací embedding (bez sémantiky)'
 
 
 def generate_embedding(text):
@@ -3065,23 +3727,30 @@ def _site_priority_multiplier(site_id):
         return PUBLIC_SITE_PRIORITY_MULTIPLIER
 
 
-def _bruteforce_neighbours(query_embedding, k):
+def _bruteforce_neighbours(query_embedding, k, space=None):
     """Exact cosine neighbours over the stored embeddings, using numpy only.
 
-    Fallback for builds without hnswlib (the Android APK): the whole vector
-    column is streamed in pages and scored in one vectorised pass, so a
-    phone-sized index stays fast enough without the approximate index.
+    Fallback for builds without hnswlib (the Android APK): the vector column is
+    streamed in pages and scored in vectorised batches. Only a bounded top-k
+    heap is kept, so memory does not grow with the number of stored vectors, and
+    only vectors from the *active* embedding space are compared — a hash vector
+    must never be scored against a real-model vector just because both are 384
+    wide. Returns ``[(page_id, cosine_distance), …]`` sorted best first.
     """
     q = np.asarray(query_embedding, dtype=np.float32).ravel()
     q_norm = float(np.linalg.norm(q)) or 1.0
-    scored = []
+    # Max-heap of size k over the distance (smallest distance wins), so we never
+    # hold more than k candidates regardless of how many pages exist.
+    heap = []
+    if space is None:
+        space = active_embedding_space()
     last_id = 0
     while True:
         rows = execute_db_fetchall(
             """SELECT id, embedding FROM pages
-               WHERE embedding IS NOT NULL AND id > ?
+               WHERE embedding IS NOT NULL AND embedding_space = ? AND id > ?
                ORDER BY id ASC LIMIT 1000""",
-            (last_id,)
+            (space, last_id)
         )
         if not rows:
             break
@@ -3095,15 +3764,22 @@ def _bruteforce_neighbours(query_embedding, k):
             if emb.size == q.size:
                 ids.append(row[0])
                 vecs.append(emb)
-        if vecs:
-            matrix = np.vstack(vecs)
-            norms = np.linalg.norm(matrix, axis=1)
-            norms[norms == 0] = 1.0
-            sims = (matrix @ q) / (norms * q_norm)
-            for page_id, sim in zip(ids, sims):
-                scored.append((page_id, 1.0 - float(sim)))
-    scored.sort(key=lambda item: item[1])
-    return scored[:k]
+        if not vecs:
+            continue
+        matrix = np.vstack(vecs)
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        sims = (matrix @ q) / (norms * q_norm)
+        for page_id, sim in zip(ids, sims):
+            distance = 1.0 - float(sim)
+            if len(heap) < k:
+                heapq.heappush(heap, (-distance, int(page_id)))
+            elif distance < -heap[0][0]:
+                heapq.heapreplace(heap, (-distance, int(page_id)))
+    # ``heap`` holds ``(-distance, page_id)``; the largest ``-distance`` is the
+    # smallest distance, i.e. the best match, so sort descending on it.
+    ordered = sorted(heap, key=lambda item: item[0], reverse=True)
+    return [(page_id, -neg_distance) for neg_distance, page_id in ordered]
 
 
 def vector_search(query, limit=25, filter_type=None):
@@ -4757,6 +5433,10 @@ def store_page(page_data):
     url = page_data['url']
     url_h = page_data['url_hash']
     embedding = page_data.get('embedding')
+    # Tag the vector with the space that produced it. When there is no new
+    # embedding the existing bytes are kept via COALESCE, so their tag must be
+    # kept too — hence the CASE rather than a plain assignment.
+    embedding_space = active_embedding_space() if embedding else ''
     page_id = None
 
     existing = execute_db_fetchone("SELECT id FROM pages WHERE url_hash=?", (url_h,))
@@ -4765,14 +5445,18 @@ def store_page(page_data):
             """UPDATE pages SET site_id=?, url=?, title=?, og_title=?, og_description=?,
                og_image=?, favicon_url=?, body_text=?, images=?, schema_type=?
                , schema_details=?, audio_url=?, has_audio=?, published_timestamp=?,
-               embedding=COALESCE(?, embedding), seo_score=?, indexed_at=strftime('%s','now')
+               embedding=COALESCE(?, embedding),
+               embedding_space=CASE WHEN ? THEN ? ELSE embedding_space END,
+               seo_score=?, indexed_at=strftime('%s','now')
                WHERE url_hash=?""",
             (page_data['site_id'], url, page_data['title'], page_data['og_title'],
              page_data['og_description'], page_data['og_image'], page_data['favicon_url'],
              page_data['body_text'], json.dumps(page_data['images']),
              page_data['schema_type'], json.dumps(page_data['schema_details']),
              page_data['audio_url'], page_data['has_audio'],
-             page_data['published_timestamp'], embedding, page_data['seo_score'], url_h),
+             page_data['published_timestamp'], embedding,
+             1 if embedding else 0, embedding_space,
+             page_data['seo_score'], url_h),
             commit=True
         )
         page_id = existing[0]
@@ -4780,14 +5464,15 @@ def store_page(page_data):
         execute_db(
             """INSERT INTO pages (site_id,url,url_hash,title,og_title,og_description,og_image,
                favicon_url,body_text,images,schema_type,schema_details,audio_url,has_audio,
-               published_timestamp,embedding,seo_score,indexed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
+               published_timestamp,embedding,embedding_space,seo_score,indexed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
             (page_data['site_id'], url, url_h, page_data['title'], page_data['og_title'],
              page_data['og_description'], page_data['og_image'], page_data['favicon_url'],
              page_data['body_text'], json.dumps(page_data['images']),
              page_data['schema_type'], json.dumps(page_data['schema_details']),
              page_data['audio_url'], page_data['has_audio'],
-             page_data['published_timestamp'], embedding, page_data['seo_score']),
+             page_data['published_timestamp'], embedding, embedding_space,
+             page_data['seo_score']),
             commit=True
         )
         page_id = execute_db_fetchone("SELECT last_insert_rowid()")[0]
@@ -4910,7 +5595,7 @@ def process_url(queue_id, site_id, url):
 
 def _worker_loop(name):
     print(f"Worker {name} spusten")
-    while not SHUTDOWN_FLAG:
+    while not SHUTDOWN_FLAG and not _stop_event.is_set():
         try:
             # Get domain crawl delay
             domain_delay = MIN_DELAY
@@ -4925,7 +5610,9 @@ def _worker_loop(name):
                 (MAX_RETRIES,)
             )
             if not rows:
-                time.sleep(5)
+                # Wait on the stop event so a shutdown is immediate instead of
+                # sleeping out the poll interval.
+                _stop_event.wait(5)
                 continue
             
             locked_rows = []
@@ -4941,14 +5628,15 @@ def _worker_loop(name):
                     locked_rows.append((row_id, site_id, url, site_delay))
             
             for row_id, site_id, url, site_delay in locked_rows:
-                if SHUTDOWN_FLAG:
+                if SHUTDOWN_FLAG or _stop_event.is_set():
                     break
                 process_url(row_id, site_id, url)
-                time.sleep(domain_delay)
+                _stop_event.wait(domain_delay)
                 
         except Exception as e:
             print(f"Worker {name} error: {e}")
-            time.sleep(5)
+            _stop_event.wait(5)
+    print(f"Worker {name} ukoncen")
 
 
 def _recover_interrupted_queue():
@@ -4970,14 +5658,42 @@ def _recover_interrupted_queue():
 
 
 def start_workers():
+    """Start the crawl workers once.
+
+    Idempotent: a second call (e.g. the Android service restarting, or the app
+    being resumed) must not spawn a second set of workers against the same
+    queue, which would double-crawl every site.
+    """
     global _worker_threads
+    if any(t.is_alive() for t in _worker_threads):
+        print("Workers already running, not starting a second set")
+        return
+    _stop_event.clear()
     _recover_interrupted_queue()
     names = [f"worker_{chr(ord('a') + i)}" for i in range(WORKER_COUNT)]
+    _worker_threads = []
     for name in names:
         t = threading.Thread(target=_worker_loop, args=(name,), daemon=True)
         t.start()
         _worker_threads.append(t)
     print(f"Workers spusteny ({WORKER_COUNT}x: {', '.join(names)})")
+
+
+def stop_workers(timeout=10.0):
+    """Signal the workers to stop and wait briefly for them to leave the loop.
+
+    The queue rows they hold stay ``locked``; :func:`_recover_interrupted_queue`
+    returns them to ``pending`` on the next start, so a stop never loses work.
+    """
+    _stop_event.set()
+    deadline = time.time() + timeout
+    for t in list(_worker_threads):
+        remaining = max(0.0, deadline - time.time())
+        t.join(timeout=remaining)
+    alive = [t for t in _worker_threads if t.is_alive()]
+    if alive:
+        print(f"{len(alive)} worker(ů) stale dobiha, pokracuji v ukonceni")
+    return not alive
 
 
 # ============================================================================
@@ -5231,8 +5947,10 @@ def maintenance_backfill_embeddings(batch=None):
 
     rows = execute_db_fetchall(
         """SELECT id, og_title, title, og_description, body_text
-           FROM pages WHERE embedding IS NULL ORDER BY id ASC LIMIT ?""",
-        (batch,)
+           FROM pages
+           WHERE embedding IS NULL OR embedding_space IS NULL OR embedding_space != ?
+           ORDER BY id ASC LIMIT ?""",
+        (active_embedding_space(), batch)
     )
     done = 0
     for row in rows:
@@ -5249,8 +5967,8 @@ def maintenance_backfill_embeddings(batch=None):
         embedding = _embedding_for(page)
         if embedding is None:
             continue
-        execute_db("UPDATE pages SET embedding = ? WHERE id = ?",
-                   (embedding, row['id']), commit=True)
+        execute_db("UPDATE pages SET embedding = ?, embedding_space = ? WHERE id = ?",
+                   (embedding, active_embedding_space(), row['id']), commit=True)
         done += 1
 
     if done:
@@ -5456,11 +6174,17 @@ def maintenance_scheduled():
 
 def handle_shutdown(signum, frame):
     global SHUTDOWN_FLAG
-    SHUTDOWN_FLAG = True
     print(f"Signal {signum}, shutting down...")
-    close_db()
-    if _scheduler:
-        _scheduler.shutdown(wait=False)
+    try:
+        # Graceful, ordered teardown; safe even if the server never started.
+        stop_server()
+    except Exception as e:
+        print(f"Graceful shutdown failed: {e}")
+        SHUTDOWN_FLAG = True
+        try:
+            close_db()
+        except Exception:
+            pass
     sys.exit(0)
 
 
@@ -5491,7 +6215,11 @@ def _plural_cz(count, one, few, many):
 
 
 app = Flask(__name__)
-app.secret_key = 'mini-search-secret-key'
+# The session secret must never be a checked-in constant: a fixed key lets
+# anyone forge our cookies. Take it from the environment when the operator sets
+# one, otherwise generate a fresh random key per process (sessions simply do not
+# survive a restart, which is fine because the panel keeps no server-side state).
+app.secret_key = os.environ.get('MINISEARCH_SECRET_KEY') or os.urandom(32)
 app.jinja_env.filters['plural_cz'] = _plural_cz
 
 # The Android app runs this same server on 127.0.0.1 and shows the public
@@ -5507,6 +6235,69 @@ def _request_is_local():
     """True when the request originates from this device (loopback)."""
     addr = (request.remote_addr or '').strip()
     return addr in ('127.0.0.1', '::1', 'localhost') or addr.startswith('127.')
+
+
+# Mutating requests are rejected when they carry a cross-site Origin. Loopback
+# is not by itself a defence against a hostile page in another tab reaching
+# 127.0.0.1, so a browser-driven request must at least come from our own origin.
+_ALLOWED_REQUEST_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
+
+
+def _origin_host(value):
+    """Host part of an Origin/Referer header, or ``None`` when it is absent."""
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return None
+    if not parsed.hostname:
+        return None
+    return parsed.hostname.lower()
+
+
+def _host_is_ours(host):
+    """True for loopback hosts and the machine's own bound address."""
+    if host in _ALLOWED_REQUEST_HOSTS:
+        return True
+    # A desktop server on 0.0.0.0 is also reached by a LAN IP; only accept that
+    # when the server was deliberately bound beyond loopback.
+    return _server_host not in ('', '127.0.0.1', '::1') and bool(host)
+
+
+@app.before_request
+def _guard_cross_site_requests():
+    """Reject state-changing requests that clearly come from another site.
+
+    This complements the loopback admin guard: it blocks a form or fetch on an
+    unrelated page from silently driving our mutation endpoints, without
+    breaking the same-origin fetch() calls the admin JS makes.
+    """
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return None
+    origin = _origin_host(request.headers.get('Origin'))
+    if origin is None:
+        referer = _origin_host(request.headers.get('Referer'))
+        origin = referer
+    if origin is None:
+        # No browser origin header at all (curl, tests, the Android WebView's
+        # own navigations): nothing to cross-check, so allow it.
+        return None
+    if not _host_is_ours(origin):
+        return ('Požadavek z cizí stránky byl odmítnut.', 403)
+    return None
+
+
+@app.route('/health')
+def health():
+    """Readiness probe used by the Android wrapper before it loads the WebView."""
+    return jsonify(server_status())
+
+
+@app.route('/admin/api/status')
+def admin_api_status():
+    """Runtime diagnostics (state, workers, embedding backend) for the panel."""
+    return jsonify(server_status())
 
 
 @app.before_request
@@ -6609,6 +7400,8 @@ def admin_errors(site_id):
 
 @app.route('/admin/check-update')
 def admin_check_update():
+    if BUNDLED_RUNTIME:
+        return redirect('/admin?error=V aplikaci se aktualizace z Gitu nepoužívá.')
     try:
         available, msg = check_for_update()
         if available:
@@ -6621,6 +7414,8 @@ def admin_check_update():
 
 @app.route('/admin/apply-update')
 def admin_apply_update():
+    if BUNDLED_RUNTIME:
+        return redirect('/admin?error=Aplikace běží z APK a sama sebe neaktualizuje.')
     try:
         success, msg = apply_update()
         key = 'success' if success else 'error'
@@ -6709,66 +7504,228 @@ def _cli_recrawl_feeds():
     return 0
 
 
-def run_server(host=None, port=None):
-    """Start the Flask server plus background workers.
+def _start_background_jobs():
+    """Create and start the scheduler plus the crawl workers (idempotent).
 
-    Used both by the CLI entry point below and by the Android wrapper
-    (``android_entry.py``), which runs the server in a background thread.
-    ``host`` defaults to ``MINISEARCH_HOST`` / 0.0.0.0 so the desktop server
-    stays reachable on the LAN, while the app binds to loopback only.
+    Split out of :func:`run_server` so a restart reuses it. Every job is
+    registered only when its interval is > 0, so a phone can disable the
+    expensive recrawls entirely instead of merely stretching them out.
     """
     global _scheduler
-    host = host or os.environ.get('MINISEARCH_HOST', '0.0.0.0')
-    port = int(port or PORT)
-
-    get_db()
-    print('Database initialized')
-
-    # Vector search is a pure optimisation: crawl, sitemap and link discovery
-    # never depend on it, and lowmem only turns the embeddings off. If the
-    # hnswlib/model stack is unavailable we say so and fall back to FTS5.
-    if embeddings_enabled() and get_hnsw_index() is not None:
-        print('hnswlib index initialized')
-    if embeddings_enabled() and get_model() is not None:
-        print('Model loaded')
+    if _scheduler is not None and getattr(_scheduler, 'running', False):
+        print("Scheduler already running, not starting a second one")
     else:
-        print('Embeddings off - FTS5 fallback active (crawling unaffected)')
+        _scheduler = BackgroundScheduler()
 
-    _scheduler = BackgroundScheduler()
+        def _add_interval(job, hours, job_id):
+            if hours <= 0:
+                print(f"Job {job_id} disabled (interval 0)")
+                return
+            _scheduler.add_job(job, IntervalTrigger(hours=hours), id=job_id)
 
-    # Interval jobs are registered only when their configured period is > 0,
-    # so setting e.g. MINISEARCH_RECRAWL_SITE_HOURS=0 on a phone skips the
-    # expensive full recrawl entirely instead of merely stretching it out.
-    def _add_interval(job, hours, job_id):
-        if hours <= 0:
-            print(f"Job {job_id} disabled (interval 0)")
-            return
-        _scheduler.add_job(job, IntervalTrigger(hours=hours), id=job_id)
-
-    _add_interval(check_feeds, RECRAWL_FEED_HOURS, 'check_feeds')
-    _add_interval(check_sitemaps, RECRAWL_SITEMAP_HOURS, 'check_sitemaps')
-    _add_interval(recrawl_all_sites, RECRAWL_SITE_HOURS, 'recrawl_all')
-    if UPDATE_CHECK_ENABLED:
-        _scheduler.add_job(check_for_updates_scheduled, IntervalTrigger(hours=6), id='check_updates')
-    if MAINTENANCE_NIGHTLY_ENABLED:
-        # One nightly pass at the configured hour; a cron-style trigger keeps it
-        # out of the user's way far better than an interval job.
-        from apscheduler.triggers.cron import CronTrigger
-        _scheduler.add_job(maintenance_scheduled,
-                           CronTrigger(hour=MAINTENANCE_NIGHTLY_HOUR),
-                           id='nightly_maintenance')
-        print(f"Nightly maintenance scheduled at {MAINTENANCE_NIGHTLY_HOUR:02d}:00")
-    _scheduler.start()
-    print('Scheduler started')
+        _add_interval(check_feeds, RECRAWL_FEED_HOURS, 'check_feeds')
+        _add_interval(check_sitemaps, RECRAWL_SITEMAP_HOURS, 'check_sitemaps')
+        _add_interval(recrawl_all_sites, RECRAWL_SITE_HOURS, 'recrawl_all')
+        if UPDATE_CHECK_ENABLED:
+            _scheduler.add_job(check_for_updates_scheduled,
+                               IntervalTrigger(hours=6), id='check_updates')
+        if MAINTENANCE_NIGHTLY_ENABLED:
+            # One nightly pass at the configured hour; a cron-style trigger keeps
+            # it out of the user's way far better than an interval job.
+            from apscheduler.triggers.cron import CronTrigger
+            _scheduler.add_job(maintenance_scheduled,
+                               CronTrigger(hour=MAINTENANCE_NIGHTLY_HOUR),
+                               id='nightly_maintenance')
+            print(f"Nightly maintenance scheduled at {MAINTENANCE_NIGHTLY_HOUR:02d}:00")
+        _scheduler.start()
+        print('Scheduler started')
 
     start_workers()
 
-    print()
-    print(f'http://{host}:{port}')
-    print('Ctrl+C to stop')
-    print('=' * 70)
 
-    app.run(host=host, port=port, debug=False, threaded=True)
+def _stop_background_jobs(scheduler_wait=True, worker_timeout=10.0):
+    """Stop workers, the scheduler and the maintenance pass.
+
+    Workers are signalled first so they stop pulling new work, then the
+    scheduler, so no new job can start while we are tearing down. The database
+    is *not* closed here: that is the caller's job, once every writer has left.
+    """
+    global _scheduler, SHUTDOWN_FLAG
+    SHUTDOWN_FLAG = True
+    _stop_event.set()
+    try:
+        stop_workers(timeout=worker_timeout)
+    except Exception as e:
+        print(f"stop_workers failed: {e}")
+    if _scheduler is not None:
+        try:
+            _scheduler.shutdown(wait=scheduler_wait)
+        except Exception as e:
+            print(f"scheduler shutdown failed: {e}")
+        _scheduler = None
+
+
+def start_server(host=None, port=None, block=False):
+    """Start the HTTP server and background jobs; return once it is listening.
+
+    This is the controllable replacement for ``app.run``: it builds a real
+    ``werkzeug`` server whose ``shutdown()`` stops the accept loop, so the same
+    process can stop and start the app again (required by the Android wrapper).
+    ``run_server`` keeps the blocking behaviour for the CLI.
+
+    Idempotent: calling it while the server is already RUNNING is a no-op.
+    Raises on a bind failure so the caller can report an ERROR state.
+    """
+    global _server_handle, _server_thread, _server_state, _server_error
+    global _server_host, _server_port, _server_started_at, SHUTDOWN_FLAG
+
+    from werkzeug.serving import make_server
+
+    with _server_lock:
+        if _server_state == 'RUNNING' and _server_handle is not None:
+            print("Server already running, ignoring duplicate start")
+            return False
+        host = host or os.environ.get('MINISEARCH_HOST', '0.0.0.0')
+        port = int(port or PORT)
+        _server_state = 'STARTING'
+        _server_error = ''
+    # A previous stop (or a failed start) left the flag set; a fresh start must
+    # begin with workers and scheduler jobs actually allowed to run.
+    SHUTDOWN_FLAG = False
+    _stop_event.clear()
+
+    try:
+        get_db()
+        print('Database initialized')
+
+        # Vector search is a pure optimisation: crawl, sitemap and link discovery
+        # never depend on it, and lowmem only turns the embeddings off.
+        if embeddings_enabled() and get_hnsw_index() is not None:
+            print('hnswlib index initialized')
+        if embeddings_enabled() and get_model() is not None:
+            print(f'Model loaded ({embedding_backend_label()})')
+        else:
+            print('Embeddings off - FTS5 fallback active (crawling unaffected)')
+
+        # Bind first so a port clash surfaces as an ERROR before any thread is
+        # spawned. ``make_server`` also answers a probe request, so readiness is
+        # a real HTTP check rather than "the thread object exists".
+        httpd = make_server(host, port, app, threaded=True)
+        _server_handle = httpd
+        _server_host = host
+        _server_port = port
+
+        _start_background_jobs()
+
+        _server_thread = threading.Thread(
+            target=httpd.serve_forever, name='minisearch-http', daemon=True)
+        _server_thread.start()
+        _server_started_at = int(time.time())
+        with _server_lock:
+            _server_state = 'RUNNING'
+
+        print()
+        print(f'http://{host}:{port}')
+        print('=' * 70)
+        if block:
+            try:
+                _server_thread.join()
+            except KeyboardInterrupt:
+                pass
+        return True
+    except Exception as e:
+        _server_error = f"{type(e).__name__}: {e}"
+        with _server_lock:
+            _server_state = 'ERROR'
+        print(f"Server start failed: {_server_error}")
+        # Leave nothing half-started behind.
+        _stop_background_jobs()
+        _server_handle = None
+        raise
+
+
+def stop_server(timeout=15.0):
+    """Stop the HTTP server, background jobs, DB and model; allow a restart.
+
+    Order matters: stop accepting work, signal the workers and maintenance,
+    stop the scheduler, shut the HTTP server down, then checkpoint and close
+    the database *after* every writer has left, and finally drop the model and
+    the in-RAM vector index so a later start rebuilds them cleanly.
+    """
+    global _server_handle, _server_thread, _server_state, _server_error
+    global _model, _model_failed, _hnsw_index, _hnsw_space, SHUTDOWN_FLAG
+
+    with _server_lock:
+        if _server_state in ('STOPPED',) and _server_handle is None:
+            return True
+        _server_state = 'STOPPING'
+
+    _stop_background_jobs(worker_timeout=min(10.0, timeout))
+
+    handle = _server_handle
+    if handle is not None:
+        try:
+            handle.shutdown()
+        except Exception as e:
+            print(f"HTTP shutdown failed: {e}")
+    thread = _server_thread
+    if thread is not None:
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            print("HTTP thread still alive after stop timeout")
+
+    # Every writer has left by now, so the checkpoint and close are safe.
+    try:
+        close_db()
+    except Exception as e:
+        print(f"close_db failed: {e}")
+
+    # Free the model and vector index so a restart does not inherit stale state
+    # (and so the memory actually comes back on a phone).
+    _model = None
+    _model_failed = False
+    _hnsw_index = None
+    _hnsw_space = None
+
+    with _server_lock:
+        _server_handle = None
+        _server_thread = None
+        _server_state = 'STOPPED'
+        _server_error = ''
+    SHUTDOWN_FLAG = False
+    print("Server stopped")
+    return True
+
+
+def server_status():
+    """Snapshot of the runtime state for the Android UI and diagnostics."""
+    return {
+        'state': _server_state,
+        'error': _server_error,
+        'host': _server_host,
+        'port': _server_port,
+        'url': f"http://{_server_host}:{_server_port}" if _server_port else '',
+        'started_at': _server_started_at,
+        'workers': sum(1 for t in _worker_threads if t.is_alive()),
+        'scheduler_running': bool(_scheduler is not None and getattr(_scheduler, 'running', False)),
+        'embeddings': embedding_backend_label(),
+        'embedding_space': active_embedding_space(),
+    }
+
+
+def restart_server(host=None, port=None):
+    """Stop then start in the same process (used by the Android retry action)."""
+    stop_server()
+    return start_server(host=host, port=port)
+
+
+def run_server(host=None, port=None):
+    """Blocking server for the desktop CLI.
+
+    ``host`` defaults to ``MINISEARCH_HOST`` / 0.0.0.0 so the desktop server
+    stays reachable on the LAN, while the app binds to loopback only.
+    """
+    start_server(host=host, port=port, block=True)
 
 
 if __name__ == '__main__':
