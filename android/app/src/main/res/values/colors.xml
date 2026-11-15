@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#1F6FEB</color>
+    <!-- Matches the Clay CSS page background (#F5F5F5) so the window behind
+         the WebView and the page itself are the same colour (no white flash). -->
+    <color name="window_background">#F5F5F5</color>
 </resources>

@@ -14,6 +14,11 @@ lxml>=4.9.0
 feedparser>=6.0.0
 markupsafe
 numpy
+# tzdata ships the IANA time-zone database. Android has no /usr/share/zoneinfo,
+# so APScheduler's tzlocal lookup of the device zone ("Europe/Prague") raised
+# ZoneInfoNotFoundError and the scheduler never started. This makes the bundled
+# interpreter able to resolve named zones on the device.
+tzdata
 # extruct is intentionally omitted: it needs rdflib/jstyleson, which have no
 # Android wheels. app_combined.py falls back to its own per-script JSON-LD
 # parser when extruct is not importable.

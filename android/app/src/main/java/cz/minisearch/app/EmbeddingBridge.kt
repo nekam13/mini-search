@@ -201,21 +201,41 @@ class EmbeddingBridge internal constructor(modelFile: File, tokenizerBytes: Byte
             context.assets.open(ASSET_TOKENIZER).use { it.readBytes() }
 
         /**
-         * Copy the bundled model from assets into private storage once. A partial
-         * file from an interrupted copy is detected by size and replaced, so a
-         * failed install self-heals instead of loading a corrupt graph.
+         * Copy the bundled model from assets into private storage once.
+         *
+         * The model is stored *compressed* in the APK (a 118 MB asset would
+         * bloat the download otherwise), and ``AssetManager.openFd()`` throws
+         * ``FileNotFoundException`` for a compressed asset because there is no
+         * uncompressed region to mmap. The size therefore comes from
+         * ``AssetFileDescriptor.getLength()`` only when the asset is stored
+         * uncompressed; otherwise the stream is copied and the real byte count
+         * is taken from the copy itself. A partial copy from an interrupted
+         * run is detected by comparing against the expected size and replaced,
+         * so a failed install self-heals instead of loading a corrupt graph.
          */
         private fun ensureModelFile(context: Context): File {
             val target = File(context.filesDir, FILE_NAME)
-            val expectedSize = context.assets.openFd(ASSET_MODEL).use { it.length }
-            if (target.exists() && target.length() == expectedSize) return target
-            val tmp = File(context.filesDir, "$FILE_NAME.tmp")
-            context.assets.open(ASSET_MODEL).use { input ->
-                tmp.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+            val expectedSize = modelAssetSize(context)
+            if (target.exists() && (expectedSize <= 0 || target.length() == expectedSize)) {
+                return target
             }
-            if (tmp.length() != expectedSize) {
+            val tmp = File(context.filesDir, "$FILE_NAME.tmp")
+            var copied = 0L
+            context.assets.open(ASSET_MODEL).use { input ->
+                tmp.outputStream().use { output ->
+                    val buffer = ByteArray(1 shl 16)
+                    var read = input.read(buffer)
+                    while (read >= 0) {
+                        output.write(buffer, 0, read)
+                        copied += read
+                        read = input.read(buffer)
+                    }
+                }
+            }
+            if (copied <= 0L || (expectedSize > 0 && copied != expectedSize)) {
                 tmp.delete()
-                throw IllegalStateException("embedding model copy truncated")
+                throw IllegalStateException(
+                    "embedding model copy truncated: $copied bytes (expected $expectedSize)")
             }
             if (!tmp.renameTo(target)) {
                 target.delete()
@@ -224,7 +244,19 @@ class EmbeddingBridge internal constructor(modelFile: File, tokenizerBytes: Byte
                     tmp.delete()
                 }
             }
+            Log.i(TAG, "embedding model installed ($copied bytes)")
             return target
         }
+
+        /**
+         * Size of the bundled model asset, or ``-1`` when it cannot be read
+         * from the archive metadata (a compressed asset has no entry length).
+         */
+        private fun modelAssetSize(context: Context): Long =
+            try {
+                context.assets.openFd(ASSET_MODEL).use { it.length }
+            } catch (t: Throwable) {
+                -1L
+            }
     }
 }

@@ -875,6 +875,49 @@ DB_TRIGGERS = [
     '''
 ]
 
+# Chaquopy's bundled SQLite (Android APK) is compiled without FTS3/4/5, so the
+# ``CREATE VIRTUAL TABLE ... USING fts5`` below raises "no such module: fts5".
+# The capability is probed once per process; when FTS5 is missing, ``pages_fts``
+# is created as a plain mirror table with the *same* columns — the triggers above
+# are written against that shape and keep working unchanged — and ``fts_search``
+# uses a diacritic-folded LIKE query instead of MATCH. Desktop keeps real FTS5.
+FTS5_ENABLED = None  # tri-state: None = not probed yet
+
+FTS_FALLBACK_SCHEMA = '''
+    CREATE TABLE IF NOT EXISTS pages_fts (
+        page_id INTEGER,
+        title TEXT DEFAULT '',
+        body_text TEXT DEFAULT '',
+        og_title TEXT DEFAULT '',
+        og_description TEXT DEFAULT '',
+        url TEXT DEFAULT '',
+        schema_type TEXT DEFAULT ''
+    )
+'''
+
+
+def _probe_fts5(conn):
+    """True when this SQLite build can create an FTS5 virtual table."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
+        conn.execute("DROP TABLE IF EXISTS _fts5_probe")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _ensure_fts_table(conn):
+    """Create ``pages_fts`` as FTS5, or as a plain mirror without FTS5.
+
+    Sets ``FTS5_ENABLED`` on first call so the rest of the code (and the
+    diagnostics in ``server_status``) knows which backend is live.
+    """
+    global FTS5_ENABLED
+    if FTS5_ENABLED is None:
+        FTS5_ENABLED = _probe_fts5(conn)
+    conn.execute(DB_SCHEMA['pages_fts'] if FTS5_ENABLED else FTS_FALLBACK_SCHEMA)
+    conn.commit()
+
 
 # ============================================================================
 # DATABASE
@@ -905,7 +948,12 @@ def get_db():
             _db_conn.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_KB}")
             _db_conn.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             _db_conn.row_factory = sqlite3.Row
+            # The FTS5-less fallback (Chaquopy's SQLite has no FTS5) folds the
+            # stored text in SQL, so the folding helper must exist on the
+            # connection. Registering it unconditionally is harmless on desktop.
+            _db_conn.create_function("minisearch_fold", 1, fold_diacritics)
             _init_schema(_db_conn)
+            _ensure_fts_table(_db_conn)
             _migrate_db(_db_conn)
             _backfill_fts(_db_conn)
             _migrate_sources(_db_conn)
@@ -980,7 +1028,11 @@ def run_self_migration(conn=None):
 def _init_schema(conn):
     """Initialize database schema - non-destructive."""
     cursor = conn.cursor()
-    for schema in DB_SCHEMA.values():
+    for name, schema in DB_SCHEMA.items():
+        # pages_fts is created by _ensure_fts_table so a SQLite build without
+        # FTS5 gets the plain mirror table instead of an exception here.
+        if name == 'pages_fts':
+            continue
         cursor.execute(schema)
     for idx in DB_INDEXES:
         try:
@@ -1086,8 +1138,7 @@ def _migrate_db(conn):
     
     # Create pages_fts table if not exists
     try:
-        cursor.execute(DB_SCHEMA['pages_fts'])
-        conn.commit()
+        _ensure_fts_table(conn)
     except sqlite3.OperationalError:
         pass
     
@@ -3917,25 +3968,73 @@ def _attach_priority(page):
         page['is_local'] = multiplier > PUBLIC_SITE_PRIORITY_MULTIPLIER
     return page
 def fts_search(query, limit=25):
-    """Search using FTS5 full-text search with a diacritic-folded query."""
+    """Full-text search over ``pages_fts``.
+
+    Uses FTS5 MATCH when the SQLite build has it (desktop, Termux). Chaquopy's
+    bundled SQLite on Android has no FTS5 module, so it falls back to a
+    diacritic-folded ``LIKE`` scan over the mirror table — same results for the
+    Czech folding rules, just O(n). The fallback is announced once, never
+    silently, so the operator knows which full-text backend is live.
+    """
     results = []
     match_expr = build_fts_query(query)
     if not match_expr:
         return results
+    if FTS5_ENABLED:
+        try:
+            rows = execute_db_fetchall("""
+                SELECT p.* FROM pages_fts fts
+                JOIN pages p ON fts.page_id = p.id
+                WHERE pages_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (match_expr, limit * 2))
+            for row in rows:
+                results.append(dict(row))
+        except Exception as e:
+            # A malformed expression must never break the whole search.
+            print(f"FTS5 search error: {e}")
+        return results
+    return _fts_like_search(query, limit)
+
+
+def _fts_like_search(query, limit=25):
+    """FTS5-less full-text fallback: folded ``LIKE`` over the mirror table.
+
+    Every folded token must appear in at least one indexed column (AND between
+    terms, OR between columns), mirroring the ``build_fts_query`` semantics
+    closely enough for a local index. The stored text is folded with the
+    registered ``minisearch_fold`` SQL function so "cesky" still matches
+    "český" (``LOWER`` alone does not strip Czech diacritics). Ranking prefers
+    title hits, then recency.
+    """
+    tokens = _fold_tokenize(query)
+    if not tokens:
+        return []
+    columns = ('title', 'body_text', 'og_title', 'og_description', 'url', 'schema_type')
+    where_parts = []
+    params = []
+    for token in tokens:
+        clause = ' OR '.join(f"minisearch_fold(COALESCE(fts.{c}, '')) LIKE ?" for c in columns)
+        where_parts.append(f'({clause})')
+        params.extend([f'%{token}%'] * len(columns))
+    title_like = ' OR '.join(
+        f"minisearch_fold(COALESCE(fts.{c}, '')) LIKE ?" for c in ('title', 'og_title'))
+    params.extend([f'%{tokens[0]}%'] * 2)
+    sql = f"""
+        SELECT p.* FROM pages_fts fts
+        JOIN pages p ON fts.page_id = p.id
+        WHERE {' AND '.join(where_parts)}
+        ORDER BY (CASE WHEN ({title_like}) THEN 0 ELSE 1 END), p.indexed_at DESC
+        LIMIT ?
+    """
+    params.append(limit * 2)
     try:
-        rows = execute_db_fetchall("""
-            SELECT p.* FROM pages_fts fts
-            JOIN pages p ON fts.page_id = p.id
-            WHERE pages_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (match_expr, limit * 2))
-        for row in rows:
-            results.append(dict(row))
+        rows = execute_db_fetchall(sql, tuple(params))
+        return [dict(row) for row in rows]
     except Exception as e:
-        # A malformed expression must never break the whole search.
-        print(f"FTS5 search error: {e}")
-    return results
+        print(f"Full-text (LIKE) search error: {e}")
+        return []
 
 
 # ============================================================================
@@ -7568,7 +7667,17 @@ def _start_background_jobs():
     if _scheduler is not None and getattr(_scheduler, 'running', False):
         print("Scheduler already running, not starting a second one")
     else:
-        _scheduler = BackgroundScheduler()
+        # APScheduler resolves the local zone via tzlocal, which raises
+        # ZoneInfoNotFoundError on Android (no /usr/share/zoneinfo). tzdata is
+        # bundled now, but a scheduler must never be the reason the whole server
+        # fails to start, so fall back to UTC if the zone cannot be resolved.
+        try:
+            _scheduler = BackgroundScheduler()
+        except Exception as e:
+            print(f"Scheduler local timezone unavailable ({e}); using UTC")
+            import datetime as _dt
+            from apscheduler.schedulers.background import BackgroundScheduler as _BS
+            _scheduler = _BS(timezone=_dt.timezone.utc)
 
         def _add_interval(job, hours, job_id):
             if hours <= 0:
@@ -7668,7 +7777,14 @@ def start_server(host=None, port=None, block=False):
         _server_host = host
         _server_port = port
 
-        _start_background_jobs()
+        # Background jobs are an enhancement, never a precondition: if the
+        # scheduler cannot start (e.g. an unresolvable time zone on a stripped
+        # Android image), the HTTP server must still come up and serve search.
+        try:
+            _start_background_jobs()
+        except Exception as e:
+            print(f"Background jobs failed to start ({type(e).__name__}: {e}); "
+                  "server continues without them")
 
         _server_thread = threading.Thread(
             target=httpd.serve_forever, name='minisearch-http', daemon=True)
