@@ -17,8 +17,8 @@ wiki-dumps/
 logs/
 data/
 
-# The full-model APK (~142 MB) is above GitHub's 100 MB per-file limit; build it
-# with `cd android && ./gradlew :app:assembleDebug`. The smaller hash-fallback
-# APK is committed instead as mini-search-*-nomodel-debug.apk.
-mini-search-7.6-debug.apk
+# The full-model APK (~142 MB) is above GitHub's 100 MB per-file limit, so it
+# is stored with Git LFS (see .gitattributes). Clone with git-lfs installed to
+# get the real file; otherwise only a small pointer is fetched. It is also
+# reproducible with `cd android && ./gradlew :app:assembleDebug`.
 nohup.out
