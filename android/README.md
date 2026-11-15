@@ -7,7 +7,10 @@ Samostatná aplikace pro Android, která **nevyžaduje Termux**. Server
 
 - **Vyhledávač** – veřejná stránka `/`.
 - **Správa** – panel `/admin`; server poslouchá jen na `127.0.0.1`, takže
-  administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`).
+  administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`). Mutující
+  akce (recrawl, pauza, obnovení, smazání) jsou **POST-only**, aby je nešlo
+  spustit obyčejným cross-site odkazem; požadavky s cizím `Origin`/`Referer`
+  se odmítají (403).
 - Server drží na pozadí foreground služba (`ServerService`, typ `specialUse`),
   takže indexace neusne. Data (SQLite + logy) jsou v privátním úložišti
   aplikace (`filesDir`).
@@ -118,3 +121,10 @@ nikdy nespouští `git pull` ani `pip install`. Data, logy a pomocné soubory
 přes původní instalaci nemusí být možná (odinstalace by smazala data). Release
 se podepisuje jen dodatečným klíčem přes bezpečnou konfiguraci; klíče a hesla
 nejsou součástí repozitáře.
+
+## Doklad o buildu a testech
+
+Podrobný doklad (odevzdané APK, SHA-256, přesný postup z čistého checkoutu,
+výsledky testů a seznam neověřených scénářů) je v `DODANI-ANDROID.md` v kořeni
+repozitáře.
+

@@ -25,6 +25,7 @@ python3 tests/test_maintenance.py            # nightly maintenance: dedup, vecto
 python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, lowmem scope
 python3 tests/test_search_quality.py         # charset, asset filtering, weights, image section
 python3 tests/test_settings_images.py        # admin settings, images filter, wiki images
+python3 tests/test_lifecycle.py              # server lifecycle: start/readiness/stop/restart, dedup
 ```
 
 `tests/test_crawler_discovery.py` and `tests/test_search_quality.py` run against a
@@ -403,5 +404,11 @@ Facts to preserve:
   requires numpy. `get_hnsw_index()` / `_init_hnsw()` / `_rebuild_hnsw_index()`
   must all tolerate `hnswlib is None`.
 - `MINISEARCH_ADMIN_LOCAL_ONLY=1` (set by `android_entry.py`) keeps `/admin`
-  loopback-only so the admin panel never leaks onto the LAN.
+  loopback-only so the admin panel never leaks onto the LAN. Loopback alone is
+  not a CSRF defence: `_guard_cross_site_requests()` rejects mutating requests
+  whose `Origin`/`Referer` is not ours (403), and every state-changing admin
+  action is POST-only (`GET /admin/recrawl-all`, `/pause-all`, `/resume-all`,
+  `/sites/<id>/recrawl`, `/sites/<id>/delete` return 405). The templates submit
+  those through `.inline-form` POST forms — keep it that way; a plain `<a href>`
+  would reopen the cross-site vector.
 
