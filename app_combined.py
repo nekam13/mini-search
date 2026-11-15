@@ -675,10 +675,14 @@ _http_local = threading.local()
 _active_recrawls = set()
 _recrawl_lock = threading.Lock()
 
-# Update tracking
-COMMIT_SHA_PATH = ".commit_sha"
-UPDATE_AVAILABLE_PATH = ".update_available"
-UPDATE_LOG_PATH = "update_log"
+# Update tracking. These are only written by the git-update feature, which is
+# disabled inside the APK (BUNDLED_RUNTIME); when a data dir is configured they
+# stay next to the database so the bundled runtime never writes into its own
+# read-only asset tree.
+_DATA_DIR = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else '.'
+COMMIT_SHA_PATH = os.path.join(_DATA_DIR, ".commit_sha")
+UPDATE_AVAILABLE_PATH = os.path.join(_DATA_DIR, ".update_available")
+UPDATE_LOG_PATH = os.path.join(_DATA_DIR, "update_log")
 REPO_OWNER = "nekam13"
 REPO_NAME = "mini-search"
 BRANCH = "beta-optimized"

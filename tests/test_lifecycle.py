@@ -207,6 +207,32 @@ def main():
         check("vector has the expected dimension",
               int(vec.shape[0]) == m.HASH_EMBEDDING_DIM, str(vec.shape))
 
+    # Two vectors with the same width but different spaces must never be
+    # compared: the brute-force path (the APK's only vector path) filters by
+    # space, so a "minilm" row cannot surface in a hash-space query even though
+    # both are 384 floats.
+    import numpy as np
+    fake_space = "minilm:test-revision"
+    q = m.generate_embedding("praha")
+    if q is not None:
+        raw = np.asarray(q, dtype=np.float32).tobytes()
+        m.execute_db(
+            "INSERT INTO pages (url, url_hash, title, body_text, embedding, "
+            "embedding_space) VALUES (?, ?, ?, ?, ?, ?)",
+            ("http://x/hash", "hash-row", "Hash", "obsah", raw,
+             m.HASH_EMBEDDING_SPACE))
+        m.execute_db(
+            "INSERT INTO pages (url, url_hash, title, body_text, embedding, "
+            "embedding_space) VALUES (?, ?, ?, ?, ?, ?)",
+            ("http://x/real", "real-row", "Real", "obsah", raw, fake_space))
+        hash_hits = m._bruteforce_neighbours(q, 10, space=m.HASH_EMBEDDING_SPACE)
+        real_hits = m._bruteforce_neighbours(q, 10, space=fake_space)
+        hash_titles = [r[0] for r in hash_hits]
+        real_titles = [r[0] for r in real_hits]
+        check("hash-space query sees only the hash vector",
+              bool(hash_titles) and not (set(hash_titles) & set(real_titles)),
+              f"hash={hash_titles} real={real_titles}")
+
     # ------------------------------------------------------------------
     # 6b. The Android dump entry imports a file:// path and stays idempotent
     # ------------------------------------------------------------------
@@ -225,18 +251,18 @@ def main():
     entry_result = json.loads(android_entry.import_wiki_dump(dump_path))
     check("android entry accepts a dump path",
           "source_id" in entry_result, str(entry_result))
+    wiki_count = ("SELECT COUNT(*) FROM pages WHERE url LIKE '%wikipedia.org%'")
     deadline = time.time() + 30
-    while time.time() < deadline and m.execute_db_fetchone(
-            "SELECT COUNT(*) FROM pages")[0] < 2:
+    while time.time() < deadline and m.execute_db_fetchone(wiki_count)[0] < 2:
         time.sleep(0.2)
     check("dump import indexed both articles",
-          m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0] == 2,
-          str(m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0]))
+          m.execute_db_fetchone(wiki_count)[0] == 2,
+          str(m.execute_db_fetchone(wiki_count)[0]))
     android_entry.import_wiki_dump(dump_path)
     time.sleep(1.5)
     check("re-importing the dump is idempotent",
-          m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0] == 2,
-          str(m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0]))
+          m.execute_db_fetchone(wiki_count)[0] == 2,
+          str(m.execute_db_fetchone(wiki_count)[0]))
 
     # ------------------------------------------------------------------
     # 7. Queue recovery: a locked row returns to pending after a crash
