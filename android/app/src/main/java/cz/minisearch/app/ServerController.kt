@@ -164,6 +164,24 @@ object ServerController {
         }, "minisearch-restart").start()
     }
 
+    /**
+     * Ask Python to import a Wikipedia dump that already sits in private
+     * storage. Runs on a background thread and reports the JSON result (or a
+     * failure message) through [onResult]; the caller must ensure the server is
+     * running, because the import shares the backend's database.
+     */
+    fun importDump(path: String, onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("import_wiki_dump", path).toString()
+                onResult(json, null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "dump import failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-dump").start()
+    }
+
     /** Poll ``/health`` until it answers or the timeout expires. */
     private fun awaitReady(): Boolean {
         val deadline = System.currentTimeMillis() + READY_TIMEOUT_MS

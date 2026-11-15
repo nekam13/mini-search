@@ -14,6 +14,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -39,6 +40,14 @@ class MainActivity : AppCompatActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    // The Wikipedia dump is chosen through the Storage Access Framework: the
+    // picker hands back a content:// URI, which Kotlin copies into private
+    // storage before Python ever sees a real path.
+    private val dumpPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) copyAndImportDump(uri)
+        }
+
     private val stateListener: (ServerState) -> Unit = { runOnUiThread { renderState(it) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,6 +63,7 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.tab_search).setOnClickListener { showSearch() }
         findViewById<Button>(R.id.tab_admin).setOnClickListener { showAdmin() }
+        findViewById<Button>(R.id.import_dump).setOnClickListener { pickDump() }
         retry.setOnClickListener {
             UserState.serverEnabled = true
             ServerService.start(this)
@@ -70,6 +80,44 @@ class MainActivity : AppCompatActivity() {
         if (UserState.serverEnabled) {
             ServerService.start(this)
         }
+    }
+
+    private fun pickDump() {
+        if (ServerController.state != ServerState.RUNNING) {
+            toast(getString(R.string.dump_need_running))
+            return
+        }
+        // A multistream dump is an XML file, often bzip2-compressed; accept both
+        // generic binaries and XML so the picker does not hide the download.
+        dumpPicker.launch(arrayOf("application/x-bzip2", "application/gzip",
+            "application/xml", "text/xml", "application/octet-stream"))
+    }
+
+    private fun copyAndImportDump(uri: Uri) {
+        toast(getString(R.string.dump_copying))
+        Thread({
+            when (val result = DumpImporter.copyToPrivate(this, uri)) {
+                is DumpImporter.Result.Success -> {
+                    ServerController.importDump(result.path) { json, error ->
+                        runOnUiThread {
+                            if (error != null) {
+                                toast(getString(R.string.dump_import_error, error))
+                            } else if (json != null && json.contains("\"error\"")) {
+                                toast(getString(R.string.dump_import_error, json))
+                            } else {
+                                toast(getString(R.string.dump_copied))
+                            }
+                        }
+                    }
+                }
+                is DumpImporter.Result.Failure ->
+                    runOnUiThread { toast(getString(R.string.dump_import_error, result.message)) }
+            }
+        }, "minisearch-dump-copy").start()
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     @SuppressLint("SetJavaScriptEnabled")

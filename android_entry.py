@@ -107,3 +107,49 @@ def ready():
 def base_url():
     """URL the WebView should load."""
     return f"http://{HOST}:{PORT}/"
+
+
+def _wiki_dump_url(path):
+    """Turn a private-storage dump path into the ``file://`` URL the importer wants."""
+    if path.startswith("file://"):
+        return path
+    return "file://" + os.path.abspath(path)
+
+
+def import_wiki_dump(path, max_pages=None):
+    """Import a Wikipedia dump that Kotlin copied into private storage.
+
+    The Android picker hands out a ``content://`` URI, which is not a filesystem
+    path; Kotlin copies the stream into ``filesDir`` first and passes the real
+    path here. The source is registered as a wiki dump source (so it is resumable
+    and idempotent like any other import) and the work runs on a background
+    thread, so the HTTP request that triggered it never blocks. Returns JSON.
+    """
+    _apply_android_defaults()
+    if not path or not os.path.exists(path):
+        return json.dumps({"error": "Dump nebyl nalezen."})
+    with _lock:
+        module = _module()
+        source_url = _wiki_dump_url(path)
+        source_id, error = module.add_source(
+            0, source_url, module.WIKI_SOURCE_TYPE, importer="dump")
+        if source_id is None:
+            existing = module.execute_db_fetchone(
+                "SELECT id FROM site_sources WHERE url = ? AND source_type = ?",
+                (source_url, module.WIKI_SOURCE_TYPE))
+            if existing:
+                source_id = existing[0]
+            else:
+                return json.dumps({"error": error or "Zdroj nelze vytvořit."})
+
+        def _run():
+            try:
+                source = module.get_source_by_id(source_id)
+                module.run_wiki_import(source, max_pages=max_pages)
+            except Exception as exc:  # pragma: no cover - background best effort
+                module.log_error("Wiki dump import failed", exc)
+
+        threading.Thread(target=_run, name="minisearch-wiki-import",
+                         daemon=True).start()
+        return json.dumps({"source_id": source_id,
+                           "message": "Import dumpu byl spuštěn na pozadí."})

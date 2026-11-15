@@ -4,6 +4,11 @@
     <string name="tab_admin">Správa</string>
     <string name="action_stop">Zastavit</string>
     <string name="action_retry">Zkusit znovu</string>
+    <string name="action_import_dump">Import dumpu</string>
+    <string name="dump_copying">Kopíruji dump do úložiště aplikace…</string>
+    <string name="dump_copied">Dump zkopírován do úložiště aplikace, import běží na pozadí.</string>
+    <string name="dump_import_error">Import dumpu se nezdařil: %1$s</string>
+    <string name="dump_need_running">Nejdřív spusťte server.</string>
 
     <string name="service_channel">Běh serveru</string>
     <string name="service_channel_desc">Trvalé oznámení o běžícím lokálním serveru.</string>

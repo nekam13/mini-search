@@ -208,6 +208,37 @@ def main():
               int(vec.shape[0]) == m.HASH_EMBEDDING_DIM, str(vec.shape))
 
     # ------------------------------------------------------------------
+    # 6b. The Android dump entry imports a file:// path and stays idempotent
+    # ------------------------------------------------------------------
+    import bz2
+    dump_path = os.path.join(tmpdir, "cswiki-latest-pages-articles.xml.bz2")
+    with bz2.open(dump_path, "wb") as handle:
+        handle.write(
+            b"<?xml version=\"1.0\"?>\n<mediawiki>"
+            b"<page><title>Praha</title><ns>0</ns>"
+            b"<revision><text>Praha je hlavni mesto.</text></revision></page>"
+            b"<page><title>Brno</title><ns>0</ns>"
+            b"<revision><text>Brno je druhe mesto.</text></revision></page>"
+            b"</mediawiki>")
+    sys.path.insert(0, PROJECT_ROOT)
+    import android_entry
+    entry_result = json.loads(android_entry.import_wiki_dump(dump_path))
+    check("android entry accepts a dump path",
+          "source_id" in entry_result, str(entry_result))
+    deadline = time.time() + 30
+    while time.time() < deadline and m.execute_db_fetchone(
+            "SELECT COUNT(*) FROM pages")[0] < 2:
+        time.sleep(0.2)
+    check("dump import indexed both articles",
+          m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0] == 2,
+          str(m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0]))
+    android_entry.import_wiki_dump(dump_path)
+    time.sleep(1.5)
+    check("re-importing the dump is idempotent",
+          m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0] == 2,
+          str(m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0]))
+
+    # ------------------------------------------------------------------
     # 7. Queue recovery: a locked row returns to pending after a crash
     # ------------------------------------------------------------------
     m.stop_server()
