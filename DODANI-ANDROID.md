@@ -6,7 +6,9 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit buildu: **`36735a1`** (`Refuse mutating admin actions over GET`)
+- Zdrojový commit obou APK: **`36735a1`** (`Refuse mutating admin actions over GET`)
+- Commit s dokumentací: `7200ac0` (přidává tento dokument a přebudované APK;
+  zdrojový kód backendu ani Androidu se v něm nemění)
 - Výchozí větev `beta-optimized` byla ověřena; větev `android-app-completion`
   vychází z referenčního commitu zadání a obsahuje dokončení Android aplikace.
 
