@@ -4,8 +4,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Mini Search{% endblock %} · Mini Search</title>
+    <!-- The Inter webfont is a progressive enhancement: loaded without blocking
+         first paint so an offline device still renders the local UI instantly
+         (the CSS stack falls back to the system sans-serif). -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" media="print" onload="this.media='all'"
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <noscript>
+        <link rel="stylesheet"
+              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    </noscript>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/clay.css') }}">
     {% block extra_css %}{% endblock %}
 </head>
@@ -34,7 +42,7 @@
     {% block content %}{% endblock %}
 
     <footer class="card card-static" style="text-align:center;color:var(--text-light);font-size:.85rem">
-        {% block footer %}Mini Search v7.3 · Clay design{% endblock %}
+        {% block footer %}Mini Search v7.6 · Clay design{% endblock %}
     </footer>
 </div>
 {% block extra_js %}{% endblock %}
