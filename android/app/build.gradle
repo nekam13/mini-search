@@ -21,8 +21,16 @@ def embeddingModelSha256 = "783fea82d71a58179b830a4dbd2d58447e640609e98eedf9ffa1
 def embeddingModelUrl = "https://huggingface.co/sentence-transformers/" +
         "paraphrase-multilingual-MiniLM-L12-v2/resolve/${embeddingModelRevision}/" +
         "onnx/model_qint8_arm64.onnx"
-def embeddingModelAsset = file("${projectDir}/src/main/assets/embedding/model_qint8_arm64.onnx")
+def embeddingModelAsset = file("${projectDir}/build-assets/embedding/model_qint8_arm64.onnx")
 def skipEmbeddingModel = project.hasProperty("skipEmbeddingModel")
+
+// The two variants use separate build directories so switching between them is
+// reproducible without a manual ``clean``: Gradle's incremental asset merge is
+// not invalidated by the asset source set, so a shared output tree would keep
+// the previously merged model.
+if (skipEmbeddingModel) {
+    layout.buildDirectory = file("${projectDir}/build-nomodel")
+}
 
 // The sentencepiece tokenizer asset is *derived* from the upstream
 // ``tokenizer.json`` at the same pinned revision. It is generated (not committed)
@@ -183,12 +191,12 @@ tasks.matching { it.name == "preBuild" || it.name.startsWith("merge") && it.name
             dependsOn("fetchTokenizerAsset")
         }
 
-// ``-PskipEmbeddingModel`` must produce a genuinely small APK (hash fallback)
-// even when the 118 MB model was downloaded by an earlier build, so drop the
-// model asset from the package instead of merely skipping its download.
-android.sourceSets.main.assets.srcDirs = [file("${projectDir}/src/main/assets")]
-if (skipEmbeddingModel) {
-    android.sourceSets.main.assets.exclude "embedding/**"
+// The 118 MB model is a *generated* asset kept out of src/main/assets, so the
+// hash-fallback variant simply does not add its source directory: no exclude
+// rule, no stale merged asset and no shared build outputs. The tokenizer asset
+// stays in src/main/assets/ml because it is small and always packaged.
+if (!skipEmbeddingModel) {
+    android.sourceSets.main.assets.srcDirs += file("${projectDir}/build-assets")
 }
 
 chaquopy {

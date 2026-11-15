@@ -30,6 +30,9 @@ class EmbeddingBridgeTest {
         @JvmStatic
         fun locateAssets() {
             val model = listOf(
+                // Generated asset dir (preferred) and the legacy in-source path.
+                File("build-assets/embedding/model_qint8_arm64.onnx"),
+                File("app/build-assets/embedding/model_qint8_arm64.onnx"),
                 File("src/main/assets/embedding/model_qint8_arm64.onnx"),
                 File("app/src/main/assets/embedding/model_qint8_arm64.onnx"),
             ).firstOrNull { it.exists() }
