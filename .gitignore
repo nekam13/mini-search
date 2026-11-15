@@ -21,3 +21,4 @@ data/
 # with `cd android && ./gradlew :app:assembleDebug`. The smaller hash-fallback
 # APK is committed instead as mini-search-*-nomodel-debug.apk.
 mini-search-7.6-debug.apk
+nohup.out
