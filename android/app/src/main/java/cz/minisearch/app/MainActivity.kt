@@ -15,6 +15,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,8 +37,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var retry: Button
     private lateinit var stopButton: Button
+    private lateinit var lanShare: CheckBox
+    private lateinit var lanUrl: TextView
     private var onAdmin = false
     private var loadedOnce = false
+    // Set while the code reflects the backend state into the checkbox, so the
+    // programmatic change does not look like a user tap and re-trigger a restart.
+    private var syncingLanToggle = false
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -60,6 +66,8 @@ class MainActivity : AppCompatActivity() {
         status = findViewById(R.id.status)
         retry = findViewById(R.id.retry)
         stopButton = findViewById(R.id.stop_server)
+        lanShare = findViewById(R.id.lan_share)
+        lanUrl = findViewById(R.id.lan_url)
 
         configureWebView()
 
@@ -75,10 +83,27 @@ class MainActivity : AppCompatActivity() {
             UserState.serverEnabled = false
             ServerService.stop(this)
         }
+        lanShare.setOnCheckedChangeListener { _, checked ->
+            if (syncingLanToggle) return@setOnCheckedChangeListener
+            if (ServerController.state != ServerState.RUNNING) {
+                // Nothing to re-bind; restore the switch to the real state.
+                syncLanToggle()
+                toast(getString(R.string.lan_share_needs_running))
+                return@setOnCheckedChangeListener
+            }
+            if (checked) {
+                toast(getString(R.string.lan_share_hint))
+            }
+            ServerController.setLanShare(this, checked)
+        }
 
         requestNotificationPermissionIfNeeded()
 
         ServerController.addListener(stateListener)
+        // The controller may already be RUNNING (rotation, return from
+        // background), in which case no new state event fires: reflect the
+        // current state once so the switch and status are correct immediately.
+        renderState(ServerController.state)
         if (UserState.serverEnabled) {
             ServerService.start(this)
         }
@@ -208,6 +233,23 @@ class MainActivity : AppCompatActivity() {
         web.loadUrl(url)
     }
 
+    /** Reflect the backend's LAN state into the checkbox and the address label. */
+    private fun syncLanToggle() {
+        syncingLanToggle = true
+        lanShare.isChecked = ServerController.lanShareEnabled
+        syncingLanToggle = false
+        val url = ServerController.lanUrl
+        if (ServerController.lanShareEnabled && url.isNotEmpty()) {
+            lanUrl.text = getString(R.string.lan_share_url, url)
+            lanUrl.visibility = View.VISIBLE
+        } else if (ServerController.lanShareEnabled) {
+            lanUrl.text = getString(R.string.lan_share_no_address)
+            lanUrl.visibility = View.VISIBLE
+        } else {
+            lanUrl.visibility = View.GONE
+        }
+    }
+
     private fun renderState(state: ServerState) {
         when (state) {
             ServerState.STARTING -> {
@@ -219,6 +261,7 @@ class MainActivity : AppCompatActivity() {
                 status.text = getString(R.string.state_running, ServerController.backendLabel)
                 status.visibility = View.VISIBLE
                 retry.visibility = View.GONE
+                syncLanToggle()
                 // Only now is localhost reachable.
                 if (!loadedOnce || web.url == null) {
                     load(if (onAdmin) "${ServerController.BASE_URL}admin" else ServerController.BASE_URL)
@@ -232,11 +275,13 @@ class MainActivity : AppCompatActivity() {
                 status.text = getString(R.string.state_stopped)
                 status.visibility = View.VISIBLE
                 retry.visibility = View.VISIBLE
+                syncLanToggle()
             }
             ServerState.ERROR -> {
                 status.text = getString(R.string.state_error, ServerController.lastError)
                 status.visibility = View.VISIBLE
                 retry.visibility = View.VISIBLE
+                syncLanToggle()
             }
         }
     }

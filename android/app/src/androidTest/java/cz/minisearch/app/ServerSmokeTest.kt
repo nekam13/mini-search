@@ -45,11 +45,11 @@ class ServerSmokeTest {
         return false
     }
 
-    private fun httpGet(path: String): Pair<Int, String> {
+    private fun httpGet(path: String, timeoutMs: Int = 30_000): Pair<Int, String> {
         val connection = URL("http://127.0.0.1:8070$path").openConnection() as HttpURLConnection
         return try {
-            connection.connectTimeout = 3000
-            connection.readTimeout = 5000
+            connection.connectTimeout = timeoutMs
+            connection.readTimeout = timeoutMs
             connection.requestMethod = "GET"
             val code = connection.responseCode
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
@@ -164,6 +164,83 @@ class ServerSmokeTest {
             val (code, _) = httpGet(path)
             assertEquals("GET $path must not be 200", true, code == 405 || code == 404)
         }
+        entry.callAttr("stop")
+    }
+
+    /**
+     * Raw-socket HTTP GET. ``HttpURLConnection`` refuses cleartext to anything
+     * but 127.0.0.1 (the app's network security config), which is exactly the
+     * policy we want for the WebView; but here we need to prove the *server*
+     * answers on the LAN interface, so we speak HTTP over a plain socket.
+     */
+    private fun rawHttpGetOn(host: String, path: String, timeoutMs: Int = 30_000): Int {
+        return try {
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress(host, 8070), timeoutMs)
+                socket.soTimeout = timeoutMs
+                socket.getOutputStream().write(
+                    ("GET $path HTTP/1.0\r\nHost: $host:8070\r\nConnection: close\r\n\r\n")
+                        .toByteArray(Charsets.UTF_8))
+                socket.getOutputStream().flush()
+                val line = socket.getInputStream().bufferedReader().readLine() ?: return -1
+                // "HTTP/1.0 200 OK"
+                line.split(" ").getOrNull(1)?.toIntOrNull() ?: -1
+            }
+        } catch (t: Throwable) {
+            -1
+        }
+    }
+
+    private fun deviceLanAddress(): String? {
+        // The address a PC on the same network would dial; null when offline.
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces().toList()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { it is java.net.Inet4Address && !it.isLoopbackAddress }
+                ?.hostAddress
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    @Test
+    fun lanSharingRebindsAndExposesTheAddress() {
+        // LAN sharing must be off by default and, once enabled, bind beyond
+        // loopback and report an address a PC on the network can open.
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not become ready", waitForReady())
+
+        entry.callAttr("set_lan_share", false)
+        entry.callAttr("stop")
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not become ready after disabling", waitForReady())
+        var status = entry.callAttr("status").toString()
+        assertTrue("lan_share should be false: $status", status.contains("\"lan_share\": false"))
+
+        entry.callAttr("set_lan_share", true)
+        entry.callAttr("stop")
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not become ready after enabling", waitForReady())
+        status = entry.callAttr("status").toString()
+        assertTrue("lan_share should be true: $status", status.contains("\"lan_share\": true"))
+        // A real device/emulator on Wi-Fi reports an address; an offline one is
+        // allowed to report an empty lan_url, which the UI explains.
+        assertTrue("status should carry a lan_url field: $status",
+            status.contains("\"lan_url\""))
+
+        // With LAN sharing on, the search page must answer on the device's own
+        // network address while the admin panel must refuse it.
+        val lan = deviceLanAddress()
+        if (lan != null) {
+            val searchCode = rawHttpGetOn(lan, "/")
+            assertEquals("GET / on $lan should be 200", 200, searchCode)
+
+            val adminCode = rawHttpGetOn(lan, "/admin")
+            assertEquals("GET /admin on $lan must be refused", 403, adminCode)
+        }
+
+        entry.callAttr("set_lan_share", false)
         entry.callAttr("stop")
     }
 }

@@ -12,16 +12,23 @@ provedeným krokům; nic není odhad ani ukázka.
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
 
+> **Aktuální verze 7.8 (LAN sdílení hledání).** Od 7.7 přibyla možnost
+> zpřístupnit **veřejnou vyhledávací stránku** ostatním zařízením ve stejné
+> síti (`network.lan_share`, v APK přepínač „Sdílet v síti"); administrace
+> zůstává pouze na loopbacku. `versionCode` je `4`, `versionName` `7.8`.
+> Podrobnosti v § 2 (sekce „Sdílení hledání v LAN") a § 6.
+
 ## 1. Odevzdané soubory
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.7-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 141 501 B (~136,5 MiB) | `1c3ce7ac9bdf042f89460a9da0ea910893e2f9d8b07672175dd130a291287088` |
-| `mini-search-7.7-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 505 856 B (~62,5 MiB) | `be3385760ec1e32da11212fbff7b53d277024a4e273c434dc69a58e7b4e8f1e4` |
+| `mini-search-7.8-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 145 209 B (~136,5 MiB) | `09cf71f2d019e434bd1ab838dfc96b3d4477e1ab42853a08c5ec1d63793b079e` |
+| `mini-search-7.8-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 509 908 B (~62,5 MiB) | `7236a9cbf01a0a76cd7013f44895dbce1b1438d649938147362d2c98895020f2` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
-`versionCode = 3`, `versionName = 7.7`, `minSdk = 30`, `targetSdk = 34`,
-nativní ABI `arm64-v8a`.
+`versionCode = 4`, `versionName = 7.8`, `minSdk = 30`, `targetSdk = 34`,
+nativní ABI `arm64-v8a`. Debug podpis (certifikát SHA-256)
+`271e48cb8eda8819735e8564986d34f48a9af0040deeff13eca2c4f767a60174`.
 
 Plná varianta je v repu **přes Git LFS** (obě varianty, protože i malá má přes
 50 MB): GitHub má tvrdý limit 100 MB na soubor v běžném gitu, takže 143MB APK je
@@ -35,13 +42,40 @@ git clone https://github.com/nekam13/mini-search.git
 
 Alternativně se plná varianta kdykoli sestaví jedním příkazem (viz § 4); model
 se při buildu stáhne a ověří proti SHA-256. Obě varianty jsou skutečně sestavené
-z commitu `d80cb50`, nikoli převzaté z dřívějška.
+z aktuálního zdrojového commitu, nikoli převzaté z dřívějška.
 
 
 ## 2. Co bylo dokončeno
 
-Tato iterace navazuje na předchozí dodávku a řeší čtyři **skutečné chyby
-nalezené spuštěním aplikace na emulátoru**, ne jen statickou kontrolou:
+### Sdílení hledání v LAN (nová funkce 7.8)
+
+Aplikace umí volitelně zpřístupnit **veřejnou vyhledávací stránku** ostatním
+zařízením ve stejné síti (typicky PC), a to na pevném portu 8070, např.
+`http://192.168.10.200:8070/`. Administrace zůstává přísně jen na zařízení.
+
+- **Výchozí stav je vypnuto.** Server poslouchá na `127.0.0.1`, dokud uživatel
+  sdílení nezapne. Nic se do sítě neotevírá samo.
+- **Backend** (`app_combined.py`): nové nastavení `network.lan_share`
+  (`MINISEARCH_LAN_SHARE`, `restart=True`) v `SETTINGS_SPEC`; `start_server()`
+  při zapnutém sdílení vynutí bind `0.0.0.0`; `_lan_ip_addresses()` zjistí
+  adresy stroje a `lan_share_url()` vrátí adresu pro PC (nebo prázdno, když
+  žádná není); `server_status()` přidává `lan_share` a `lan_url`.
+- **Ochrana administrace**: `_guard_admin_to_localhost()` odmítá jakýkoli
+  požadavek na `/admin` (stránku i `/admin/api/**`) z neloopback adresy
+  (403) — a to i při zapnutém sdílení. Sdílí se tak jen `/`, `/autocomplete`
+  a `/health`, tedy čistě veřejné a nemutující cesty.
+- **Android**: v `android_entry.py` funkce `set_lan_share()` / `lan_share_enabled()`
+  a `status()` nese `lan_share` / `lan_url`; `ServerController` má `lanUrl`,
+  `setLanShare()` a `refreshLanInfo()`; v horní liště je přepínač
+  „Sdílet v síti", který po zapnutí **zobrazí adresu k otevření na PC**
+  (text je označitelný pro zkopírování) a při nedostupné adrese zobrazí
+  srozumitelnou výzvu. Přepnutí proběhne až když server běží.
+- **Žádné nové oprávnění**: bind na `0.0.0.0` i zjištění adresy (UDP socket)
+  nevyžadují `NEARBY_WIFI_DEVICES` ani polohu, protože se `WifiManager`
+  nepoužívá.
+
+Tato funkce je navíc k dosavadnímu dokončení aplikace (7.7), které řešilo
+čtyři **skutečné chyby nalezené spuštěním aplikace na emulátoru**:
 
 - **Start neblokuje hlavní vlákno (oprava reálného pádu).** `Python.start()`
   volaný přímo v `Application.onCreate()` blokoval hlavní vlákno ~17 s; služba
@@ -94,7 +128,7 @@ Zachované vlastnosti z předchozí dodávky:
 
 ## 3. Výsledky testů (skutečně spuštěné)
 
-### Backendové testy (všech 17 skriptů)
+### Backendové testy (všech 18 skriptů)
 
 Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exit 0):
 
@@ -117,6 +151,7 @@ Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exi
 | `test_settings_images.py` | 45 |
 | `test_lifecycle.py` | 37 |
 | `test_android_compat.py` | 5 |
+| `test_lan_share.py` | 30 |
 
 Testy životního cyklu (`test_lifecycle.py`) pokrývají start → `RUNNING` až po
 `/health`, opakovaný start jako no-op bez druhého serveru/scheduleru/workerů,
@@ -127,6 +162,14 @@ Nový `test_android_compat.py` (5 testů) ověřuje přesně to, co je specifick
 Android: detekci FTS5, fallback tabulku s triggery, skládání diakritiky v LIKE
 fallbacku, start/stop/restart bez FTS5 a start bez timezone.
 
+Nový `test_lan_share.py` (30 testů) ověřuje sdílení hledání v LAN: výchozí stav
+je vypnutý a server zůstává na loopbacku; po zapnutí se bindne na `0.0.0.0`,
+`lan_share_url()` vrátí adresu a `server_status()` hlásí `lan_share: true`;
+požadavek s **cizím veřejným `Origin`** se odmítne (403), ale požadavek
+s LAN `Origin` (`http://10.2.135.153:8070`) projde; administrace zůstává jen na
+loopbacku; vypnutí vrátí bind zpět. Test obsahuje i skutečný HTTP požadavek na
+LAN adresu.
+
 ### Android JVM testy
 
 `./gradlew :app:testDebugUnitTest` – `SpmTokenizerTest` (6 testů) a
@@ -136,8 +179,9 @@ proti referenčním vektorům `sentence-transformers` na českých textech.
 
 ### Android instrumentační testy (skutečně spuštěné na emulátoru)
 
-`./gradlew :app:connectedDebugAndroidTest -Pabi=x86_64 -PskipEmbeddingModel`
-na emulátoru `msx(AVD) - 14`: **7 testů, 0 selhání, 0 přeskočeno**.
+`./gradlew :app:connectedDebugAndroidTest` na emulátoru `msx(AVD) - 14`:
+**8 testů, 0 selhání, 0 přeskočeno** (výsledek posledního běhu). Běh na
+`arm64-v8a` buildu s reálným modelem ověřen samostatně (viz níže).
 
 `ServerSmokeTest.kt` spouští skutečný Chaquopy backend a ověřuje:
 
@@ -149,6 +193,15 @@ na emulátoru `msx(AVD) - 14`: **7 testů, 0 selhání, 0 přeskočeno**.
 - `databaseLivesInPrivateStorage` – `console.db` je ve `filesDir`
 - `pagesSurviveStopAndRestart` – restart neztratí indexované stránky
 - `mutatingAdminRoutesRejectGet` – GET na mutační admin endpointy není 200
+- `lanSharingRebindsAndExposesTheAddress` – **nové**: sdílení je výchozně
+  vypnuté; po zapnutí `status` hlásí `lan_share: true` a `lan_url`; přes
+  syrový socket se ověří, že `/` na adrese zařízení vrací 200 a `/admin`
+  na téže adrese vrací 403 (tedy že server na LAN skutečně odpovídá a
+  administrace se přesto odmítá). Ověřeno na zařízení, ne jen na desktopu.
+
+Poznámka k `searchAndAdminPagesLoad`: první dotaz na `/admin` na emulátoru bez
+KVM má studený start ~30 s (druhý už 0,7 s), proto test používá timeout 30 s;
+jde o omezení pomalého emulátoru, nikoli o regresi aplikace.
 
 ### End-to-end ověření na emulátoru (mimo testy)
 
@@ -190,7 +243,7 @@ echo "sdk.dir=/cesta/k/android-sdk" > local.properties
 
 # testy:
 ./gradlew :app:testDebugUnitTest
-./gradlew :app:connectedDebugAndroidTest -Pabi=x86_64 -PskipEmbeddingModel
+./gradlew :app:connectedDebugAndroidTest
 ```
 
 Při prvním plném buildu se stáhnou dva artefakty z Hugging Face (model
@@ -199,14 +252,16 @@ build je možný přes `-PembeddingModel=/cesta/model.onnx
 -PtokenizerJson=/cesta/tokenizer.json`. Verze závislostí jsou připnuté
 (AGP 8.5.2, Kotlin 1.9.24, Chaquopy 17.0.0, Python 3.13).
 
-Obě varianty byly sestaveny z pracovní kopie na commitu `d80cb50` bez ručních
+Pro reprodukovatelnější výstup lze přidat `SOURCE_DATE_EPOCH=0` před gradle;
+odstraní časové značky v `app.imy` (viz § 8). Obě varianty jsou sestavené
+z pracovní kopie na aktuálním commitu větve `android-app-completion` bez ručních
 oprav a bez absolutních cest v repu.
 
 ## 5. Ověřená funkčnost a co ověřeno nebylo
 
 **Ověřeno (skutečně spuštěno):**
 - Build obou variant projde (`BUILD SUCCESSFUL`) a výsledné APK mají shodná
-  metadata (`versionCode 3`, `versionName 7.7`).
+  metadata (`versionCode 4`, `versionName 7.8`).
 - V plné variantě jsou v APK `assets/embedding/model_qint8_arm64.onnx`
   (118 412 398 B), `assets/ml/tokenizer_spm.bin`, `lib/arm64-v8a/libonnxruntime.so`,
   `lib/arm64-v8a/libonnxruntime4j_jni.so` a `assets/chaquopy/app.imy`.
@@ -232,8 +287,23 @@ oprav a bez absolutních cest v repu.
     vrátilo výsledek, i když stránka text „hlavní město" neobsahuje.
 - Světlý i tmavý režim: pozadí `#F5F5F5`, text lišty čitelný (ověřeno
   screenshotem v obou režimech).
+- **Sdílení hledání v LAN na zařízení (7.8).** Po zapnutí `network.lan_share`
+  přes admin API a restartu aplikace `/health` hlásí `host = 0.0.0.0`,
+  `lan_share = true`, `lan_url = http://10.0.2.16:8070/`. UI na obrazovce
+  ukazuje přepínač „Sdílet v síti" a text **„Otevřete na PC:
+  http://10.0.2.16:8070/"** (ověřeno přes `uiautomator dump`, tj. skutečný
+  widget, ne jen logika). Současně `/admin` přes loopback vrací 200 a přes LAN
+  adresu 403 (ověřeno instrumentačním testem raw socketem na zařízení).
+  Výchozí stav po instalaci je vypnuto (`lan_share = false`, `host =
+  127.0.0.1`).
 
 **Neověřeno (přesné důvody):**
+- **Otevření LAN adresy z reálného PC v téže Wi-Fi.** Sdílení je ověřené na
+  úrovni serveru (bind `0.0.0.0`, `lan_url`, odpověď na LAN adrese zařízení
+  přes raw socket, odmítnutí adminu) a backendový test `test_lan_share.py`
+  poslal skutečný HTTP požadavek z adresy `10.2.135.153`. Chybí ale fyzické PC
+  ve stejné síti jako telefon; emulátor žije v NATu (`10.0.2.x`), takže
+  mezizařízení v jedné Wi-Fi nebylo možné nasimulovat věrně.
 - **Fyzické arm64 zařízení.** Ověření proběhlo na emulátoru s ARM překladem
   (`msx(AVD) - 14`), který spouští `arm64-v8a` binárky. Běh na skutečném
   telefonu (jiný SoC, jiná paměť, skutečná baterie) zůstává neověřený.
@@ -251,50 +321,60 @@ oprav a bez absolutních cest v repu.
 
 - HTTP server poslouchá na `127.0.0.1`; LAN indexování je jiná věc než
   zpřístupnění aplikace do LAN.
+- **Volitelné sdílení hledání v LAN** (`network.lan_share`, výchozně vypnuto):
+  po zapnutí se bindne `0.0.0.0` a zveřejní se **jen veřejné cesty** (`/`,
+  `/autocomplete`, `/health`). Administrace se na LAN adrese odmítá (403) — na
+  zařízení ověřeno raw socketem.
 - `/admin` a `/admin/api/**` jsou dostupné jen z loopbacku; navíc se odmítají
-  mutující požadavky s cizím `Origin`/`Referer` (403).
+  mutující požadavky s cizím `Origin`/`Referer` (403). Požadavek s `Origin`
+  z vlastní LAN adresy projde (kvůli WebView/stejnému zařízení), cizí veřejný
+  `Origin` se odmítá.
 - Všech sedm dříve GET-mutujících akcí (recrawl, recrawl-all, pause-all,
   resume-all, delete, check-update, apply-update) je nyní POST-only; GET vrací 405.
 - Z APK jsou vypnuté git aktualizace i jejich mutační endpointy
   (`BUNDLED_RUNTIME=1`); aplikace nikdy nespouští `git pull` ani `pip install`.
 - WebView: JS ano (Clay UI), ale `allowFileAccess=false`,
   `allowContentAccess=false`, žádný JavaScript most, externí odkazy se otevírají
-  v systémovém prohlížeči, `MIXED_CONTENT_NEVER_ALLOW`.
+  v systémovém prohlížeči, `MIXED_CONTENT_NEVER_ALLOW`. Cleartext je povolen
+  **jen** pro `127.0.0.1`/`localhost` (`network_security_config.xml`); proto se
+  LAN adresa nikdy nenačítá v privilegovaném WebView.
 - TLS se nikde nevypíná (žádné `verify=False`, trust-all ani obcházení).
 - Secret key se generuje za běhu (`os.urandom`), v repu není pevný klíč.
 
 ## 7. Aktualizace a podpis
 
-`applicationId` zůstal `cz.minisearch.app` a `versionCode` se zvýšil z 2 na 3
-(`versionName` 7.6 → 7.7). Debug APK je podepsané automatickým debug klíčem
+`applicationId` zůstal `cz.minisearch.app` a `versionCode` se zvýšil z 3 na 4
+(`versionName` 7.7 → 7.8). Debug APK je podepsané automatickým debug klíčem
 (otisk certifikátu SHA-256:
 `271e48cb8eda8819735e8564986d34f48a9af0040deeff13eca2c4f767a60174`).
 **Původní podpisový klíč aplikace `mini-search-7.5-debug.apk` ani klíč předchozí
-7.6 není v tomto prostředí k dispozici**, proto běžná aktualizace přes původní
-instalaci nemusí být možná (Android odmítne APK s jiným podpisem). Odinstalace
-staré verze by smazala data a **není** náhradou migrace; databázi nikdy nemažte.
-Release se podepisuje jen dodatečným klíčem přes bezpečnou konfiguraci; klíče a
-hesla nejsou součástí repozitáře a žádný produktivně podepsaný release není
-tvzen.
+7.6/7.7 není v tomto prostředí k dispozici**, proto běžná aktualizace přes
+původní instalaci nemusí být možná (Android odmítne APK s jiným podpisem).
+Odinstalace staré verze by smazala data a **není** náhradou migrace; databázi
+nikdy nemažte. Release se podepisuje jen dodatečným klíčem přes bezpečnou
+konfiguraci; klíče a hesla nejsou součástí repozitáře a žádný produktivně
+podepsaný release není tvrzen.
 
 ## 8. Reprodukovatelnost
 
-Oba buildy prošly opakovaně (před i po opravě `testInstrumentationRunner`)
-a výsledek je **obsahově shodný**:
+Oba buildy prošly opakovaně; výsledek je **obsahově shodný**:
 
 - V plné variantě má zabalený model přesně SHA-256
   `783fea82d71a58179b830a4dbd2d58447e640609e98eedf9ffa12622d375a672` (shodný
   s připnutou hodnotou v `build.gradle`), tokenizer i nativní knihovny
   `libonnxruntime*.so` jsou přítomné.
-- V malé variantě jsou `templates/` i `static/` v `app.imy` a v zabalené podobě
-  obsahují opravené POST formuláře.
+- V obou variantách jsou `templates/` i `static/` v `app.imy` a obsahují
+  opravené POST formuláře; Python kód nese symboly `lan_share` / `lan_share_url`.
 - Těla přeložených modulů (`app_combined.pyc`, `android_entry.pyc`) jsou
-  **bajtově shodná**; liší se jen 4bajtová hlavička s časem překladu.
+  **bajtově shodná** mezi buildy i mezi variantami; liší se jen 4bajtová
+  hlavička s časem překladu.
 
-Bajtová shoda celého APK není zaručena: ZIP záznamy nesou časové značky,
-Python `.pyc` obsahuje mtime a `classes*.dex` / `requirements-common.imy` nesou
-metadata nástrojů. Ověřená je proto **obsahová** reprodukovatelnost, ne
-bit-identický soubor.
+Bajtová shoda celého APK není zaručena: ZIP záznamy nesou časové značky a
+`classes*.dex` nese D8 debug checksum tabulku (hash kódů, nikoli kód samotný —
+`dexdump` bez hlavičky je mezi buildy identický). Ověřená je proto **obsahová**
+reprodukovatelnost, ne bit-identický soubor. Build s `SOURCE_DATE_EPOCH=0`
+odstraní časové značky v `app.imy`, ale `classes3.dex` zůstává závislý na
+pořadí hashů v D8; to je vlastnost AGP/D8, ne našeho kódu.
 
 ## 9. Omezení prostředí během práce
 
@@ -303,8 +383,9 @@ bit-identický soubor.
   a nutnosti delších timeoutů u instrumentačních testů.
 - Emulátor má zapnutý **ARM překlad** (`libndk_translation.so`,
   `ro.enable.native.bridge.exec=1`), proto na něm běží i `arm64-v8a` APK včetně
-  ONNX modelu. Instrumentační testy ale běžely na `x86_64` buildu, aby se
-  nezatěžoval pomalý překladový režim.
+  ONNX modelu. Instrumentační testy i ruční ověření běžely přímo na tomto
+  `arm64-v8a` buildu (stejné APK jako odevzdané), takže testují skutečný
+  produkční artefakt, ne separátní x86_64 variantu.
 - Toolchain: JDK 21 (`/usr/lib/jvm/java-21-openjdk-amd64`), Gradle 8.7,
   `ANDROID_HOME=/opt/android-sdk` (platform 34, build-tools 34.0.0).
 - Databáze `console.db` v repu se nikdy needitovala ani nemazala.

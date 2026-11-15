@@ -87,11 +87,37 @@ def restart(data_dir=None):
 
 
 def status():
-    """Current runtime state (state, workers, embedding backend, error)."""
+    """Current runtime state (state, workers, embedding backend, error).
+
+    Also carries ``lan_share`` / ``lan_url`` so the Android UI can show the
+    address a PC on the same network should open.
+    """
     with _lock:
         if _server_module is None:
             return json.dumps({"state": "STOPPED", "error": "", "workers": 0})
         return json.dumps(_server_module.server_status())
+
+
+def set_lan_share(enabled):
+    """Persist the LAN-sharing flag and return the resulting status.
+
+    The setting lives in ``app_settings`` (the same single source of truth the
+    admin panel writes), so it survives restarts. The caller restarts the server
+    afterwards because the bind address only changes on start.
+    """
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        module.save_settings({"network.lan_share": "1" if enabled else "0"})
+        return json.dumps(module.server_status())
+
+
+def lan_share_enabled():
+    """True when the public search page is currently shared on the LAN."""
+    with _lock:
+        if _server_module is None:
+            return False
+        return bool(_server_module.LAN_SHARE_ENABLED)
 
 
 def ready():

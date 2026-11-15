@@ -157,10 +157,11 @@ android {
         applicationId "cz.minisearch.app"
         minSdk 30
         targetSdk 34
-        // Bumped for the on-device fix release (startup, dark mode, FTS5,
-        // timezone); keeps the same applicationId so it upgrades in place.
-        versionCode 3
-        versionName "7.7"
+        // Bumped for the LAN-sharing release (public search page shareable on
+        // the local network, admin stays loopback-only); keeps the same
+        // applicationId so it upgrades in place.
+        versionCode 4
+        versionName "7.8"
         // Required for ``connectedDebugAndroidTest``: without it the test APK
         // has no runner and the suite silently runs 0 tests.
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"

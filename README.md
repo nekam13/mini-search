@@ -500,6 +500,7 @@ výchozí hodnoty najednou. Konfigurace se čte z prostředí:
 | `MINISEARCH_WIKI_LANG` | `cs` | Výchozí jazyk Wikipedie |
 | `MINISEARCH_WIKI_BATCH` | 50 | Dávka pro wiki API |
 | `MINISEARCH_WIKI_API_BASE` | – | Mirror MediaWiki API (např. pro testy) |
+| `MINISEARCH_LAN_SHARE` | `0` | Sdílet veřejné hledání v lokální síti (0/1); administrace zůstává jen lokálně |
 
 ```bash
 export MINISEARCH_PROFILE=lowmem

@@ -305,6 +305,28 @@ Three behaviours depend on it, so keep them consistent:
 (stats, parsed aliases, `is_local`, `search_priority_multiplier`); routes must
 use it rather than re-deriving those keys by hand.
 
+### Sharing the search page on the LAN (opt-in)
+
+Do not confuse indexing a LAN site with *serving* to the LAN. The public search
+page can be exposed to other devices on the same network with the
+`network.lan_share` setting (`MINISEARCH_LAN_SHARE`, default off):
+
+- Off, the bind is the configured host (`127.0.0.1` in the APK).
+- On, `start_server()` forces `0.0.0.0`; `_lan_ip_addresses()` finds the machine's
+  IPv4 addresses and `lan_share_url()` returns the one a PC should open
+  (e.g. `http://192.168.10.200:8070/`), empty when none is available.
+- Admin stays local: `_guard_admin_to_localhost()` rejects any `/admin` (page and
+  `/admin/api/**`) request whose remote address is not loopback, with 403, even
+  when the search page is shared. The setting is `restart=True`, so it takes
+  effect on the next start; `server_status()` reports `lan_share` / `lan_url`.
+- The Android UI exposes it as a „Sdílet v síti" switch that shows the address
+  (`lan_share_url`); it never shows it while off, and the address is selectable
+  for copying. Enabling it never changes the applicationId or the admin policy.
+
+The bind itself needs no extra Android permission: it uses the `0.0.0.0` bind
+and a UDP-socket probe for the address, not `WifiManager`, so no
+`NEARBY_WIFI_DEVICES`/location grant is involved.
+
 ## Recrawl scheduling
 
 Background refresh intervals are env-configurable in whole hours and **0

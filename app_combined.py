@@ -180,6 +180,12 @@ IMAGE_SEARCH_LIMIT = _env_int("MINISEARCH_IMAGE_SEARCH_LIMIT", 60, 0, 500)
 # Listening port. Kept at 8070 for existing installs, but overridable so a
 # hosted/Termux setup can bind whatever port its environment exposes.
 PORT = _env_int("MINISEARCH_PORT", 8070, 1, 65535)
+# Optional LAN sharing. Off by default: the app then binds loopback and the
+# search page is reachable only from this device. When on, the *public* search
+# page is bound to 0.0.0.0 so a PC on the same network can use it; the admin
+# panel stays loopback-only (ADMIN_LOCAL_ONLY) regardless. Env-seeded here and
+# editable in the panel (``network.lan_share``).
+LAN_SHARE_ENABLED = _env_bool("MINISEARCH_LAN_SHARE")
 # When the server runs from inside the Android APK it has no git checkout and
 # must never mutate its own bundled code. android_entry.py sets this flag; the
 # git-based update check *and* the manual mutation endpoints are then disabled
@@ -470,6 +476,14 @@ SETTINGS_SPEC = {
         'label': 'Hodina noční údržby',
         'help': 'V kolik hodin má noční údržba začít.',
     },
+    'network.lan_share': {
+        'group': 'network', 'global': 'LAN_SHARE_ENABLED', 'kind': 'bool',
+        'default': LAN_SHARE_ENABLED, 'restart': True,
+        'label': 'Sdílet vyhledávač v lokální síti',
+        'help': 'Po zapnutí je veřejné vyhledávání dostupné i z jiného zařízení '
+                've stejné síti (např. z PC). Administrace zůstává jen na tomto '
+                'zařízení. Změna vyžaduje restart serveru.',
+    },
 }
 
 SETTINGS_GROUPS = (
@@ -479,6 +493,7 @@ SETTINGS_GROUPS = (
     ('wiki', 'Wikipedie'),
     ('embeddings', 'Vektorové hledání'),
     ('maintenance', 'Noční údržba'),
+    ('network', 'Síť a sdílení'),
 )
 
 # Environment variable that seeds each setting. Shown in the admin UI so an
@@ -507,6 +522,7 @@ SETTINGS_ENV = {
     'embeddings.hnsw_max': 'MINISEARCH_HNSW_MAX_ELEMENTS',
     'maintenance.nightly': 'MINISEARCH_NIGHTLY',
     'maintenance.nightly_hour': 'MINISEARCH_NIGHTLY_HOUR',
+    'network.lan_share': 'MINISEARCH_LAN_SHARE',
 }
 for _key, _env_name in SETTINGS_ENV.items():
     SETTINGS_SPEC[_key]['env'] = _env_name
@@ -6408,12 +6424,19 @@ def _origin_host(value):
 
 
 def _host_is_ours(host):
-    """True for loopback hosts and the machine's own bound address."""
+    """True for loopback hosts and this machine's own local-network address.
+
+    When the server is bound beyond loopback (optional LAN sharing, or the
+    desktop default), a browser request is only accepted when its Origin is
+    itself on the local network — never an arbitrary public host. That keeps a
+    hostile page on the internet from driving our mutating endpoints through a
+    LAN-reachable server.
+    """
     if host in _ALLOWED_REQUEST_HOSTS:
         return True
-    # A desktop server on 0.0.0.0 is also reached by a LAN IP; only accept that
-    # when the server was deliberately bound beyond loopback.
-    return _server_host not in ('', '127.0.0.1', '::1') and bool(host)
+    if _server_host in ('', '127.0.0.1', '::1'):
+        return False
+    return is_local_host(host)
 
 
 @app.before_request
@@ -6453,7 +6476,10 @@ def admin_api_status():
 
 @app.before_request
 def _guard_admin_to_localhost():
-    if not ADMIN_LOCAL_ONLY:
+    # Admin stays loopback-only either when the operator asked for it
+    # (ADMIN_LOCAL_ONLY, set by the APK) or whenever the search page is shared
+    # on the LAN — sharing search must never expose the panel too.
+    if not (ADMIN_LOCAL_ONLY or LAN_SHARE_ENABLED):
         return None
     path = request.path or ''
     if (path == '/admin' or path.startswith('/admin/')) and not _request_is_local():
@@ -7747,7 +7773,6 @@ def start_server(host=None, port=None, block=False):
         if _server_state == 'RUNNING' and _server_handle is not None:
             print("Server already running, ignoring duplicate start")
             return False
-        host = host or os.environ.get('MINISEARCH_HOST', '0.0.0.0')
         port = int(port or PORT)
         _server_state = 'STARTING'
         _server_error = ''
@@ -7757,8 +7782,21 @@ def start_server(host=None, port=None, block=False):
     _stop_event.clear()
 
     try:
+        # ``get_db`` loads the persisted settings, so ``LAN_SHARE_ENABLED`` is
+        # current by the time the bind address is chosen below (a value saved in
+        # the panel therefore survives a cold start).
         get_db()
         print('Database initialized')
+
+        # LAN sharing binds the public search page to every interface so a PC on
+        # the same network can reach it. It is an explicit opt-in and overrides
+        # the loopback host the Android wrapper passes; otherwise the passed host
+        # wins, falling back to ``MINISEARCH_HOST`` / 0.0.0.0 on the desktop. The
+        # admin panel is guarded separately and never leaves loopback.
+        if LAN_SHARE_ENABLED:
+            host = '0.0.0.0'
+        else:
+            host = host or os.environ.get('MINISEARCH_HOST', '0.0.0.0')
 
         # Vector search is a pure optimisation: crawl, sitemap and link discovery
         # never depend on it, and lowmem only turns the embeddings off.
@@ -7866,6 +7904,49 @@ def stop_server(timeout=15.0):
     return True
 
 
+def _lan_ip_addresses():
+    """Best-effort list of this machine's LAN IPv4 addresses.
+
+    Uses the classic UDP-connect trick, which needs no packet to leave the host
+    (the kernel only picks a route/source address) and works on Android without
+    any location or Wi-Fi permission. Falls back to parsing the interface list.
+    Returns a de-duplicated list, public/loopback addresses excluded.
+    """
+    found = []
+    try:
+        import socket as _socket
+        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            found.append(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except Exception:
+        pass
+    try:
+        import socket as _socket
+        for info in _socket.getaddrinfo(_socket.gethostname(), None, _socket.AF_INET):
+            found.append(info[4][0])
+    except Exception:
+        pass
+    result = []
+    for addr in found:
+        if not addr or addr.startswith('127.'):
+            continue
+        if addr not in result:
+            result.append(addr)
+    return result
+
+
+def lan_share_url():
+    """The URL a PC on the same network should open, or '' when unavailable."""
+    if not LAN_SHARE_ENABLED:
+        return ''
+    for addr in _lan_ip_addresses():
+        return f"http://{addr}:{_server_port or PORT}/"
+    return ''
+
+
 def server_status():
     """Snapshot of the runtime state for the Android UI and diagnostics."""
     return {
@@ -7879,6 +7960,8 @@ def server_status():
         'scheduler_running': bool(_scheduler is not None and getattr(_scheduler, 'running', False)),
         'embeddings': embedding_backend_label(),
         'embedding_space': active_embedding_space(),
+        'lan_share': LAN_SHARE_ENABLED,
+        'lan_url': lan_share_url(),
     }
 
 

@@ -19,4 +19,10 @@
     <string name="state_stopping">Zastavuji server…</string>
     <string name="state_stopped">Server je zastaven.</string>
     <string name="state_error">Server se nepodařilo spustit: %1$s</string>
+
+    <string name="lan_share_toggle">Sdílet v síti</string>
+    <string name="lan_share_hint">Zapněte, pokud chcete vyhledávač otevřít i z jiného zařízení ve stejné Wi-Fi síti (např. z PC). Administrace zůstává jen v tomto zařízení.</string>
+    <string name="lan_share_url">Otevřete na PC: %1$s</string>
+    <string name="lan_share_needs_running">Sdílení v síti lze přepnout, až když server běží.</string>
+    <string name="lan_share_no_address">Adresu v síti se nepodařilo zjistit. Zkontrolujte, že jste připojeni k Wi-Fi.</string>
 </resources>
