@@ -26,7 +26,15 @@ import java.net.URL
 class ServerSmokeTest {
 
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private val entry get() = com.chaquo.python.Python.getInstance().getModule("android_entry")
+
+    /**
+     * The interpreter is bootstrapped on a background thread by the app; wait
+     * for it before asking Chaquopy for a module.
+     */
+    private val entry get(): com.chaquo.python.PyObject {
+        PythonRuntime.awaitStarted()
+        return com.chaquo.python.Python.getInstance().getModule("android_entry")
+    }
 
     private fun waitForReady(timeoutMs: Long = 90_000): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -123,6 +131,39 @@ class ServerSmokeTest {
         assertTrue("server did not become ready", waitForReady())
         assertTrue("console.db not created in filesDir",
             File(context.filesDir, "console.db").exists())
+        entry.callAttr("stop")
+    }
+
+    @Test
+    fun pagesSurviveStopAndRestart() {
+        // A stop/start cycle must not lose indexed data (WAL checkpoint, not a
+        // fresh database).
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not become ready", waitForReady())
+        val pageCountBefore = entry.callAttr("page_count").toInt()
+
+        entry.callAttr("stop")
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not restart", waitForReady())
+
+        val pageCountAfter = entry.callAttr("page_count").toInt()
+        assertEquals("page count changed across a restart",
+            pageCountBefore, pageCountAfter)
+        entry.callAttr("stop")
+    }
+
+    @Test
+    fun mutatingAdminRoutesRejectGet() {
+        // State-changing admin endpoints must not be reachable via GET, so a
+        // stray link or prefetch cannot trigger them.
+        entry.callAttr("start", context.filesDir.absolutePath)
+        assertTrue("server did not become ready", waitForReady())
+
+        for (path in listOf("/admin/recrawl-all", "/admin/pause-all",
+                            "/admin/resume-all", "/admin/check-update")) {
+            val (code, _) = httpGet(path)
+            assertEquals("GET $path must not be 200", true, code == 405 || code == 404)
+        }
         entry.callAttr("stop")
     }
 }

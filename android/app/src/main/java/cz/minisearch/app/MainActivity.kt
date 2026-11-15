@@ -7,7 +7,9 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.View
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -130,6 +132,16 @@ class MainActivity : AppCompatActivity() {
         web.settings.javaScriptCanOpenWindowsAutomatically = false
         web.settings.setSupportMultipleWindows(false)
         web.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        // The Clay CSS is light-only. Android's "algorithmic darkening" would
+        // invert the page in system dark mode and paint it black, so it is
+        // turned off explicitly (the theme pins light colours as well).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            web.settings.isAlgorithmicDarkeningAllowed = false
+        } else {
+            @Suppress("DEPRECATION")
+            run { web.settings.forceDark = WebSettings.FORCE_DARK_OFF }
+        }
+        web.setBackgroundColor(android.graphics.Color.parseColor("#F5F5F5"))
         // Never add a JavaScript interface: that would expose native calls to
         // any page. Keep the WebView free of bridges.
         web.webViewClient = object : WebViewClient() {
@@ -146,6 +158,23 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 loadedOnce = true
+            }
+
+            /**
+             * A renderer crash (typically the system killing the sandboxed
+             * renderer under memory pressure) would otherwise take the whole
+             * process down. Recover by reloading the local page instead.
+             */
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                Log.w(TAG, "WebView renderer gone (crashed=${detail.didCrash()})")
+                loadedOnce = false
+                if (ServerController.state == ServerState.RUNNING) {
+                    view.postDelayed({
+                        load(if (onAdmin) "${ServerController.BASE_URL}admin"
+                             else ServerController.BASE_URL)
+                    }, 500)
+                }
+                return true
             }
         }
     }
@@ -216,5 +245,9 @@ class MainActivity : AppCompatActivity() {
         ServerController.removeListener(stateListener)
         web.destroy()
         super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "MainActivity"
     }
 }

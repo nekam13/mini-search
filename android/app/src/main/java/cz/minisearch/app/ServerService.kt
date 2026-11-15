@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 
@@ -38,7 +39,14 @@ class ServerService : Service() {
             stopServerAndSelf()
             return START_NOT_STICKY
         }
-        startInForeground()
+        // startForeground must happen within a few seconds of
+        // startForegroundService(), so it is the very first thing done here.
+        // The Python bootstrap no longer runs on the main thread, so this call
+        // is not delayed by interpreter startup.
+        if (!startInForeground()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // If the system restarts us after a kill, bring the server back up; but
         // never after an explicit user stop (that path returns NOT_STICKY above).
         if (UserState.serverEnabled) {
@@ -47,14 +55,23 @@ class ServerService : Service() {
         return START_STICKY
     }
 
-    private fun startInForeground() {
-        createChannel()
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+    private fun startInForeground(): Boolean {
+        return try {
+            createChannel()
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (t: Throwable) {
+            // e.g. a missing FOREGROUND_SERVICE_SPECIAL_USE permission or a
+            // platform that refuses the type: do not crash, report and stop.
+            Log.e(TAG, "startForeground failed", t)
+            ServerController.reportError("Službu nelze spustit na pozadí: ${t.message}")
+            false
         }
     }
 
@@ -104,6 +121,7 @@ class ServerService : Service() {
     }
 
     companion object {
+        private const val TAG = "ServerService"
         private const val CHANNEL_ID = "minisearch_server"
         private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "cz.minisearch.app.STOP"

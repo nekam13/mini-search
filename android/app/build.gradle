@@ -24,12 +24,18 @@ def embeddingModelUrl = "https://huggingface.co/sentence-transformers/" +
 def embeddingModelAsset = file("${projectDir}/build-assets/embedding/model_qint8_arm64.onnx")
 def skipEmbeddingModel = project.hasProperty("skipEmbeddingModel")
 
-// The two variants use separate build directories so switching between them is
-// reproducible without a manual ``clean``: Gradle's incremental asset merge is
-// not invalidated by the asset source set, so a shared output tree would keep
-// the previously merged model.
-if (skipEmbeddingModel) {
-    layout.buildDirectory = file("${projectDir}/build-nomodel")
+// Target ABI(s). Default arm64-v8a (real phones). ``-Pabi=x86_64`` builds for
+// the emulator; that variant is a testing aid, not a shipping artifact.
+def abiList = project.findProperty("abi") ?: "arm64-v8a"
+
+// Separate output trees per variant so switching between them needs no clean:
+// Gradle's incremental asset merge is not invalidated by the asset source set,
+// so a shared tree would keep the previously merged model (and ABI).
+def variantTag = []
+if (skipEmbeddingModel) variantTag << "nomodel"
+if (abiList != "arm64-v8a") variantTag << abiList
+if (variantTag) {
+    layout.buildDirectory = file("${projectDir}/build-${variantTag.join('-')}")
 }
 
 // The sentencepiece tokenizer asset is *derived* from the upstream
@@ -151,13 +157,18 @@ android {
         applicationId "cz.minisearch.app"
         minSdk 30
         targetSdk 34
-        // Bumped from 1 so the new build upgrades an installed 7.5 APK instead
-        // of being rejected as a downgrade.
-        versionCode 2
-        versionName "7.6"
+        // Bumped for the on-device fix release (startup, dark mode, FTS5,
+        // timezone); keeps the same applicationId so it upgrades in place.
+        versionCode 3
+        versionName "7.7"
+        // Required for ``connectedDebugAndroidTest``: without it the test APK
+        // has no runner and the suite silently runs 0 tests.
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            // Only 64-bit ARM matters for real phones; keep the APK small.
-            abiFilters "arm64-v8a"
+            // Real phones are 64-bit ARM only, which keeps the APK small. An
+            // x86_64 build for the emulator is produced separately with
+            // ``-Pabi=x86_64`` (see README) — never mixed into a release APK.
+            abiFilters(*abiList.split(','))
         }
     }
 

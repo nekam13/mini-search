@@ -58,6 +58,11 @@ object ServerController {
         listeners.remove(listener)
     }
 
+    /** Surface an error raised outside the start path (e.g. the service). */
+    fun reportError(message: String) {
+        setState(ServerState.ERROR, message)
+    }
+
     private fun setState(newState: ServerState, error: String = "") {
         synchronized(lock) {
             state = newState
@@ -223,6 +228,10 @@ object ServerController {
     }
 
     private fun pythonEntry(): com.chaquo.python.PyObject {
+        // The interpreter is bootstrapped on a background thread by
+        // MiniSearchApp; wait for it here (still off the main thread) instead of
+        // assuming it is already up.
+        PythonRuntime.awaitStarted()
         if (!Python.isStarted()) {
             throw IllegalStateException("Python runtime není inicializovaný")
         }

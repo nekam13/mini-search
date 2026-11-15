@@ -1,5 +1,13 @@
 <resources>
-    <style name="Theme.MiniSearch" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="android:windowBackground">@android:color/white</item>
+    <!-- The Clay design system (clay.css) is light-only: every surface is a
+         light card with dark text. A DayNight parent would follow the system
+         dark mode and hand the borderless buttons and the status TextView
+         light-on-light colours (invisible UI), so the theme is pinned to
+         Light and algorithmic darkening is disabled for the WebView too
+         (see MainActivity). -->
+    <style name="Theme.MiniSearch" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:colorBackground">@color/window_background</item>
     </style>
 </resources>
