@@ -19,7 +19,7 @@ provedeným krokům; nic není odhad ani ukázka.
 | `mini-search-7.6-debug.apk` | plná s modelem MiniLM (142 MB), **negitovaná** | 142 023 873 B (~135,4 MiB) | `582a95eb0c23fbb34b88f5decc757a1fd56cc229a14da819ae9de6058dddcdf4` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
-`versionCode = 2`, `versionName = 7.6`, nativní ABI `arm64-v8a`.
+`versionCode = 2`, `versionName = 7.6`, `minSdk = 30`, nativní ABI `arm64-v8a`.
 
 Proč je plná varianta negitovaná: GitHub má tvrdý limit 100 MB na soubor a
 Git LFS v tomto prostředí není k dispozici. Plná varianta proto **není**
