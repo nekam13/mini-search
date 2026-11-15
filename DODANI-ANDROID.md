@@ -6,8 +6,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`d80cb50`** (`Fix Android startup, dark mode,
-  FTS5 and timezone on-device`) plus dokumentační commit
+- Zdrojový commit obou APK: **`6644ee6`** (`Add Android instrumentation tests
+  and refresh the delivery doc`), který obsahuje i opravy z `d80cb50`
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
@@ -16,8 +16,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.7-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 141 101 B (~136,5 MiB) | `c5d8ca5208a66369dddb045d8ca0ece5d4d944067df9de8d4f46773411778e35` |
-| `mini-search-7.7-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 65 505 692 B (~62,5 MiB) | `72ae088403e6ebc8a3bd6a739157abb1fe00a3b0c0d01f2c2fef0ab7ca21000c` |
+| `mini-search-7.7-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 141 501 B (~136,5 MiB) | `1c3ce7ac9bdf042f89460a9da0ea910893e2f9d8b07672175dd130a291287088` |
+| `mini-search-7.7-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 65 505 856 B (~62,5 MiB) | `be3385760ec1e32da11212fbff7b53d277024a4e273c434dc69a58e7b4e8f1e4` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 3`, `versionName = 7.7`, `minSdk = 30`, `targetSdk = 34`,
@@ -217,14 +217,30 @@ oprav a bez absolutních cest v repu.
 - Instalace a běh **nového APK** na emulátoru `msx(AVD) - 14`: server se rozjede,
   `/health` = 200, české hledání s diakritikou i bez ní funguje, crawling
   a automatická indexace nového zdroje fungují, administrace se načte.
+- **Plná varianta s reálným ONNX modelem na zařízení.** Emulátor má ARM
+  překlad (`libndk_translation.so`, `ro.enable.native.bridge.exec=1`), takže
+  i `arm64-v8a` APK se nainstaluje a spustí. Ověřeno:
+  - `EmbeddingBridge: embedding model installed (118412398 bytes)` a soubor
+    `minilm-l12-v2.onnx` (118 412 398 B) vznikl v privátním `files/` →
+    oprava komprimovaného assetu funguje.
+  - `/health` hlásí `embedding_space = minilm-l12-v2:e8f8c211226b894fcb81acc59f3b34ba3efd5f42`
+    a `embeddings = model (paraphrase-multilingual-MiniLM-L12-v2)`, tedy
+    **skutečný model, ne hash**.
+  - **Sémantické hledání** bez doslovného překryvu: dotazy „sídlo prezidenta",
+    „turistická atrakce", „cestovní ruch" (tato slova se na stránce
+    nevyskytují) vrátily stránku o Praze; `?q=hlavní město České republiky`
+    vrátilo výsledek, i když stránka text „hlavní město" neobsahuje.
+- Světlý i tmavý režim: pozadí `#F5F5F5`, text lišty čitelný (ověřeno
+  screenshotem v obou režimech).
 
 **Neověřeno (přesné důvody):**
-- **Fyzické arm64 zařízení.** V tomto prostředí je jen emulátor `x86_64` bez
-  `/dev/kvm`; plná `arm64-v8a` varianta na něm nainstalovat nelze. Testováno
-  proto na `x86_64` buildu se stejnými zdroji (`-Pabi=x86_64`), ale s hashovacím
-  fallbackem místo ONNX. Běh ONNX modelu na fyzickém telefonu zůstává neověřený.
-- **Shoda embeddingů na zařízení** – `EmbeddingBridgeTest` je JVM test ověřující
-  matematiku ONNX Runtime na desktopu; na zařízení běžel jen hashovací fallback.
+- **Fyzické arm64 zařízení.** Ověření proběhlo na emulátoru s ARM překladem
+  (`msx(AVD) - 14`), který spouští `arm64-v8a` binárky. Běh na skutečném
+  telefonu (jiný SoC, jiná paměť, skutečná baterie) zůstává neověřený.
+- **Shoda embeddingů na zařízení proti referenci.** Na zařízení bylo ověřeno,
+  že model běží a sémanticky vyhledává; přesná shoda vektorů s referenčním
+  `sentence-transformers` je ověřená jen JVM testem (`EmbeddingBridgeTest`) na
+  desktopu.
 - **Pád rendereru WebView na emulátoru** – renderer na emulátoru bez KVM
   opakovaně padá na `SIGTRAP` (sandbox WebView, omezení prostředí, nikoli
   aplikace). Aplikace díky `onRenderProcessGone` nespadne, ale vykreslení
@@ -285,9 +301,10 @@ bit-identický soubor.
 - Emulátor `msx(AVD) - 14` běží **bez `/dev/kvm`** (hostitel x86_64 bez
   virtualizace), takže je velmi pomalý a ANR; to je důvod pádů rendereru WebView
   a nutnosti delších timeoutů u instrumentačních testů.
-- Plná `arm64-v8a` varianta se na tomto emulátoru nainstalovat nedá, proto běžely
-  instrumentační testy na `x86_64` buildu se stejnými zdroji a hashovacím
-  fallbackem (model ONNX na zařízení tedy ověřen nebyl).
+- Emulátor má zapnutý **ARM překlad** (`libndk_translation.so`,
+  `ro.enable.native.bridge.exec=1`), proto na něm běží i `arm64-v8a` APK včetně
+  ONNX modelu. Instrumentační testy ale běžely na `x86_64` buildu, aby se
+  nezatěžoval pomalý překladový režim.
 - Toolchain: JDK 21 (`/usr/lib/jvm/java-21-openjdk-amd64`), Gradle 8.7,
   `ANDROID_HOME=/opt/android-sdk` (platform 34, build-tools 34.0.0).
 - Databáze `console.db` v repu se nikdy needitovala ani nemazala.
