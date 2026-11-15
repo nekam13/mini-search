@@ -17,16 +17,16 @@ provedeným krokům; nic není odhad ani ukázka.
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
 | `mini-search-7.7-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 141 501 B (~136,5 MiB) | `1c3ce7ac9bdf042f89460a9da0ea910893e2f9d8b07672175dd130a291287088` |
-| `mini-search-7.7-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 65 505 856 B (~62,5 MiB) | `be3385760ec1e32da11212fbff7b53d277024a4e273c434dc69a58e7b4e8f1e4` |
+| `mini-search-7.7-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 505 856 B (~62,5 MiB) | `be3385760ec1e32da11212fbff7b53d277024a4e273c434dc69a58e7b4e8f1e4` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 3`, `versionName = 7.7`, `minSdk = 30`, `targetSdk = 34`,
 nativní ABI `arm64-v8a`.
 
-Plná varianta je v repu **přes Git LFS**: GitHub má tvrdý limit 100 MB na
-soubor v běžném gitu, takže 143MB APK je uložené jako LFS objekt (`.gitattributes`
-→ `filter=lfs`) a v gitu je jen malý pointer. Klony bez nainstalovaného
-`git-lfs` dostanou jen pointer (134 B), proto:
+Plná varianta je v repu **přes Git LFS** (obě varianty, protože i malá má přes
+50 MB): GitHub má tvrdý limit 100 MB na soubor v běžném gitu, takže 143MB APK je
+uložené jako LFS objekt (`.gitattributes` → `filter=lfs`) a v gitu je jen malý
+pointer. Klony bez nainstalovaného `git-lfs` dostanou jen pointer (134 B), proto:
 
 ```bash
 git lfs install            # jednou na stroji
