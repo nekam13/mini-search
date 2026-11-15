@@ -6,7 +6,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`1220a68`** (`Make the update endpoints POST-only too`)
+- Zdrojový commit obou APK: **`1220a68`** (LFS commit `1d0a095` přidává
+  pouze samotný binární soubor a `.gitattributes`, kód se nemění) (`Make the update endpoints POST-only too`)
 - Commit s dokumentací: `7200ac0` a `84e0357` (texty, beze změny kódu)
 - Výchozí větev `beta-optimized` byla ověřena; větev `android-app-completion`
   vychází z referenčního commitu zadání a obsahuje dokončení Android aplikace.
@@ -16,16 +17,29 @@ provedeným krokům; nic není odhad ani ukázka.
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
 | `mini-search-7.6-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 64 388 796 B (~61,4 MiB) | `63804d6b5a176139145429bc455aa1b165b8296ba66b43110e949fbcbaf3f3dc` |
-| `mini-search-7.6-debug.apk` | plná s modelem MiniLM (142 MB), **negitovaná** | 142 023 873 B (~135,4 MiB) | `582a95eb0c23fbb34b88f5decc757a1fd56cc229a14da819ae9de6058dddcdf4` |
+| `mini-search-7.6-debug.apk` | plná s modelem MiniLM (142 MB), **v repu přes Git LFS** | 142 023 873 B (~135,4 MiB) | `582a95eb0c23fbb34b88f5decc757a1fd56cc229a14da819ae9de6058dddcdf4` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 2`, `versionName = 7.6`, `minSdk = 30`, nativní ABI `arm64-v8a`.
 
-Proč je plná varianta negitovaná: GitHub má tvrdý limit 100 MB na soubor a
-Git LFS v tomto prostředí není k dispozici. Plná varianta proto **není**
-nahrána do gitu; sestaví se jedním příkazem (viz § 4) a model se při buildu
-stáhne a ověří proti SHA-256. Obě varianty jsou skutečně sestavené z commitu
-`36735a1`, nikoli převzaté z dřívějška.
+Plná varianta je v repu **přes Git LFS**: GitHub má tvrdý limit 100 MB na
+soubor v běžném gitu, takže 142MB APK je uložené jako LFS objekt (`.gitattributes`
+→ `filter=lfs`) a v gitu je jen malý pointer. Ověřeno round-tripem: klon větve
+stáhne skutečných 142 023 873 B se shodným SHA-256 výše.
+
+ZIP ani jiná komprese nepomůže — APK je už deflované a ONNX váhy se dál
+nezmenšují (max-deflate 117 MB, LZMA 114 MB, bzip2 117 MB, všechny nad limitem).
+
+Klony bez nainstalovaného `git-lfs` dostanou jen pointer (134 B), proto:
+
+```bash
+git lfs install            # jednou na stroji
+git clone https://github.com/nekam13/mini-search.git
+```
+
+Alternativně se plná varianta kdykoli sestaví jedním příkazem (viz § 4); model
+se při buildu stáhne a ověří proti SHA-256. Obě varianty jsou skutečně sestavené
+z commitu `1220a68`, nikoli převzaté z dřívějška.
 
 ## 2. Co bylo dokončeno
 
