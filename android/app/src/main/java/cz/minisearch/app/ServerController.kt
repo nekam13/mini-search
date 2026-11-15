@@ -91,6 +91,7 @@ object ServerController {
     private fun doStart(context: Context) {
         try {
             EmbeddingBridge.setContext(context)
+            SystemStatus.setContext(context)
             val entry = pythonEntry()
             val dataDir = context.filesDir.absolutePath
             val status = entry.callAttr("start", dataDir).toString()

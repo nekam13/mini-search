@@ -2765,13 +2765,39 @@ def _init_hnsw(dim=384, space=None):
     return idx
 
 
+def _android_system_status():
+    """The Kotlin ``SystemStatus`` bridge, or ``None`` outside the APK.
+
+    On Android the app cannot read ``/sys/class/power_supply`` (SELinux), so the
+    sysfs probes below come back empty. The bridge uses the platform BatteryManager
+    and ActivityManager instead and returns ``None`` for genuinely unknown values.
+    """
+    try:
+        from java import jclass  # type: ignore
+    except Exception:
+        return None
+    try:
+        return jclass("cz.minisearch.app.SystemStatus")
+    except Exception:
+        return None
+
+
 def _available_memory_mb():
     """Best-effort free RAM in MB, or ``None`` when it cannot be determined.
 
-    Reads ``/proc/meminfo`` (Linux, incl. Termux) and falls back to
-    ``os.sysconf``; returns ``None`` on platforms that expose neither, which
+    Reads the Android bridge first (the app cannot read ``/proc/meminfo`` for
+    ``MemAvailable`` reliably), then ``/proc/meminfo`` (Linux, incl. Termux) and
+    ``os.sysconf``; returns ``None`` on platforms that expose none of them, which
     callers treat as "don't know, don't block".
     """
+    bridge = _android_system_status()
+    if bridge is not None:
+        try:
+            value = bridge.availableMemoryMb()
+            if value is not None:
+                return float(value)
+        except Exception:
+            pass
     try:
         with open('/proc/meminfo') as handle:
             for line in handle:
@@ -2790,7 +2816,21 @@ def _available_memory_mb():
 
 
 def _battery_status():
-    """Return ``(percent, charging)`` from sysfs, or ``(None, None)`` if unknown."""
+    """Return ``(percent, charging)`` or ``(None, None)`` when unknown.
+
+    Prefers the Android bridge; falls back to sysfs on a desktop/Linux host where
+    the values are actually readable. ``None`` means "unknown", never "empty".
+    """
+    bridge = _android_system_status()
+    if bridge is not None:
+        try:
+            percent = bridge.batteryPercent()
+            charging = bridge.isCharging()
+            if percent is not None or charging is not None:
+                return (int(percent) if percent is not None else None,
+                        bool(charging) if charging is not None else None)
+        except Exception:
+            pass
     for base in ('/sys/class/power_supply/BAT0', '/sys/class/power_supply/battery'):
         try:
             with open(f"{base}/capacity") as handle:
@@ -2813,7 +2853,9 @@ def _embeddings_allowed_by_resources():
     if free_mb is not None and free_mb < EMBED_MIN_FREE_MB:
         return False
     percent, charging = _battery_status()
-    if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
+    # ``charging is False`` (not ``not charging``) so an unknown charging state
+    # is never mistaken for "on battery", which would needlessly stop vectors.
+    if percent is not None and charging is False and percent < EMBED_MIN_BATTERY_PCT:
         return False
     return True
 
@@ -2827,7 +2869,7 @@ def _embeddings_resource_status():
     if free_mb is not None and free_mb < EMBED_MIN_FREE_MB:
         allowed = False
         reasons.append(f"volná RAM {free_mb:.0f} MB < {EMBED_MIN_FREE_MB} MB")
-    if percent is not None and not charging and percent < EMBED_MIN_BATTERY_PCT:
+    if percent is not None and charging is False and percent < EMBED_MIN_BATTERY_PCT:
         allowed = False
         reasons.append(
             f"baterie {percent}% < {EMBED_MIN_BATTERY_PCT}% (není na nabíječce)")
