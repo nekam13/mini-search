@@ -183,6 +183,14 @@ tasks.matching { it.name == "preBuild" || it.name.startsWith("merge") && it.name
             dependsOn("fetchTokenizerAsset")
         }
 
+// ``-PskipEmbeddingModel`` must produce a genuinely small APK (hash fallback)
+// even when the 118 MB model was downloaded by an earlier build, so drop the
+// model asset from the package instead of merely skipping its download.
+android.sourceSets.main.assets.srcDirs = [file("${projectDir}/src/main/assets")]
+if (skipEmbeddingModel) {
+    android.sourceSets.main.assets.exclude "embedding/**"
+}
+
 chaquopy {
     defaultConfig {
         // The bundled Python server is Python 3.13 (matches app_combined.py).

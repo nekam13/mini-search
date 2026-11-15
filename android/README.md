@@ -60,6 +60,19 @@ cd android
 # výsledek: app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### Dvě varianty APK
+
+| Varianta | Model | Velikost | Poznámka |
+|---|---|---|---|
+| plná | reálný MiniLM (118 MB) | ~142,5 MB | sémantické hledání, **nad limitem GitHubu (100 MB)** |
+| hashovací | žádný (`-PskipEmbeddingModel`) | ~65 MB | menší, jen FTS5 + hashovací fallback; vhodná ke commitu |
+
+Plná varianta se nedá nahrát do GitHubu jako běžný soubor (limit 100 MB na
+soubor, LFS v tomto prostředí není k dispozici). Proto je v repozitáři
+commitnutá **hashovací** varianta (`mini-search-7.6-nomodel-debug.apk`) a plná
+varianta se sestaví jedním příkazem výše (model se stáhne a ověří proti
+SHA-256).
+
 Při prvním buildu se stáhnou dva artefakty z Hugging Face (model 118 MB a
 `tokenizer.json`) a ověří se proti SHA-256. Pro offline build je lze dodat
 předem:

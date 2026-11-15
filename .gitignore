@@ -16,3 +16,8 @@ wiki-dumps/
 .env
 logs/
 data/
+
+# The full-model APK (~142 MB) is above GitHub's 100 MB per-file limit; build it
+# with `cd android && ./gradlew :app:assembleDebug`. The smaller hash-fallback
+# APK is committed instead as mini-search-*-nomodel-debug.apk.
+mini-search-7.6-debug.apk
