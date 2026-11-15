@@ -7198,7 +7198,7 @@ def admin_site_edit(site_id):
     )
 
 
-@app.route('/admin/sites/<int:site_id>/recrawl')
+@app.route('/admin/sites/<int:site_id>/recrawl', methods=['POST'])
 def admin_site_recrawl(site_id):
     ok, message = recrawl_async(site_id)
     key = 'success' if ok else 'error'
@@ -7206,7 +7206,7 @@ def admin_site_recrawl(site_id):
     return redirect(f'{target}?{key}={message}')
 
 
-@app.route('/admin/sites/<int:site_id>/delete')
+@app.route('/admin/sites/<int:site_id>/delete', methods=['POST'])
 def admin_site_delete(site_id):
     delete_site(site_id)
     return redirect('/admin/sites?success=Web byl smazán')
@@ -7258,7 +7258,7 @@ def admin_source_edit(source_id):
     )
 
 
-@app.route('/admin/recrawl-all')
+@app.route('/admin/recrawl-all', methods=['POST'])
 def admin_recrawl_all():
     count = 0
     for site in get_all_sites():
@@ -7268,13 +7268,13 @@ def admin_recrawl_all():
     return redirect(f'/admin?success=Recrawl zahájen pro {count} webů')
 
 
-@app.route('/admin/pause-all')
+@app.route('/admin/pause-all', methods=['POST'])
 def admin_pause_all():
     execute_db("UPDATE sites SET status='paused' WHERE status='active'", commit=True)
     return redirect('/admin?success=Všechny aktivní weby byly pozastaveny')
 
 
-@app.route('/admin/resume-all')
+@app.route('/admin/resume-all', methods=['POST'])
 def admin_resume_all():
     execute_db("UPDATE sites SET status='active' WHERE status='paused'", commit=True)
     return redirect('/admin?success=Všechny pozastavené weby byly obnoveny')

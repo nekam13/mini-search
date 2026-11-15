@@ -35,12 +35,18 @@
     <div class="card-header"><h2>Rychlé akce</h2></div>
     <div class="actions">
         <a href="/admin/sources/new" class="btn btn-primary">Přidat web nebo zdroj</a>
-        <a href="/admin/recrawl-all" class="btn btn-secondary"
-           onclick="return confirm('Zahájit recrawl všech aktivních webů?')">Recrawl všech webů</a>
-        <a href="/admin/pause-all" class="btn btn-accent"
-           onclick="return confirm('Pozastavit všechny aktivní weby?')">Pozastavit vše</a>
-        <a href="/admin/resume-all" class="btn btn-ghost"
-           onclick="return confirm('Obnovit všechny pozastavené weby?')">Obnovit vše</a>
+        <form method="post" action="/admin/recrawl-all" class="inline-form"
+              onsubmit="return confirm('Zahájit recrawl všech aktivních webů?')">
+            <button type="submit" class="btn btn-secondary">Recrawl všech webů</button>
+        </form>
+        <form method="post" action="/admin/pause-all" class="inline-form"
+              onsubmit="return confirm('Pozastavit všechny aktivní weby?')">
+            <button type="submit" class="btn btn-accent">Pozastavit vše</button>
+        </form>
+        <form method="post" action="/admin/resume-all" class="inline-form"
+              onsubmit="return confirm('Obnovit všechny pozastavené weby?')">
+            <button type="submit" class="btn btn-ghost">Obnovit vše</button>
+        </form>
     </div>
 </div>
 
@@ -93,7 +99,9 @@
             </div>
             <div class="actions">
                 <a href="/admin/sites/{{ site.id }}/edit" class="btn btn-secondary btn-sm">Editovat</a>
-                <a href="/admin/sites/{{ site.id }}/recrawl" class="btn btn-primary btn-sm">Recrawl</a>
+                <form method="post" action="/admin/sites/{{ site.id }}/recrawl" class="inline-form">
+                    <button type="submit" class="btn btn-primary btn-sm">Recrawl</button>
+                </form>
                 <a href="/admin/sites/{{ site.id }}" class="btn btn-accent btn-sm">Detail</a>
             </div>
         </div>

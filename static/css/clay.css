@@ -151,6 +151,9 @@ a { color: var(--secondary); text-decoration: none; }
 .btn-lg { padding: 14px 28px; font-size: 1.05rem; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+/* A mutation rendered as a POST form so it cannot be triggered by a plain
+   cross-site link; it must not add its own line to the action row. */
+.inline-form { display: inline; margin: 0; }
 
 /* ---------------- Badges ---------------- */
 .badge {

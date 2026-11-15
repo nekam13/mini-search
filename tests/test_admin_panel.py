@@ -151,15 +151,20 @@ resp = client.post("/admin/api/sources", data={
 check("POST form-encoded", resp.status_code == 201, resp.get_data(as_text=True))
 
 # --- 15. recrawl route exists (no network) ---
+resp = client.post("/admin/sites/1/recrawl", follow_redirects=False)
+check("POST recrawl redirects", resp.status_code == 302)
+# A GET must not mutate anything: it is a CSRF vector on loopback.
 resp = client.get("/admin/sites/1/recrawl", follow_redirects=False)
-check("GET recrawl redirects", resp.status_code == 302)
+check("GET recrawl is refused", resp.status_code == 405, str(resp.status_code))
 
 # --- 16. pause/resume all ---
-resp = client.get("/admin/pause-all", follow_redirects=False)
+resp = client.post("/admin/pause-all", follow_redirects=False)
 check("pause-all", resp.status_code == 302)
 check("all paused", all(s["status"] == "paused" for s in m.get_all_sites()))
-client.get("/admin/resume-all")
+client.post("/admin/resume-all")
 check("all active", all(s["status"] == "active" for s in m.get_all_sites()))
+resp = client.get("/admin/pause-all", follow_redirects=False)
+check("GET pause-all is refused", resp.status_code == 405, str(resp.status_code))
 
 # --- 17. migration from legacy sites/sitemaps_feeds ---
 legacy_conn = m.get_db()
