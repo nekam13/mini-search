@@ -24,7 +24,8 @@ Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje
 - Ošetření HTTP 429 (`Retry-After`) a HTTP 403 (označení webu jako blokovaného)
 - **Nedestruktivní recrawl** s respektováním max_pages
 - Deduplikace velmi podobných výsledků
-- **Automatické aktualizace** z GitHub
+- **Automatické aktualizace** z GitHub (jen desktop; v APK je aplikace
+  zabalená a sama se neaktualizuje)
 
 ## Technologie
 
@@ -36,6 +37,30 @@ Lehký osobní vyhledávač pro indexování vybraných webů. Aplikace crawluje
 - model `paraphrase-multilingual-MiniLM-L12-v2`
 - Beautiful Soup, lxml, extruct a feedparser
 - APScheduler
+
+## Android aplikace (APK, bez Termuxu)
+
+Samostatná aplikace pro Android obsahuje celý server i Python závislosti přímo
+v APK (Chaquopy) – nepotřebuje Termux, root ani externí server. UI je WebView,
+které načítá `http://127.0.0.1:8070/` (veřejné hledání i `/admin`).
+
+- **Reálný model na zařízení**: vícejazyčný
+  `paraphrase-multilingual-MiniLM-L12-v2` běží offline přes ONNX Runtime for
+  Android (Kotlin `EmbeddingBridge` + přesný XLM-R tokenizer). Bez modelu se
+  použije výslovně označený hashovací fallback; FTS5 funguje vždy.
+- **Životní cyklus serveru**: stavy `STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/
+  `ERROR`; `RUNNING` až po kontrole `/health`, start je idempotentní, stop
+  korektně ukončí workery, scheduler, HTTP server a zavře DB.
+- **Foreground služba** (`specialUse`) drží server na pozadí, oznámení nabízí
+  otevření aplikace a Zastavit. Po výslovném zastavení se aplikace sama
+  nespouští.
+- **Import Wikipedie** z dumpu přes systémový výběr souborů (`content://` se
+  bezpečně zkopíruje do privátního úložiště) i přes API.
+- Data (SQLite, logy) jsou v privátním úložišti aplikace; migrace jsou
+  nedestruktivní.
+
+Podrobný postup buildu, testů a konfigurace je v
+[`android/README.md`](android/README.md).
 
 ## Spuštění v Ubuntu přes Termux
 

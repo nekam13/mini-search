@@ -350,13 +350,41 @@ scheduler only registers a job when its interval is non-zero.
 ## Android APK (`android/`)
 
 An APK bundles the same `app_combined.py` server via Chaquopy (Python 3.13) and
-shows it in a WebView; it does **not** need Termux. `android_entry.py` is the
-Python entry point (sets lowmem/loopback env, starts `run_server()` in a thread);
-Kotlin `MainActivity` + `ServerService` keep it running. Build with
-`cd android && gradle :app:assembleDebug`; the built APK is committed as
-`mini-search-*-debug.apk`.
+shows it in a WebView; it does **not** need Termux, root or a separate Python.
+`android_entry.py` is the Python entry point (sets lowmem/loopback env, calls
+`start_server()`/`stop_server()`); Kotlin `MiniSearchApp` starts the interpreter
+exactly once per process and `ServerController` + `ServerService` own the
+lifecycle. Build with `cd android && ./gradlew :app:assembleDebug`.
 
 Facts to preserve:
+
+- **Lifecycle states** are real: `STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/
+  `ERROR`. `RUNNING` is only set after a successful HTTP `/health` probe, never
+  just because a thread was spawned; `start` is idempotent (rotation/repeat
+  service start must not create a second server, scheduler or worker pool), and
+  `stop()` tears down workers, scheduler and HTTP server before checkpointing
+  and closing the DB, then drops the model so a restart in the same process
+  works. The Android HTTP server must stay controllable (`werkzeug.make_server`
+  with `shutdown()`), not `app.run`.
+- **Embeddings**: the APK ships the real multilingual MiniLM ONNX model
+  (`onnxruntime-android`, Kotlin `EmbeddingBridge` + `SpmTokenizer`), never the
+  PyTorch stack. `_HashingEmbedding` is a labelled fallback, not a language
+  model. Vectors carry an `embedding_space`; a hash vector and a model vector
+  are never compared just because both are 384 wide.
+- **Foreground service** type is `specialUse` (a local server + crawler, not
+  `dataSync`), with `FOREGROUND_SERVICE_SPECIAL_USE` and the manifest property
+  justification. It does not defeat Doze; after an explicit user stop the
+  service is not restarted on its own.
+- **Dumps** arrive as a `content://` URI, which is not a path: `DumpImporter`
+  copies the stream into `filesDir/wiki_dumps` (with a free-space check) and
+  `android_entry.import_wiki_dump()` registers a resumable dump source.
+- `BUNDLED_RUNTIME=1` (set by `android_entry.py`) disables the git-update check
+  and hides its dashboard controls; the app never git-pulls or pip-installs.
+  Update-tracking files live beside `MINISEARCH_DB`, never in the CWD.
+- Python tests: `python3 tests/test_lifecycle.py` covers start/readiness/stop/
+  restart, worker dedup, vector-space separation and dump import. JVM tests:
+  `./gradlew :app:testDebugUnitTest`. On-device:
+  `./gradlew :app:connectedDebugAndroidTest`.
 
 - `chaquopy.sourceSets.main.srcDir(rootProject.projectDir.parentFile)` with an
   `include(...)` whitelist is required: a plain relative `srcDir("..")` resolves

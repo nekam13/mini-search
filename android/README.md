@@ -31,6 +31,15 @@ přepis XLM-R sentencepiece tokenizeru (`SpmTokenizer.kt`, shoda s referencí).
 - `hnswlib` pro Android neexistuje; `vector_search()` proto použije přesné
   brute-force hledání přes numpy s omezenou pamětí (top-k halda).
 
+## Import Wikipedie z dumpu
+
+V aplikaci je akce **Import dumpu**: přes systémový výběr souborů vyberete
+stažený `cswiki-*.xml.bz2`. `content://` URI **není** cesta k souboru, takže
+`DumpImporter` nejdřív zkontroluje volné místo a zkopíruje proud do privátního
+úložiště (`filesDir/wiki_dumps`); teprve pak `android_entry.import_wiki_dump()`
+zaregistruje zdroj a spustí import na pozadí (idempotentně, s možností
+pokračování). API importér funguje bez dumpu.
+
 ## Životní cyklus serveru
 
 `ServerController` drží stavy `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`,
@@ -80,6 +89,13 @@ záměrně chybí (potřebuje `rdflib`/`jstyleson`, které nemají Android kola)
 `_extract_jsonld()` se bez něj obejde vlastním parserem. `MINISEARCH_*`
 proměnné se nastavují v `android_entry.py`; runtime nastavení zůstává v
 `SETTINGS_SPEC` v `app_combined.py` (v Kotlinu není druhá konfigurace).
+
+## Aktualizace a soubory v úložišti
+
+Aplikace nikdy sama sebe neaktualizuje: `BUNDLED_RUNTIME=1` vypne kontrolu
+aktualizací z Gitu i její ovládání v dashboardu a `ServerController`/Python
+nikdy nespouští `git pull` ani `pip install`. Data, logy a pomocné soubory
+(`.commit_sha`, `update_log`) leží v privátním úložišti vedle `console.db`.
 
 ## Aktualizace aplikace
 
