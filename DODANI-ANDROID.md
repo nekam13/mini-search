@@ -6,9 +6,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`36735a1`** (`Refuse mutating admin actions over GET`)
-- Commit s dokumentací: `7200ac0` (přidává tento dokument a přebudované APK;
-  zdrojový kód backendu ani Androidu se v něm nemění)
+- Zdrojový commit obou APK: **`1220a68`** (`Make the update endpoints POST-only too`)
+- Commit s dokumentací: `7200ac0` a `84e0357` (texty, beze změny kódu)
 - Výchozí větev `beta-optimized` byla ověřena; větev `android-app-completion`
   vychází z referenčního commitu zadání a obsahuje dokončení Android aplikace.
 
@@ -16,8 +15,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.6-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 64 388 880 B (~61,4 MiB) | `16edf63edbc22cb35ea91080f3700734bbd256066975ab08c3287192e88b4534` |
-| `mini-search-7.6-debug.apk` | plná s modelem MiniLM (142 MB), **negitovaná** | 142 024 109 B (~135,4 MiB) | `09a2198a7566ab06b27f65e986e79b8abdfe773931f3dc94811ae0bf0cabb076` |
+| `mini-search-7.6-nomodel-debug.apk` | bez modelu (hashovací fallback), **commitnutá** | 64 388 796 B (~61,4 MiB) | `63804d6b5a176139145429bc455aa1b165b8296ba66b43110e949fbcbaf3f3dc` |
+| `mini-search-7.6-debug.apk` | plná s modelem MiniLM (142 MB), **negitovaná** | 142 023 873 B (~135,4 MiB) | `582a95eb0c23fbb34b88f5decc757a1fd56cc229a14da819ae9de6058dddcdf4` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 2`, `versionName = 7.6`, nativní ABI `arm64-v8a`.
@@ -62,7 +61,7 @@ Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exi
 |---|---|
 | `test_db.py` | 9 |
 | `test_admin.py` | 8 |
-| `test_admin_panel.py` | 65 |
+| `test_admin_panel.py` | 68 |
 | `test_discovery_integration.py` | 16 |
 | `test_search_page.py` | 52 |
 | `test_source_indexing.py` | 31 |
@@ -166,8 +165,8 @@ ručních oprav a bez absolutních cest v repu.
   zpřístupnění aplikace do LAN.
 - `/admin` a `/admin/api/**` jsou dostupné jen z loopbacku; navíc se odmítají
   mutující požadavky s cizím `Origin`/`Referer` (403).
-- Všech pět dříve GET-mutujících akcí (recrawl, recrawl-all, pause-all,
-  resume-all, delete) je nyní POST-only; GET vrací 405.
+- Všech sedm dříve GET-mutujících akcí (recrawl, recrawl-all, pause-all,
+  resume-all, delete, check-update, apply-update) je nyní POST-only; GET vrací 405.
 - Z APK jsou vypnuté git aktualizace i jejich mutační endpointy
   (`BUNDLED_RUNTIME=1`); aplikace nikdy nespouští `git pull` ani `pip install`.
 - WebView: JS ano (Clay UI), ale `allowFileAccess=false`,
