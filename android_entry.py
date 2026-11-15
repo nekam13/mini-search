@@ -104,6 +104,15 @@ def ready():
         return False
 
 
+def page_count():
+    """Number of indexed pages, used by the smoke tests to detect data loss."""
+    with _lock:
+        if _server_module is None:
+            return 0
+        row = _server_module.execute_db_fetchone("SELECT COUNT(*) FROM pages")
+        return int(row[0]) if row else 0
+
+
 def base_url():
     """URL the WebView should load."""
     return f"http://{HOST}:{PORT}/"
