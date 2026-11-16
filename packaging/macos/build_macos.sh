@@ -37,7 +37,6 @@ echo "==> PyInstaller"
 python3 -m PyInstaller --clean --noconfirm \
     --distpath "$BUILD/pyinstaller-dist" \
     --workpath "$BUILD/pyinstaller-work" \
-    --windowed \
     "$ROOT/packaging/minisearch.spec"
 
 APP="$BUILD/pyinstaller-dist/mini-search.app"

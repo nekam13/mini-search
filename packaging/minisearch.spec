@@ -15,6 +15,7 @@ model next to the executable and sets ``MINISEARCH_MODEL``.
 """
 
 import os
+import sys
 
 # SPECPATH is the directory that contains this spec file (packaging/), so the
 # repository root is one level up.
@@ -42,17 +43,31 @@ hiddenimports = [
     "markupsafe",
 ]
 
-# extruct (and its rdflib stack) is optional; only pull it in when installed.
+binaries = []
+
+# extruct (and its rdflib/jstyleson stack) is optional; only pull it in when
+# installed. collect_all also grabs the package *data* files, which a bare
+# hiddenimport misses: mf2py ships "backcompat-rules" as a data file and raises
+# FileNotFoundError at import time without it, and rdflib ships plugin files.
 try:
     import extruct  # noqa: F401
-    hiddenimports += ["extruct", "rdflib", "jstyleson"]
+    from PyInstaller.utils.hooks import collect_all
+
+    for _pkg in ("extruct", "mf2py", "rdflib", "jstyleson"):
+        try:
+            _d, _b, _h = collect_all(_pkg)
+        except Exception:
+            continue
+        datas += _d
+        binaries += _b
+        hiddenimports += _h
 except Exception:
     pass
 
 a = Analysis(
     [os.path.join(ROOT, "desktop", "launcher.py")],
     pathex=[ROOT, os.path.join(ROOT, "desktop")],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -83,3 +98,14 @@ coll = COLLECT(
     upx=False,
     name=APP_NAME,
 )
+
+# On macOS, also wrap the collected directory in a double-clickable .app bundle.
+# This lives in the spec (not as a `--windowed` CLI flag) because PyInstaller
+# rejects make-spec options when a .spec file is given.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name=f"{APP_NAME}.app",
+        icon=None,
+        bundle_identifier="cz.minisearch.desktop",
+    )

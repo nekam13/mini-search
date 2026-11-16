@@ -29,6 +29,10 @@ done
 
 APP_NAME="mini-search"
 ARCH="$(uname -m)"            # x86_64 or aarch64
+# Reverse-DNS id shared by the .desktop file, the icons and the AppStream
+# metadata. appstreamcli (run by appimagetool) requires all three to agree, and
+# the id must be reverse-DNS — hence not the plain "mini-search" binary name.
+APP_ID="cz.minisearch.MiniSearch"
 APPDIR="$BUILD/${APP_NAME}.AppDir"
 mkdir -p "$CACHE" "$DIST" "$BUILD"
 
@@ -69,14 +73,14 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
          "$APPDIR/usr/share/metainfo"
 cp -a "$BUNDLE/." "$APPDIR/usr/bin/"
-cp "$HERE/mini-search.desktop" "$APPDIR/usr/share/applications/"
-cp "$HERE/mini-search.desktop" "$APPDIR/${APP_NAME}.desktop"
-cp "$HERE/mini-search.appdata.xml" "$APPDIR/usr/share/metainfo/"
-cp "$HERE/mini-search.appdata.xml" "$APPDIR/${APP_NAME}.appdata.xml"
-cp "$HERE/mini-search.svg" "$APPDIR/usr/share/icons/hicolor/256x256/apps/mini-search.svg"
-cp "$HERE/mini-search.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/mini-search.png"
-cp "$HERE/mini-search.svg" "$APPDIR/${APP_NAME}.svg"
-cp "$HERE/mini-search.png" "$APPDIR/${APP_NAME}.png"
+cp "$HERE/$APP_ID.desktop" "$APPDIR/usr/share/applications/"
+cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
+cp "$HERE/$APP_ID.appdata.xml" "$APPDIR/usr/share/metainfo/"
+cp "$HERE/$APP_ID.appdata.xml" "$APPDIR/$APP_ID.appdata.xml"
+cp "$HERE/$APP_ID.svg" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP_ID.svg"
+cp "$HERE/$APP_ID.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP_ID.png"
+cp "$HERE/$APP_ID.svg" "$APPDIR/$APP_ID.svg"
+cp "$HERE/$APP_ID.png" "$APPDIR/$APP_ID.png"
 cp "$HERE/AppRun" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
 # AppImages are run by other users, so every file must be world-readable.
@@ -111,15 +115,17 @@ DEBROOT="$BUILD/deb"
 rm -rf "$DEBROOT"
 mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/opt/$APP_NAME" \
          "$DEBROOT/usr/bin" "$DEBROOT/usr/share/applications" \
+         "$DEBROOT/usr/share/metainfo" \
          "$DEBROOT/usr/share/icons/hicolor/256x256/apps"
 # A setgid parent (common in shared/CI workspaces) leaves the control dir at
 # 2755, which dpkg-deb rejects. The 5-digit form clears the setgid bit; a plain
 # "0755" would silently preserve it.
 chmod 00755 "$DEBROOT/DEBIAN"
 cp -a "$BUNDLE/." "$DEBROOT/opt/$APP_NAME/"
-cp "$HERE/mini-search.desktop" "$DEBROOT/usr/share/applications/"
-cp "$HERE/mini-search.svg" "$DEBROOT/usr/share/icons/hicolor/256x256/apps/mini-search.svg"
-cp "$HERE/mini-search.png" "$DEBROOT/usr/share/icons/hicolor/256x256/apps/mini-search.png"
+cp "$HERE/$APP_ID.desktop" "$DEBROOT/usr/share/applications/"
+cp "$HERE/$APP_ID.appdata.xml" "$DEBROOT/usr/share/metainfo/"
+cp "$HERE/$APP_ID.svg" "$DEBROOT/usr/share/icons/hicolor/256x256/apps/$APP_ID.svg"
+cp "$HERE/$APP_ID.png" "$DEBROOT/usr/share/icons/hicolor/256x256/apps/$APP_ID.png"
 ln -sf "/opt/$APP_NAME/$APP_NAME" "$DEBROOT/usr/bin/$APP_NAME"
 chmod -R a+rX "$DEBROOT/opt"
 

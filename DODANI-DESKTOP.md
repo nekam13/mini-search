@@ -35,8 +35,8 @@ nastavení; desktop ani iOS si nevedou vlastní konfiguraci.
 
 | Soubor | Velikost | SHA-256 |
 |---|---|---|
-| `packaging/linux/dist/mini-search-7.9-x86_64.AppImage` | 36 121 080 B (~34,4 MiB) | `647cbe3cf17bb88cb790de1fbb97f52e4f52007308a34c05241e706c56560ddd` |
-| `packaging/linux/dist/mini-search_7.9_amd64.deb` | 27 955 560 B (~26,7 MiB) | `dfe272ecb103eb9eaa60558a40113434174988c8349efc06a2d0ca951c0c125b` |
+| `packaging/linux/dist/mini-search-7.9-x86_64.AppImage` | 39 852 536 B (~38,0 MiB) | `1aeb7a0975c21730f1c6bec6ab37186aea2975de1e9bc1b3a6462d58d58c650d` |
+| `packaging/linux/dist/mini-search_7.9_amd64.deb` | 31 410 024 B (~30,0 MiB) | `fc263595b855bf9bbc654bec256c8720ed37007a35f10bd9c7c520689e5660a8` |
 
 Metadata: `applicationId` (Android) se desktop netýká; balíčky nesou
 `Name=Mini Search`, `versionName`/`Version` **7.9**. Databáze, logy a modely se
@@ -87,11 +87,39 @@ i `/admin` a po `SIGTERM` se ověří, že se port uvolnil. Prošly:
 Ověřeno navíc: `dpkg -r mini-search` balíček čistě odstraní (nezůstane
 `/opt/mini-search` ani `/usr/bin/mini-search`).
 
-### Backendové testy (18 sad)
+### Backendové testy (19 sad)
 
 Spuštěny všechny skripty z `AGENTS.md` (`python3 tests/<skript>.py`), všechny
 prošly (exit 0), včetně nového `test_desktop_launcher.py`. Tato práce žádný
 backendový soubor nemění, jde tedy o regresní kontrolu.
+
+### Opravy pro CI (build všech platforem)
+
+První běh CI na tagu `v7.9` odhalil tři chyby, které bránily sestavení
+linux/macos/ios balíčků; všechny jsou opravené a Linux varianta je znovu
+sestavená a smoke-testovaná lokálně:
+
+1. **Linux AppStream metadata.** `appimagetool` validuje AppStream přes
+   `appstreamcli`, a oba nástroje se musí shodnout na jméně souboru, `<id>` a
+   `<launchable>` desktop id. Řešení: reverse-DNS identita
+   `cz.minisearch.MiniSearch` pro desktop soubor, ikony i metadata
+   (`packaging/linux/cz.minisearch.MiniSearch.*`). Soubor
+   `mini-search.appdata.xml` s `<id>mini-search</id>` hlásil
+   `cid-desktopapp-is-not-rdns`. `.desktop` má jednu hlavní kategorii
+   (`Categories=Network;`).
+2. **macOS PyInstaller.** `build_macos.sh` předávalo `--windowed` zároveň se
+   `.spec` souborem, což PyInstaller odmítá („make-spec options cannot be used
+   with a .spec file"). `.app` obal se nyní vytváří přímo ve specu
+   (`BUNDLE(...)`, jen na `darwin`).
+3. **iOS Briefcase.** `project_name = "Mini Search"` není platné PEP 621 jméno
+   (mezera) a chyběl `license`. Opraveno na `project_name = "mini-search"`,
+   `bundle = "cz"` (výsledné bundle id `cz.minisearch`) a
+   `license = "LicenseRef-proprietary"`.
+
+Navíc se opravilo balení `extruct`: pouhý `hiddenimports` vynechával datové
+soubory, takže `mf2py` padal na `FileNotFoundError: .../mf2py/backcompat-rules`.
+Spec nyní používá `collect_all()` pro `extruct`, `mf2py`, `rdflib` a
+`jstyleson`, takže se zabalí i datové soubory a pluginy.
 
 ## 4. Postup buildu z čistého checkoutu
 

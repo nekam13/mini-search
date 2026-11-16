@@ -1,11 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata for the Linux packages.
+     appimagetool validates this with appstreamcli, which requires the file name,
+     the <id> and the <launchable> desktop id to agree. Using the reverse-DNS id
+     (cz.minisearch.MiniSearch) for all three — desktop file, icon and this file —
+     satisfies both tools; a plain "mini-search" id trips cid-desktopapp-is-not-rdns.
+     The project has no declared licence yet (see README "Licence"), so the honest
+     value is LicenseRef-proprietary rather than claiming a licence we did not choose. -->
 <component type="desktop-application">
-  <id>cz.minisearch.MiniSearch.desktop</id>
+  <id>cz.minisearch.MiniSearch</id>
   <name>Mini Search</name>
   <summary>Hybridní vyhledávač s lokálním indexem</summary>
   <summary xml:lang="en">Hybrid search engine with a local index</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT</project_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer id="github.com.nekam13">
+    <name>nekam13</name>
+  </developer>
   <description>
     <p>
       Mini Search je lokální vyhledávač: crawluje weby, sitemapy, RSS/Atom a
@@ -19,7 +29,7 @@
       machine, with no account and no cloud.
     </p>
   </description>
-  <launchable type="desktop-id">mini-search.desktop</launchable>
+  <launchable type="desktop-id">cz.minisearch.MiniSearch.desktop</launchable>
   <url type="homepage">https://github.com/nekam13/mini-search</url>
   <provides>
     <binary>mini-search</binary>
