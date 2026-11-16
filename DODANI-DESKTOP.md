@@ -6,10 +6,12 @@ bylo v tomto prostředí skutečně sestaveno a otestováno. Nic není odhad: co
 nešlo v Linux kontejneru ověřit, je výslovně označeno jako neověřené.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
-- Zdrojový commit: `b961309` (větev `android-app-completion`)
+- Zdrojový commit: `6451f0a` (větev `android-app-completion`) — tento commit
+  přidává desktop/mobilní balíčky a aktualizuje obě Android APK
 - Verze: **7.9** (shodná s Android APK i s `versionName`)
 
-Android APK má vlastní dokument `DODANI-ANDROID.md`; ten se touto prací nemění.
+Android APK má vlastní dokument `DODANI-ANDROID.md`; v tomto commitu se u něj
+aktualizovaly jen údaje o novém buildu (hashe, commit, výsledky testů).
 
 ## 1. Princip: jeden backend, žádná druhá logika
 
