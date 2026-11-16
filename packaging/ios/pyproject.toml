@@ -31,6 +31,8 @@ bez účtu a bez cloudu.
 """
 sources = ["src/minisearch"]
 requires = [
+    # The app UI is a Toga WebView (src/minisearch/app.py imports toga).
+    "toga",
     "flask",
     "requests",
     "beautifulsoup4",
@@ -46,6 +48,11 @@ test_sources = ["tests"]
 requirement_installer_args = ["--find-links", "./wheelhouse"]
 
 [tool.briefcase.app.minisearch.iOS]
-requires = []
+# Toga's iOS backend is a separate distribution; without it `import toga`
+# fails on the device. (Briefcase only adds it automatically for projects
+# created with `briefcase new`, not for a hand-written pyproject.toml.)
+requires = [
+    "toga-iOS~=0.5.0",
+]
 # iOS sandbox: the server binds to loopback only and the WebView loads it.
 info = { NSLocalNetworkUsageDescription = "Mini Search indexuje weby ve vaší lokální síti, když to výslovně zadáte." }

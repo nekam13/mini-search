@@ -90,7 +90,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build iOS/iPadOS app with Briefcase
-        run: bash packaging/ios/build_ios.sh --version 7.9 --adhoc
+        run: bash packaging/ios/build_ios.sh --version 7.9
       - uses: actions/upload-artifact@v4
         with:
           name: ios
