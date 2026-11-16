@@ -101,6 +101,13 @@ předem:
 ./gradlew :app:assembleDebug -PskipEmbeddingModel
 ```
 
+Primární cílová architektura je `arm64-v8a` (skutečné telefony). Pro běh na
+emulátoru x86_64 se build dělá odděleně a transparentně:
+
+```bash
+./gradlew :app:assembleDebug -PskipEmbeddingModel -Pabi=x86_64
+```
+
 Chaquopy při prvním buildu stahuje Python balíčky z `repo.chaquo.com`. Cestu k
 SDK nastavte do `android/local.properties` (`sdk.dir=...`).
 
@@ -108,8 +115,12 @@ SDK nastavte do `android/local.properties` (`sdk.dir=...`).
 
 ```bash
 ./gradlew :app:testDebugUnitTest            # JVM: tokenizer + ONNX vs reference
-./gradlew :app:connectedDebugAndroidTest    # na zařízení/emulátoru: reálný start serveru
+./gradlew :app:connectedDebugAndroidTest    # na zařízení: start serveru + nativní UI
 ```
+
+Instrumentační sada má dvě části: `ServerSmokeTest` (spouští reálný Chaquopy
+backend a kontroluje `/health`, `/`, `/admin`, stop/restart, LAN sdílení) a
+`MainActivityUiTest` (čtyři nativní záložky a dialogy `confirm()`/`alert()`).
 
 ## Konfigurace
 
