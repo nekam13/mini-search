@@ -39,6 +39,11 @@ requires = [
     "markupsafe",
 ]
 test_sources = ["tests"]
+# MarkupSafe (a Flask dependency) ships only C-extension wheels; there is no
+# iOS wheel and Briefcase installs iOS requirements with --only-binary :all:.
+# Its C speedups are optional, so we vendor a pure-Python wheel built from the
+# pinned sdist (see wheelhouse/README.md) and let pip find it.
+requirement_installer_args = ["--find-links", "./wheelhouse"]
 
 [tool.briefcase.app.minisearch.iOS]
 requires = []
