@@ -6,8 +6,8 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`<COMMIT>`** (viz `git log -1` v této větvi; do
-  commitu se zapisuje při odevzdání)
+- Zdrojový commit obou APK: **`7996c3e`** (`Android 7.9: nativní Clay UI,
+  souběžné čtení a nové APK`)
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
