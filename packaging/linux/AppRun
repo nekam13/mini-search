@@ -1,0 +1,10 @@
+#!/bin/bash
+# AppRun entry point for the Mini Search AppImage.
+#
+# Keeps the writable data (console.db, logs) in the user's XDG data dir — never
+# inside the read-only AppImage mount — then hands control to the bundled
+# launcher, which starts the server and opens the UI.
+set -e
+HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+export MINISEARCH_DATA_DIR="${MINISEARCH_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mini-search}"
+exec "$HERE/usr/bin/mini-search" "$@"

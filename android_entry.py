@@ -98,6 +98,81 @@ def status():
         return json.dumps(_server_module.server_status())
 
 
+def settings_json():
+    """Grouped, display-ready settings for the native Android settings screen.
+
+    ``SETTINGS_SPEC`` in ``app_combined`` stays the single source of truth — the
+    Kotlin UI renders exactly what this returns, so there is never a second,
+    unsynchronised copy of the configuration.
+    """
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        groups = []
+        for group in module.settings_for_ui():
+            groups.append({
+                'key': group['key'],
+                'label': group['label'],
+                'items': [
+                    {
+                        'key': item['key'], 'label': item['label'],
+                        'help': item['help'], 'kind': item['kind'],
+                        'value': item['value'], 'display': item['display'],
+                        'choices': list(item['choices']),
+                        'min': item['min'], 'max': item['max'],
+                        'restart': item['restart'], 'env': item['env'],
+                    }
+                    for item in group['items']
+                ],
+            })
+        return json.dumps({'groups': groups})
+
+
+def save_settings_json(payload_json):
+    """Persist settings posted from the native screen. Returns JSON.
+
+    The payload is ``{"settings": {key: value, ...}}``. The result carries
+    ``restart_needed``: true when a saved item is flagged ``restart`` in
+    ``SETTINGS_SPEC``, so Kotlin can re-bind the server instead of leaving the
+    user with a change that silently does nothing.
+    """
+    _apply_android_defaults()
+    try:
+        payload = json.loads(payload_json or '{}')
+    except ValueError:
+        return json.dumps({'error': 'Neplatná data nastavení.'})
+    updates = payload.get('settings') or {}
+    with _lock:
+        module = _module()
+        # Which restart-flagged keys are actually changing? A save that only
+        # touches live settings must not bounce the server.
+        restart_needed = False
+        for key, raw in updates.items():
+            spec = module.SETTINGS_SPEC.get(key)
+            if not spec or not spec.get('restart'):
+                continue
+            new_value = module._coerce_setting(key, raw)
+            if new_value is not None and new_value != module.get_setting(key):
+                restart_needed = True
+                break
+        ok, errors = module.save_settings(updates)
+        if not ok:
+            return json.dumps({'error': '; '.join(errors)})
+        return json.dumps({
+            'message': 'Nastavení uloženo',
+            'restart_needed': restart_needed,
+        })
+
+
+def reset_settings_json():
+    """Reset every stored setting to its environment default."""
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        module.reset_settings()
+        return json.dumps({'message': 'Nastavení obnoveno', 'restart_needed': True})
+
+
 def set_lan_share(enabled):
     """Persist the LAN-sharing flag and return the resulting status.
 

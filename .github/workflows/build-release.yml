@@ -1,0 +1,111 @@
+name: build-release
+
+# Builds an installable Mini Search for every platform and, on a version tag,
+# attaches them all to a GitHub release.
+#
+#   * Linux   – AppImage + .deb      (ubuntu runner, built and smoke-tested here)
+#   * Windows – portable .zip + Setup.exe (windows runner; PyInstaller cannot
+#               cross-compile from Linux)
+#   * macOS   – .app + .dmg          (macos runner)
+#   * iOS/iPadOS – .ipa via Briefcase (macos runner with Xcode)
+#
+# The Android APK is built by the existing Gradle project (see android/) and
+# committed to the repository via Git LFS; this workflow does not rebuild it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file libfuse2
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mobile.txt
+      - name: Build AppImage + .deb
+        run: bash packaging/linux/build_linux.sh --version 7.9
+      - name: Smoke-test the AppImage
+        run: |
+          export MINISEARCH_DATA_DIR="$RUNNER_TEMP/ms-test"
+          AI=$(ls packaging/linux/dist/*.AppImage)
+          "$AI" --appimage-extract-and-run --no-ui --port 8091 &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8091/health || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          test "$code" = "200"
+          curl -sf http://127.0.0.1:8091/ > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: packaging/linux/dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build portable zip (+ installer if Inno Setup is present)
+        shell: pwsh
+        run: ./packaging/windows/build_windows.ps1 -Version 7.9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: packaging/windows/dist/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build .app + .dmg
+        run: bash packaging/macos/build_macos.sh --version 7.9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: packaging/macos/dist/*
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build iOS/iPadOS app with Briefcase
+        run: bash packaging/ios/build_ios.sh --version 7.9 --adhoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: packaging/ios/dist/**
+
+  release:
+    needs: [linux, windows, macos, ios]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

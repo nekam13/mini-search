@@ -1,0 +1,13 @@
+Package: mini-search
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Installed-Size: @SIZE@
+Depends: libc6, libstdc++6, zlib1g
+Maintainer: nekam13 <https://github.com/nekam13/mini-search>
+Homepage: https://github.com/nekam13/mini-search
+Description: Hybridni vyhledavac s lokalnim indexem
+ Mini Search crawluje weby, sitemapy, RSS/Atom a ceskou Wikipedii do SQLite
+ s FTS5 a hleda hybridne (fulltext + volitelne vektorove). Bezi cely lokalne,
+ bez uctu a bez cloudu.

@@ -10,6 +10,9 @@
     {% if not query %}<h2>Co chcete najít?</h2>{% endif %}
     <p>Prohledávejte lokálně indexované stránky přirozeným jazykem, česky i v dalších jazycích.</p>
 
+    {% if public_message %}<div class="msg msg-ok">{{ public_message }}</div>{% endif %}
+    {% if public_error %}<div class="msg msg-err">{{ public_error }}</div>{% endif %}
+
     <form id="searchForm" action="/" method="get" role="search">
         <input type="hidden" name="filter" id="filterInput" value="{{ current_filter }}">
         <div class="search-wrap">
@@ -211,6 +214,62 @@
 {% endif %}
 
 {% else %}
+{% if feed %}
+<div class="card card-static">
+    <div class="card-header">
+        <h2>Novinky v indexu</h2>
+        <span class="muted">Naposledy indexované stránky</span>
+    </div>
+</div>
+<div id="resultList" class="result-list feed-list">
+    {% for r in feed %}
+    <article class="result-item"
+             data-card="{{ r.card_type }}"
+             data-title="{{ r.display_title|lower }}"
+             data-date="{{ r.published_timestamp or 0 }}">
+        <div class="card-rich card-{{ r.card_type }}">
+        <div class="rich-head">
+            <span class="badge badge-{{ r.card_type }}">{{ r.card_badge }}</span>
+        </div>
+        <div class="card-media-layout">
+            {% if r.thumb %}
+            <div class="card-thumbnail">
+                <img src="{{ r.thumb }}" class="result-thumb" alt="" loading="lazy">
+            </div>
+            {% endif %}
+            <div class="result-content">
+                <div class="result-title">
+                    <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">{{ r.display_title }}</a>
+                </div>
+                <div class="result-url"><span class="domain">{{ r.domain }}</span>{{ r.display_url_path }}</div>
+                {% if r.snippet_html %}<div class="result-snippet">{{ r.snippet_html|safe }}</div>{% endif %}
+                <div class="result-meta">
+                    {% if r.display_date %}<span class="meta-item">{{ r.display_date }}</span>{% endif %}
+                </div>
+            </div>
+        </div>
+        </div>
+    </article>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div class="card card-static">
+    <div class="card-header"><h2>Přidat zdroj</h2></div>
+    <p class="hint">
+        Vložte adresu webu, konkrétní stránky, sitemapy nebo RSS/Atom feedu.
+        Typ se rozpozná automaticky a indexace začne na pozadí.
+    </p>
+    <form method="post" action="/add" class="public-add-form">
+        <div class="search-row">
+            <input type="text" name="url" inputmode="url" autocomplete="off"
+                   placeholder="https://example.com nebo example.com/feed"
+                   aria-label="Adresa zdroje">
+            <button type="submit" class="btn btn-primary">Přidat a indexovat</button>
+        </div>
+    </form>
+</div>
+
 <div class="card card-static">
     <div class="empty-state" style="padding-bottom:10px">
         <div class="icon">⌕</div>

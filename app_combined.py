@@ -660,8 +660,15 @@ def settings_for_ui():
     return groups
 
 
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 _db_conn = None
+# Each thread gets its own connection so concurrent HTTP requests can read in
+# parallel (WAL allows many readers beside one writer). ``_db_conn`` stays the
+# primary connection opened by whichever thread initialised the layer; a test
+# that sets it to ``None`` forces the whole layer to reconnect.
+_db_local = threading.local()
+_db_all_conns = {}
+_db_conns_lock = threading.Lock()
 _hnsw_index = None
 _hnsw_space = None
 _model = None
@@ -939,45 +946,85 @@ def _ensure_fts_table(conn):
 # DATABASE
 # ============================================================================
 
-def get_db():
-    """Get or create global SQLite connection (double-checked locking)."""
+def _connect_db():
+    """Open and configure one SQLite connection.
+
+    WAL lets many readers run beside the single writer, so every thread keeps
+    its own connection and only *writes* are serialised (see ``execute_db``).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # Termux/phone defaults: keep the page cache small and force any
+    # sort/temp b-trees onto disk instead of into RAM. A few MB of cache is
+    # plenty for this workload and leaves headroom for the rest of the process.
+    conn.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_KB}")
+    conn.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
+    conn.row_factory = sqlite3.Row
+    # The FTS5-less fallback (Chaquopy's SQLite has no FTS5) folds the stored
+    # text in SQL, so the folding helper must exist on every connection.
+    conn.create_function("minisearch_fold", 1, fold_diacritics)
+    return conn
+
+
+def _drop_connections():
+    """Close every cached connection so the next ``get_db`` rebuilds the layer.
+
+    Only called under ``_db_lock`` when the primary connection is gone (a test
+    reset ``_db_conn``, or a stop/start cycle), i.e. when no request is using
+    them.
+    """
     global _db_conn
-    if _db_conn is not None:
-        return _db_conn
+    with _db_conns_lock:
+        conns = list(_db_all_conns.values())
+        _db_all_conns.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    _db_conn = None
+    _db_local.conn = None
+
+
+def get_db():
+    """Return this thread's SQLite connection, creating the layer if needed.
+
+    Each thread reads through its own connection (WAL: concurrent readers beside
+    one writer); the first connection after a reset also runs the schema
+    creation and in-place migration exactly once.
+    """
+    global _db_conn
+    ident = threading.get_ident()
+    conn = getattr(_db_local, 'conn', None)
+    # A stale local (closed by ``_drop_connections`` from another thread) is no
+    # longer in the pool, so the membership check forces a reconnect.
+    if conn is not None and _db_conn is not None and _db_all_conns.get(ident) is conn:
+        return conn
     stored_settings = None
     with _db_lock:
         if _db_conn is None:
-            _db_conn = sqlite3.connect(
-                DB_PATH,
-                timeout=60.0,
-                check_same_thread=False
-            )
-            _db_conn.execute("PRAGMA journal_mode=WAL")
-            _db_conn.execute("PRAGMA foreign_keys=ON")
-            _db_conn.execute("PRAGMA busy_timeout=30000")
-            _db_conn.execute("PRAGMA wal_autocheckpoint=1000")
-            _db_conn.execute("PRAGMA synchronous=NORMAL")
-            # Termux/phone defaults: keep the page cache small and force any
-            # sort/temp b-trees onto disk instead of into RAM. A few MB of
-            # cache is plenty for this workload and leaves headroom for the
-            # rest of the process.
-            _db_conn.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_KB}")
-            _db_conn.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
-            _db_conn.row_factory = sqlite3.Row
-            # The FTS5-less fallback (Chaquopy's SQLite has no FTS5) folds the
-            # stored text in SQL, so the folding helper must exist on the
-            # connection. Registering it unconditionally is harmless on desktop.
-            _db_conn.create_function("minisearch_fold", 1, fold_diacritics)
-            _init_schema(_db_conn)
-            _ensure_fts_table(_db_conn)
-            _migrate_db(_db_conn)
-            _backfill_fts(_db_conn)
-            _migrate_sources(_db_conn)
-            run_self_migration(_db_conn)
-            # Read saved settings with the raw cursor: ``execute_db`` would try
-            # to take ``_db_lock`` again and deadlock this non-reentrant lock.
+            # A reset (``_db_conn = None``) invalidates every cached connection.
+            _drop_connections()
+        conn = getattr(_db_local, 'conn', None)
+        if conn is None or _db_all_conns.get(ident) is not conn:
+            conn = _connect_db()
+            _db_local.conn = conn
+            with _db_conns_lock:
+                _db_all_conns[ident] = conn
+        if _db_conn is None:
+            _db_conn = conn
+            _init_schema(conn)
+            _ensure_fts_table(conn)
+            _migrate_db(conn)
+            _backfill_fts(conn)
+            _migrate_sources(conn)
+            run_self_migration(conn)
             try:
-                rows = _db_conn.execute("SELECT key, value FROM app_settings").fetchall()
+                rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
                 stored_settings = {row['key']: row['value'] for row in rows}
             except sqlite3.OperationalError:
                 stored_settings = None
@@ -985,7 +1032,7 @@ def get_db():
     # without re-entering the connection lock.
     if stored_settings:
         apply_settings(stored_settings)
-    return _db_conn
+    return conn
 
 
 def run_self_migration(conn=None):
@@ -1323,7 +1370,7 @@ def log_error(message, exc=None):
 
 
 def close_db():
-    """Close the shared connection, checkpointing the WAL first.
+    """Close every cached connection, checkpointing the WAL first.
 
     Without an explicit checkpoint the ``-wal`` file keeps growing between
     restarts (worst on a phone with little storage), and an interrupted process
@@ -1331,18 +1378,38 @@ def close_db():
     """
     global _db_conn
     with _db_lock:
-        if _db_conn is not None:
-            try:
-                _db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            _db_conn.close()
-            _db_conn = None
+        if _db_conn is None:
+            return
+        try:
+            _db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        _drop_connections()
+
+
+# Statements that only read never take the write lock: with WAL they run
+# concurrently on the calling thread's own connection, so several people can
+# search at once while the crawler writes. Anything else is serialised.
+_READ_PREFIXES = ('SELECT', 'PRAGMA', 'WITH', 'EXPLAIN', 'VALUES')
+
+
+def _looks_like_read(query):
+    head = (query or '').lstrip().lstrip('(').lstrip()[:10].upper()
+    return head.startswith(_READ_PREFIXES)
 
 
 def execute_db(query, params=(), commit=False):
-    """Execute a query. Uses a single lock acquisition (no nested locking)."""
+    """Execute a query on this thread's connection.
+
+    Reads (``commit=False`` and a read-only statement) run lock-free on the
+    thread-local connection; writes take ``_db_lock`` so there is exactly one
+    writer at a time, and SQLite's ``busy_timeout`` covers the rest.
+    """
     conn = get_db()
+    if not commit and _looks_like_read(query):
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        return cursor
     with _db_lock:
         try:
             cursor = conn.cursor()
@@ -2499,6 +2566,50 @@ def _mirror_source_to_legacy(site_id, url, source_type):
         log_error(f"Could not mirror source {url} to sitemaps_feeds", e)
 
 
+def submit_public_source(raw_url):
+    """Register a source from the public page: URL in, indexing started.
+
+    The public form is deliberately minimal — the visitor types an address and
+    the type is detected (sitemap/feed/wiki/domain), the parent domain is
+    created if new, and indexing runs asynchronously so the HTTP request returns
+    at once instead of waiting on robots.txt / sitemap discovery. Returns
+    ``(ok, message)``.
+    """
+    value = (raw_url or '').strip()
+    if not value:
+        return False, 'Zadejte adresu webu nebo zdroje.'
+
+    source_type = detect_source_type(value, fallback='url')
+    is_wiki = source_type == WIKI_SOURCE_TYPE
+    if is_wiki:
+        site_url, _importer, _lang = normalize_wiki_source(value)
+        if not site_url:
+            return False, 'Neplatný odkaz na Wikipedii.'
+        value = site_url
+    else:
+        ok, message = validate_url(value)
+        if not ok:
+            return False, message
+        value = normalize_url(value)
+
+    # ``add_site`` accepts a full URL and stores the canonical domain, so a
+    # sitemap/feed lands under the same domain as its site.
+    site_id = add_site(value, is_local=False if is_wiki else None)
+    if not site_id:
+        return False, 'Doménu se nepodařilo založit.'
+
+    source_id, error = add_source(site_id, value, source_type=source_type)
+    if source_id is None:
+        # Already registered is not a failure for the visitor: the site is
+        # there and indexing, which is what they asked for.
+        if error and 'již' in error:
+            return True, 'Tento zdroj je již zaregistrovaný a průběžně se indexuje.'
+        return False, error or 'Zdroj se nepodařilo přidat.'
+
+    index_source_async(source_id)
+    return True, 'Zdroj byl přidán a indexace běží na pozadí.'
+
+
 def update_source(source_id, **kwargs):
     """Update fields of a source. Returns (ok, message)."""
     source = get_source_by_id(source_id)
@@ -2735,6 +2846,37 @@ def get_recent_pages(site_id, limit=10):
         page['indexed_at_str'] = format_timestamp(page['indexed_at'])
         pages.append(page)
     return pages
+
+
+def latest_indexed_pages(limit=12):
+    """Most recently indexed pages across every site, for the public news feed.
+
+    A single ordered query (backed by the ``pages.indexed_at`` index) keeps this
+    cheap even on a large index, and it is the only query the public homepage
+    runs when no search term is given.
+    """
+    try:
+        limit = max(1, min(int(limit), 60))
+    except (TypeError, ValueError):
+        limit = 12
+    rows = execute_db_fetchall(
+        """SELECT p.*, s.canonical_url AS site_domain, s.is_local AS site_is_local
+           FROM pages p LEFT JOIN sites s ON p.site_id = s.id
+           WHERE COALESCE(p.og_title, p.title, '') != ''
+           ORDER BY p.indexed_at DESC LIMIT ?""",
+        (limit,)
+    )
+    return [dict(row) for row in rows]
+
+
+def feed_items(limit=12):
+    """Display-ready news-feed cards for the public homepage.
+
+    Reuses :func:`prepare_results` (the same rich-card pipeline as search
+    results) so a feed card renders exactly like a search hit — no second
+    rendering path, no parsing in the template.
+    """
+    return prepare_results(latest_indexed_pages(limit), '')
 
 
 def get_filtered_sites(search='', status='', source_type='', local_only=False):
@@ -6487,6 +6629,8 @@ def _guard_admin_to_localhost():
     return None
 
 SEARCH_PAGE_SIZE = 25
+# Number of cards in the homepage news feed (the public page's landing view).
+FEED_PAGE_SIZE = _env_int("MINISEARCH_FEED_SIZE", 12, 1, 60)
 # Hard ceiling on how many results a single query may pull from the index.
 # Also bounds how deep pagination can go (page * SEARCH_PAGE_SIZE).
 SEARCH_MAX_RESULTS = 500
@@ -6981,6 +7125,7 @@ def search_index():
     results = []
     has_next = False
     image_results = []
+    feed = []
     if query:
         if filter_type == 'images':
             # The image tab wants breadth, not the article page window: search a
@@ -7006,6 +7151,11 @@ def search_index():
             # summary.
             if page == 1:
                 image_results = _collect_result_images(results)
+    else:
+        # No query: the homepage is a news feed of the freshest indexed pages
+        # (one indexed query), so a PC that opens the LAN address lands on
+        # something useful instead of an empty prompt.
+        feed = feed_items(FEED_PAGE_SIZE)
 
     return render_template(
         'search.html',
@@ -7013,12 +7163,29 @@ def search_index():
         query=query,
         results=prepare_results(results, query),
         image_results=image_results,
+        feed=feed,
         total_results=len(results),
         current_filter=filter_type,
         page=page,
         has_prev=page > 1,
         has_next=has_next,
+        public_message=request.args.get('ok', ''),
+        public_error=request.args.get('error', ''),
     )
+
+
+@app.route('/add', methods=['POST'])
+def public_add_source():
+    """Public, minimal "add a source" form: a URL in, indexing started.
+
+    Deliberately simpler than the admin panel — no type, no priority, no
+    domain picker. The type is detected from the address and indexing runs in
+    the background, so the visitor is never left waiting on a crawl. This is the
+    only mutating route the shared (LAN) page exposes; admin stays loopback-only.
+    """
+    ok, message = submit_public_source(request.form.get('url', ''))
+    key = 'ok' if ok else 'error'
+    return redirect('/?' + urlencode({key: message}))
 
 
 @app.route('/autocomplete')
@@ -7385,10 +7552,13 @@ def admin_source_edit(source_id):
 
 @app.route('/admin/recrawl-all', methods=['POST'])
 def admin_recrawl_all():
+    # Queue the recrawl in the background instead of running the network
+    # discovery inside the HTTP request: with several people using the server,
+    # a synchronous crawl of every site would block a worker for a long time.
     count = 0
     for site in get_all_sites():
         if site['status'] == 'active':
-            recrawl_site(site['id'])
+            recrawl_async(site['id'])
             count += 1
     return redirect(f'/admin?success=Recrawl zahájen pro {count} webů')
 

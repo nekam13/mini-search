@@ -157,11 +157,11 @@ android {
         applicationId "cz.minisearch.app"
         minSdk 30
         targetSdk 34
-        // Bumped for the LAN-sharing release (public search page shareable on
-        // the local network, admin stays loopback-only); keeps the same
-        // applicationId so it upgrades in place.
-        versionCode 4
-        versionName "7.8"
+        // Bumped for the native Clay UI release (Home/Search/Admin/Settings
+        // tabs rendered natively, concurrent multi-user reads, lazy WebView);
+        // keeps the same applicationId so it upgrades in place.
+        versionCode 5
+        versionName "7.9"
         // Required for ``connectedDebugAndroidTest``: without it the test APK
         // has no runner and the suite silently runs 0 tests.
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"

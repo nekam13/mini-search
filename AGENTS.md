@@ -26,6 +26,8 @@ python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, low
 python3 tests/test_search_quality.py         # charset, asset filtering, weights, image section
 python3 tests/test_settings_images.py        # admin settings, images filter, wiki images
 python3 tests/test_lifecycle.py              # server lifecycle: start/readiness/stop/restart, dedup
+python3 tests/test_android_compat.py         # FTS5 fallback, diacritics, start without FTS5/timezone
+python3 tests/test_lan_share.py              # opt-in LAN sharing of the public search page
 ```
 
 `tests/test_crawler_discovery.py` and `tests/test_search_quality.py` run against a
@@ -373,14 +375,23 @@ scheduler only registers a job when its interval is non-zero.
 ## Android APK (`android/`)
 
 An APK bundles the same `app_combined.py` server via Chaquopy (Python 3.13) and
-shows it in a WebView; it does **not** need Termux, root or a separate Python.
-`android_entry.py` is the Python entry point (sets lowmem/loopback env, calls
-`start_server()`/`stop_server()`); Kotlin `MiniSearchApp` starts the interpreter
-exactly once per process and `ServerController` + `ServerService` own the
-lifecycle. Build with `cd android && ./gradlew :app:assembleDebug`.
+shows it in a **native Czech UI** (Home / Search / Admin / Settings tabs); the
+Search and Admin tabs embed the local server in a locked-down WebView, while
+Home and Settings are pure Android views. It does **not** need Termux, root or a
+separate Python. `android_entry.py` is the Python entry point (sets
+lowmem/loopback env, calls `start_server()`/`stop_server()`, exposes
+`settings_json()`/`save_settings_json()`); Kotlin `PythonRuntime` starts the
+interpreter exactly once per process and `ServerController` + `ServerService`
+own the lifecycle. Build with `cd android && ./gradlew :app:assembleDebug`.
 
 Facts to preserve:
 
+- **Native UI + single source of truth.** The Settings screen renders whatever
+  `android_entry.settings_json()` returns from `SETTINGS_SPEC`; never add a
+  second, unsynchronised config in Kotlin. `MainActivity` builds the WebView
+  lazily (first time the Search/Admin tab opens) so `onCreate` does not delay
+  the foreground service, and `WebChromeClient` turns `confirm()`/`alert()` into
+  native dialogs (`MainActivity.buildJsDialog`, covered by `MainActivityUiTest`).
 - **Lifecycle states** are real: `STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/
   `ERROR`. `RUNNING` is only set after a successful HTTP `/health` probe, never
   just because a thread was spawned; `start` is idempotent (rotation/repeat
@@ -389,11 +400,15 @@ Facts to preserve:
   and closing the DB, then drops the model so a restart in the same process
   works. The Android HTTP server must stay controllable (`werkzeug.make_server`
   with `shutdown()`), not `app.run`.
+- **Concurrent requests**: each thread gets its own SQLite connection
+  (`threading.local` + a pool keyed by thread id); writes take `_db_lock`
+  (an `RLock`) so there is one writer, reads run in parallel under WAL.
 - **Embeddings**: the APK ships the real multilingual MiniLM ONNX model
   (`onnxruntime-android`, Kotlin `EmbeddingBridge` + `SpmTokenizer`), never the
   PyTorch stack. `_HashingEmbedding` is a labelled fallback, not a language
   model. Vectors carry an `embedding_space`; a hash vector and a model vector
-  are never compared just because both are 384 wide.
+  are never compared just because both are 384 wide, and `_bruteforce_neighbours`
+  keeps only a bounded top-k heap (no all-documents sort).
 - **Foreground service** type is `specialUse` (a local server + crawler, not
   `dataSync`), with `FOREGROUND_SERVICE_SPECIAL_USE` and the manifest property
   justification. It does not defeat Doze; after an explicit user stop the
@@ -405,8 +420,9 @@ Facts to preserve:
   and hides its dashboard controls; the app never git-pulls or pip-installs.
   Update-tracking files live beside `MINISEARCH_DB`, never in the CWD.
 - Python tests: `python3 tests/test_lifecycle.py` covers start/readiness/stop/
-  restart, worker dedup, vector-space separation and dump import. JVM tests:
-  `./gradlew :app:testDebugUnitTest`. On-device:
+  restart, worker dedup, vector-space separation, concurrent readers/writers and
+  dump import; `tests/test_android_compat.py` covers the FTS5-less path. JVM
+  tests: `./gradlew :app:testDebugUnitTest`. On-device:
   `./gradlew :app:connectedDebugAndroidTest`.
 
 - `chaquopy.sourceSets.main.srcDir(rootProject.projectDir.parentFile)` with an

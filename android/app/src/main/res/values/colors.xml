@@ -4,4 +4,23 @@
     <!-- Matches the Clay CSS page background (#F5F5F5) so the window behind
          the WebView and the page itself are the same colour (no white flash). -->
     <color name="window_background">#F5F5F5</color>
+
+    <!-- Clay design tokens, mirrored from static/css/clay.css so the native
+         screens look like the WebView pages. Keep these in sync with the CSS
+         :root block; the CSS remains the reference. -->
+    <color name="clay_primary">#4CAF50</color>
+    <color name="clay_primary_dark">#388E3C</color>
+    <color name="clay_secondary">#2196F3</color>
+    <color name="clay_secondary_dark">#1976D2</color>
+    <color name="clay_accent">#FFC107</color>
+    <color name="clay_background">#F5F5F5</color>
+    <color name="clay_card">#FFFFFF</color>
+    <color name="clay_text">#212121</color>
+    <color name="clay_text_light">#666666</color>
+    <color name="clay_border">#E0E0E0</color>
+    <color name="clay_danger">#E53935</color>
+    <color name="clay_ok_bg">#E8F5E9</color>
+    <color name="clay_ok_text">#2E7D32</color>
+    <color name="clay_err_bg">#FDECEA</color>
+    <color name="clay_err_text">#C62828</color>
 </resources>

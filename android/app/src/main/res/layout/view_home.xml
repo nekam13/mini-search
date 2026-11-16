@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Native "Domů" screen in the Clay design: a scrollable column of cards with
+     the server status, the LAN-sharing switch and the primary actions. This is
+     a real native screen, not a WebView of a remote site. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="@color/clay_background">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/clay_card"
+            android:padding="18dp"
+            android:layout_marginBottom="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/home_heading"
+                android:textColor="@color/clay_text"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/home_subtitle"
+                android:textColor="@color/clay_text_light"
+                android:textSize="14sp"
+                android:paddingTop="4dp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/clay_card"
+            android:padding="18dp"
+            android:layout_marginBottom="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/home_status_title"
+                android:textColor="@color/clay_text"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:paddingBottom="8dp" />
+
+            <TextView
+                android:id="@+id/home_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/clay_status_ok"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="8dp"
+                android:textColor="@color/clay_ok_text"
+                android:textSize="14sp"
+                android:text="@string/state_starting" />
+
+            <TextView
+                android:id="@+id/home_backend"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp"
+                android:textColor="@color/clay_text_light"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/home_error"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/clay_status_err"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="8dp"
+                android:textColor="@color/clay_err_text"
+                android:textSize="13sp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/clay_card"
+            android:padding="18dp"
+            android:layout_marginBottom="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/home_actions_title"
+                android:textColor="@color/clay_text"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:paddingBottom="10dp" />
+
+            <Button
+                android:id="@+id/home_open_web"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/clay_btn_primary"
+                android:textColor="#FFFFFF"
+                android:textAllCaps="false"
+                android:text="@string/action_open_web"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/home_restart"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/clay_btn_ghost"
+                android:textColor="@color/clay_text"
+                android:textAllCaps="false"
+                android:text="@string/action_restart"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/home_stop"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/clay_btn_danger"
+                android:textColor="#FFFFFF"
+                android:textAllCaps="false"
+                android:text="@string/action_stop" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="10dp"
+                android:text="@string/home_battery_note"
+                android:textColor="@color/clay_text_light"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/clay_card"
+            android:padding="18dp"
+            android:layout_marginBottom="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/home_lan_title"
+                android:textColor="@color/clay_text"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:paddingBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/home_lan_note"
+                android:textColor="@color/clay_text_light"
+                android:textSize="13sp"
+                android:paddingBottom="10dp" />
+
+            <CheckBox
+                android:id="@+id/lan_share"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/clay_text"
+                android:text="@string/lan_share_toggle" />
+
+            <TextView
+                android:id="@+id/lan_url"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="6dp"
+                android:textColor="@color/clay_secondary_dark"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textIsSelectable="true"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/lan_copy"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/clay_btn_ghost"
+                android:textColor="@color/clay_text"
+                android:textAllCaps="false"
+                android:text="@string/home_copy"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/lan_web_note"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp"
+                android:textColor="@color/clay_text_light"
+                android:textSize="12sp"
+                android:text="@string/home_web_note" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>
