@@ -234,6 +234,12 @@
     font-size: 0.9rem;
 }
 
+/* Public homepage: the news feed of freshly indexed pages and the minimal
+   "add a source" form. The cards themselves reuse .result-item / .card-rich. */
+.feed-list { margin-bottom: 4px; }
+.public-add-form .search-row { margin-bottom: 0; }
+.public-add-form input[type="text"] { flex: 1; }
+
 @media (max-width: 600px) {
     .hero { padding: 20px 16px; }
     .hero h2 { font-size: 1.25rem; }

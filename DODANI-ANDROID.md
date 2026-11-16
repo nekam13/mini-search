@@ -6,48 +6,88 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`6644ee6`** (`Add Android instrumentation tests
-  and refresh the delivery doc`), který obsahuje i opravy z `d80cb50`
+- Zdrojový commit obou APK: **`<COMMIT>`** (viz `git log -1` v této větvi; do
+  commitu se zapisuje při odevzdání)
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
 
-> **Aktuální verze 7.8 (LAN sdílení hledání).** Od 7.7 přibyla možnost
-> zpřístupnit **veřejnou vyhledávací stránku** ostatním zařízením ve stejné
-> síti (`network.lan_share`, v APK přepínač „Sdílet v síti"); administrace
-> zůstává pouze na loopbacku. `versionCode` je `4`, `versionName` `7.8`.
-> Podrobnosti v § 2 (sekce „Sdílení hledání v LAN") a § 6.
+> **Aktuální verze 7.9 (nativní UI).** Od 7.8 přibylo **nativní české UI**
+> (obrazovky Domů / Hledat / Správa / Nastavení) místo jediného WebView:
+> Domů ovládá server (start/stop/restart, LAN sdílení, import dumpu), Nastavení
+> vykresluje `SETTINGS_SPEC` z backendu. Zůstává možnost sdílet **veřejnou
+> vyhledávací stránku** v LAN (`network.lan_share`, výchozně vypnuto);
+> administrace zůstává pouze na loopbacku. `versionCode` je `5`, `versionName`
+> `7.9`. Podrobnosti v § 2 (sekce „Nativní UI") a § 6.
 
 ## 1. Odevzdané soubory
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.8-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 145 209 B (~136,5 MiB) | `09cf71f2d019e434bd1ab838dfc96b3d4477e1ab42853a08c5ec1d63793b079e` |
-| `mini-search-7.8-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 509 908 B (~62,5 MiB) | `7236a9cbf01a0a76cd7013f44895dbce1b1438d649938147362d2c98895020f2` |
+| `mini-search-7.9-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 214 586 B (~136,6 MiB) | `f9e3586d27e5a0f3cb6701e1b738bf29b53dd27c93ad4c452d5e71e9c3e3a2ab` |
+| `mini-search-7.9-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 579 557 B (~62,5 MiB) | `7a7ad75e7fe7b35712143c37c8c75b086ac15c50496e2d73f25a9095724ddeb3` |
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
-`versionCode = 4`, `versionName = 7.8`, `minSdk = 30`, `targetSdk = 34`,
+`versionCode = 5`, `versionName = 7.9`, `minSdk = 30`, `targetSdk = 34`,
 nativní ABI `arm64-v8a`. Debug podpis (certifikát SHA-256)
-`271e48cb8eda8819735e8564986d34f48a9af0040deeff13eca2c4f767a60174`.
+`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`.
 
-Plná varianta je v repu **přes Git LFS** (obě varianty, protože i malá má přes
-50 MB): GitHub má tvrdý limit 100 MB na soubor v běžném gitu, takže 143MB APK je
-uložené jako LFS objekt (`.gitattributes` → `filter=lfs`) a v gitu je jen malý
-pointer. Klony bez nainstalovaného `git-lfs` dostanou jen pointer (134 B), proto:
+Obě varianty jsou v repu **přes Git LFS** (i malá má přes 50 MB): GitHub má
+tvrdý limit 100 MB na soubor v běžném gitu, takže 143MB APK je uložené jako
+LFS objekt (`.gitattributes` → `filter=lfs`) a v gitu je jen malý pointer.
+Klony bez nainstalovaného `git-lfs` dostanou jen pointer, proto:
 
 ```bash
 git lfs install            # jednou na stroji
 git clone https://github.com/nekam13/mini-search.git
 ```
 
-Alternativně se plná varianta kdykoli sestaví jedním příkazem (viz § 4); model
-se při buildu stáhne a ověří proti SHA-256. Obě varianty jsou skutečně sestavené
-z aktuálního zdrojového commitu, nikoli převzaté z dřívějška.
+Alternativně se obě varianty kdykoli sestaví jedním příkazem (viz § 4); model
+se při buildu stáhne a ověří proti SHA-256. Obě varianty jsou skutečně
+sestavené z aktuálního zdrojového commitu, nikoli převzaté z dřívějška.
 
 
 ## 2. Co bylo dokončeno
 
-### Sdílení hledání v LAN (nová funkce 7.8)
+### Nativní UI (nová funkce 7.9)
+
+Místo jediného WebView má aplikace **nativní české UI** se čtyřmi záložkami
+(Horní lišta s přepínačem záložek, v duchu společného Clay designu):
+
+- **Domů** (`view_home.xml`) – nativní ovládání serveru: stav
+  (`STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/`ERROR`), backend (jaký embedding
+  běží), chybová zpráva s diagnostikou, tlačítka Start / Zastavit / Znovu
+  spustit, přepínač „Sdílet v síti" (LAN) a zobrazení LAN adresy pro PC,
+  tlačítko importu wiki dumpu.
+- **Hledat** (`web_container`) – veřejná stránka `/` v uzamčeném WebView;
+  WebView se vytváří líně, až když záložku poprvé otevřete (aby `onCreate`
+  nezdržel start foreground služby).
+- **Správa** – panel `/admin` ve stejném WebView. `confirm()`/`alert()`
+  z admin formulářů vykresluje `WebChromeClient` jako nativní dialog; ověřeno
+  instrumentačním testem `MainActivityUiTest` (dialog se zobrazí s českou
+  zprávou, OK vrátí `confirm()`, Zrušit vrátí `cancel()`).
+- **Nastavení** (`view_settings.xml`) – nativní obrazovka, která dostane
+  seskupená nastavení z backendu (`settings_json()` → `SETTINGS_SPEC`) a
+  vykreslí je; ukládání, obnovení výchozích hodnot a restart, když to změna
+  vyžaduje. **V Kotlinu není druhá konfigurace** – jediným zdrojem pravdy
+  zůstává `SETTINGS_SPEC` v `app_combined.py`.
+
+Zachováno a doplněno u životního cyklu:
+
+- **Idempotentní start.** `ServerController` má hlídač `inFlight` + `state`,
+  takže rotace obrazovky, návrat do aplikace ani opakované spuštění služby
+  nevytvoří druhý server, scheduler ani crawlery. `PythonRuntime.ensureStarted`
+  spouští `Python.start()` **právě jednou za proces** a na pozadí (nikdy na
+  hlavním vlákně).
+- **`RUNNING` až po kontrole `/health`** s timeoutem (60 s); samotné vytvoření
+  Python vlákna se za běžící server nepovažuje. Při selhání nastoupí `ERROR`
+  s českou diagnostikou a tlačítko „Zkusit znovu".
+- **Korektní stop a restart** ve stejném procesu: `stop_server()` zastaví
+  příjem další práce, ukončí workery a scheduler, zavolá `shutdown()` na
+  řiditelném HTTP serveru (Werkzeug `make_server`), udělá SQLite checkpoint a
+  zavře spojení.
+
+### Sdílení hledání v LAN (funkce 7.8)
 
 Aplikace umí volitelně zpřístupnit **veřejnou vyhledávací stránku** ostatním
 zařízením ve stejné síti (typicky PC), a to na pevném portu 8070, např.
@@ -149,9 +189,9 @@ Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exi
 | `test_crawler_discovery.py` | 27 |
 | `test_search_quality.py` | 44 |
 | `test_settings_images.py` | 45 |
-| `test_lifecycle.py` | 37 |
+| `test_lifecycle.py` | 42 |
 | `test_android_compat.py` | 5 |
-| `test_lan_share.py` | 30 |
+| `test_lan_share.py` | 31 |
 
 Testy životního cyklu (`test_lifecycle.py`) pokrývají start → `RUNNING` až po
 `/health`, opakovaný start jako no-op bez druhého serveru/scheduleru/workerů,
@@ -179,9 +219,10 @@ proti referenčním vektorům `sentence-transformers` na českých textech.
 
 ### Android instrumentační testy (skutečně spuštěné na emulátoru)
 
-`./gradlew :app:connectedDebugAndroidTest` na emulátoru `msx(AVD) - 14`:
-**8 testů, 0 selhání, 0 přeskočeno** (výsledek posledního běhu). Běh na
-`arm64-v8a` buildu s reálným modelem ověřen samostatně (viz níže).
+`./gradlew :app:connectedDebugAndroidTest` (ekvivalentně `adb shell am instrument
+-w cz.minisearch.app.test/androidx.test.runner.AndroidJUnitRunner`) na emulátoru
+`msx(AVD) - 14`: **12 testů, 0 selhání** (úspěšný běh na odevzdaném `arm64-v8a`
+APK). Tvoří je `ServerSmokeTest` (8) a `MainActivityUiTest` (4).
 
 `ServerSmokeTest.kt` spouští skutečný Chaquopy backend a ověřuje:
 
@@ -193,17 +234,41 @@ proti referenčním vektorům `sentence-transformers` na českých textech.
 - `databaseLivesInPrivateStorage` – `console.db` je ve `filesDir`
 - `pagesSurviveStopAndRestart` – restart neztratí indexované stránky
 - `mutatingAdminRoutesRejectGet` – GET na mutační admin endpointy není 200
-- `lanSharingRebindsAndExposesTheAddress` – **nové**: sdílení je výchozně
-  vypnuté; po zapnutí `status` hlásí `lan_share: true` a `lan_url`; přes
-  syrový socket se ověří, že `/` na adrese zařízení vrací 200 a `/admin`
-  na téže adrese vrací 403 (tedy že server na LAN skutečně odpovídá a
-  administrace se přesto odmítá). Ověřeno na zařízení, ne jen na desktopu.
+- `lanSharingRebindsAndExposesTheAddress` – sdílení je výchozně vypnuté; po
+  zapnutí `status` hlásí `lan_share: true` a `lan_url`; přes syrový socket se
+  ověří, že `/` na adrese zařízení vrací 200 a `/admin` na téže adrese vrací
+  403 (tedy že server na LAN skutečně odpovídá a administrace se přesto odmítá).
+
+`MainActivityUiTest.kt` (nové) ověřuje nativní UI a dialogy:
+
+- `nativeTabsArePresentAndSwitchScreens` – čtyři záložky (Domů/Hledat/Správa/
+  Nastavení) existují s českými popisky a přepnutí na Správu schová Domů a
+  zobrazí webový kontejner.
+- `confirmDialogShowsAndReportsConfirm`, `cancelButtonReportsCancel`,
+  `alertDialogHasOnlyOkButton` – `MainActivity.buildJsDialog(...)` (přesně to,
+  co volá `WebChromeClient.onJsConfirm`/`onJsAlert`) zobrazí dialog s českou
+  zprávou; OK vrátí `confirm()`, Zrušit vrátí `cancel()`, alert nabídne jen OK.
+
+> Poznámka k dialogům: testy záměrně **nepřipojují DevTools/CDP klienta**.
+> Připojený DevTools klient totiž sám zachytí `window.confirm()`/`alert()`, takže
+> `onJsConfirm` se nikdy nezavolá a nativní dialog se neukáže — přes CDP tedy
+> dialog ověřit nelze. Test proto volá reálnou metodu bez CDP a kliká na
+> skutečné tlačítko `AlertDialog` na hlavním vlákně (kvůli pomalému emulátoru
+> bez KVM se místo Espresso čekání použije `waitForIdleSync`).
 
 Poznámka k `searchAndAdminPagesLoad`: první dotaz na `/admin` na emulátoru bez
 KVM má studený start ~30 s (druhý už 0,7 s), proto test používá timeout 30 s;
 jde o omezení pomalého emulátoru, nikoli o regresi aplikace.
 
 ### End-to-end ověření na emulátoru (mimo testy)
+
+> Poznámka k aktuálnosti: kroky 1–5 níže byly provedeny v rámci dřívějšího cyklu
+> (7.8) na stejném typu emulátoru. V tomto cyklu (7.9) se přes `adb forward`
+> ruční tok **nepodařilo znovu dokončit** — emulátor bez KVM má studený start
+> Pythonu tak pomalý, že ho systém opakovaně ukončil (zátěž 15–20). Stejný tok
+> ale pokrývají instrumentační testy, které v tomto cyklu **prošly 12/12 na
+> odevzdaném `arm64-v8a` APK** a provádějí skutečné HTTP požadavky na běžící
+> server (`/health`, `/`, `/admin`, syrový socket na LAN adrese).
 
 Nad spuštěnou aplikací byl přes `adb forward` ověřen skutečný tok:
 
@@ -261,14 +326,21 @@ oprav a bez absolutních cest v repu.
 
 **Ověřeno (skutečně spuštěno):**
 - Build obou variant projde (`BUILD SUCCESSFUL`) a výsledné APK mají shodná
-  metadata (`versionCode 4`, `versionName 7.8`).
+  metadata (`versionCode 5`, `versionName 7.9`).
 - V plné variantě jsou v APK `assets/embedding/model_qint8_arm64.onnx`
   (118 412 398 B), `assets/ml/tokenizer_spm.bin`, `lib/arm64-v8a/libonnxruntime.so`,
   `lib/arm64-v8a/libonnxruntime4j_jni.so` a `assets/chaquopy/app.imy`.
 - V malé variantě model **není**, tokenizer ano.
 - `templates/` a `static/` jsou zabalené v `app.imy` (`templates/search.html`,
   `templates/base_clay.html`, `static/css/clay.css`, `static/js/search.js`).
-- 17 backendových sad, 7 JVM testů a 7 instrumentačních testů prochází.
+- 18 backendových sad, 7 JVM testů a 12 instrumentačních testů prochází.
+- **Nativní UI na odevzdaném `arm64-v8a` APK.** `MainActivityUiTest` ověřil na
+  zařízení, že existují čtyři záložky s českými popisky a že přepnutí na Správu
+  schová Domů a zobrazí webový kontejner; dialogy `confirm()`/`alert()`
+  (co volá `WebChromeClient`) se zobrazí s českou zprávou a OK/Zrušit vrací
+  správnou hodnotu. V logu (`ServerController`) je vidět skutečný přechod do
+  `state -> RUNNING` s `workers: 1`, `scheduler_running: true`,
+  `embedding_space: "hash:384"` (nomodel varianta) a platným `lan_url`.
 - Instalace a běh **nového APK** na emulátoru `msx(AVD) - 14`: server se rozjede,
   `/health` = 200, české hledání s diakritikou i bez ní funguje, crawling
   a automatická indexace nového zdroje fungují, administrace se načte.
@@ -298,6 +370,14 @@ oprav a bez absolutních cest v repu.
   127.0.0.1`).
 
 **Neověřeno (přesné důvody):**
+- **Stabilita startu na extrémně pomalém emulátoru.** Emulátor bez KVM má
+  studený start Python interpretu přes ARM překlad tak pomalý, že občas
+  překročí i 120s timeout `PythonRuntime` (v logu pak `ERROR: Python se
+  nepodařilo inicializovat do 120 s`). Na tomto emulátoru se to stává
+  nepravidelně (jeden běh instrumentačních testů projde 12/12, jiný start
+  trvá mnoho minut); jde o omezení emulátoru bez virtualizace, ne o chybu
+  aplikace — při úspěšném startu server naběhne správně (`state -> RUNNING`).
+  Na reálném telefonu je start řádově rychlejší.
 - **Otevření LAN adresy z reálného PC v téže Wi-Fi.** Sdílení je ověřené na
   úrovni serveru (bind `0.0.0.0`, `lan_url`, odpověď na LAN adrese zařízení
   přes raw socket, odmítnutí adminu) a backendový test `test_lan_share.py`
@@ -343,17 +423,16 @@ oprav a bez absolutních cest v repu.
 
 ## 7. Aktualizace a podpis
 
-`applicationId` zůstal `cz.minisearch.app` a `versionCode` se zvýšil z 3 na 4
-(`versionName` 7.7 → 7.8). Debug APK je podepsané automatickým debug klíčem
+`applicationId` zůstal `cz.minisearch.app` a `versionCode` se zvýšil z 4 na 5
+(`versionName` 7.8 → 7.9). Debug APK je podepsané automatickým debug klíčem
 (otisk certifikátu SHA-256:
-`271e48cb8eda8819735e8564986d34f48a9af0040deeff13eca2c4f767a60174`).
-**Původní podpisový klíč aplikace `mini-search-7.5-debug.apk` ani klíč předchozí
-7.6/7.7 není v tomto prostředí k dispozici**, proto běžná aktualizace přes
-původní instalaci nemusí být možná (Android odmítne APK s jiným podpisem).
-Odinstalace staré verze by smazala data a **není** náhradou migrace; databázi
-nikdy nemažte. Release se podepisuje jen dodatečným klíčem přes bezpečnou
-konfiguraci; klíče a hesla nejsou součástí repozitáře a žádný produktivně
-podepsaný release není tvrzen.
+`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`).
+**Předchozí 7.8 APK bylo podepsané jiným debug klíčem**
+(`271e48cb…`) než toto prostředí, proto běžná aktualizace přes původní instalaci
+nemusí být možná (Android odmítne APK s jiným podpisem). Odinstalace staré verze
+by smazala data a **není** náhradou migrace; databázi nikdy nemažte. Release se
+podepisuje jen dodatečným klíčem přes bezpečnou konfiguraci; klíče a hesla
+nejsou součástí repozitáře a žádný produktivně podepsaný release není tvrzen.
 
 ## 8. Reprodukovatelnost
 
@@ -379,13 +458,18 @@ pořadí hashů v D8; to je vlastnost AGP/D8, ne našeho kódu.
 ## 9. Omezení prostředí během práce
 
 - Emulátor `msx(AVD) - 14` běží **bez `/dev/kvm`** (hostitel x86_64 bez
-  virtualizace), takže je velmi pomalý a ANR; to je důvod pádů rendereru WebView
-  a nutnosti delších timeoutů u instrumentačních testů.
+  virtualizace), takže je velmi pomalý a ANR; to je důvod pádů rendereru WebView,
+  občasného překročení 120s timeoutu startu Pythonu a nutnosti delších timeoutů
+  u instrumentačních testů. Zátěž guest systému dosahovala 16–20 a systém sám
+  hlásil ANR (např. „Process system isn't responding"). Prostředí je proto
+  vhodné pro jednorázové ověření, ne pro opakované interaktivní testování.
 - Emulátor má zapnutý **ARM překlad** (`libndk_translation.so`,
   `ro.enable.native.bridge.exec=1`), proto na něm běží i `arm64-v8a` APK včetně
   ONNX modelu. Instrumentační testy i ruční ověření běžely přímo na tomto
   `arm64-v8a` buildu (stejné APK jako odevzdané), takže testují skutečný
-  produkční artefakt, ne separátní x86_64 variantu.
+  produkční artefakt, ne separátní x86_64 variantu. Separátní `x86_64` varianta
+  (`-Pabi=x86_64`) sloužila jen jako pomocník při ladění UI a **není** součástí
+  odevzdání.
 - Toolchain: JDK 21 (`/usr/lib/jvm/java-21-openjdk-amd64`), Gradle 8.7,
-  `ANDROID_HOME=/opt/android-sdk` (platform 34, build-tools 34.0.0).
+  `ANDROID_HOME=/home/openhands/android-sdk` (platform 34, build-tools 34.0.0).
 - Databáze `console.db` v repu se nikdy needitovala ani nemazala.

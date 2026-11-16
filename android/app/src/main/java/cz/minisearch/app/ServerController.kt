@@ -221,6 +221,116 @@ object ServerController {
         }, "minisearch-lan").start()
     }
 
+    /**
+     * Load the grouped settings JSON from the backend (``SETTINGS_SPEC`` driven)
+     * and hand it to [onResult] on a background thread. A null JSON plus a
+     * non-null error means the call failed.
+     */
+    fun loadSettings(onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("settings_json").toString()
+                onResult(json, null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "settings load failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-settings-load").start()
+    }
+
+    /**
+     * Persist the settings the native screen collected.
+     *
+     * When the backend reports ``restart_needed`` (a saved item is flagged
+     * ``restart`` in ``SETTINGS_SPEC`` and its value actually changed), the
+     * server is stopped and started again in the same process so the change
+     * takes effect instead of silently doing nothing. [onResult] receives
+     * ``(message, error, restarted)``.
+     */
+    fun saveSettings(settingsJson: String, context: Context,
+                     onResult: (String?, String?, Boolean) -> Unit) {
+        val appContext = context.applicationContext
+        synchronized(lock) {
+            if (inFlight) {
+                onResult(null, "Probíhá jiná operace se serverem, zkuste to za okamžik.", false)
+                return
+            }
+            inFlight = true
+        }
+        Thread({
+            var restartNeeded = false
+            try {
+                val entry = pythonEntry()
+                val payload = org.json.JSONObject()
+                payload.put("settings", org.json.JSONObject(settingsJson))
+                val result = org.json.JSONObject(
+                    entry.callAttr("save_settings_json", payload.toString()).toString())
+                if (result.has("error")) {
+                    onResult(null, result.optString("error"), false)
+                    return@Thread
+                }
+                restartNeeded = result.optBoolean("restart_needed", false)
+                if (restartNeeded) {
+                    // Re-bind so the change applies; the caller (UI) follows the
+                    // state listener while this runs.
+                    setState(ServerState.STARTING)
+                    entry.callAttr("stop")
+                    EmbeddingBridge.reset()
+                    entry.callAttr("start", appContext.filesDir.absolutePath)
+                    if (!awaitReady()) {
+                        throw IllegalStateException("Server se nepodařilo po změně nastavení znovu spustit.")
+                    }
+                    backendLabel = readBackendLabel(entry)
+                    refreshLanInfo(entry)
+                    setState(ServerState.RUNNING)
+                }
+                onResult(result.optString("message", "Nastavení uloženo"), null, restartNeeded)
+            } catch (t: Throwable) {
+                Log.e(TAG, "settings save failed", t)
+                onResult(null, describe(t), restartNeeded)
+            } finally {
+                synchronized(lock) { inFlight = false }
+            }
+        }, "minisearch-settings-save").start()
+    }
+
+    /**
+     * Reset every stored setting to its environment default, then restart so the
+     * defaults are in effect. [onResult] receives ``(message, error)``.
+     */
+    fun resetSettings(context: Context, onResult: (String?, String?) -> Unit) {
+        val appContext = context.applicationContext
+        synchronized(lock) {
+            if (inFlight) {
+                onResult(null, "Probíhá jiná operace se serverem, zkuste to za okamžik.")
+                return
+            }
+            inFlight = true
+        }
+        Thread({
+            try {
+                val entry = pythonEntry()
+                entry.callAttr("reset_settings_json")
+                setState(ServerState.STARTING)
+                entry.callAttr("stop")
+                EmbeddingBridge.reset()
+                entry.callAttr("start", appContext.filesDir.absolutePath)
+                if (!awaitReady()) {
+                    throw IllegalStateException("Server se nepodařilo po obnovení nastavení znovu spustit.")
+                }
+                backendLabel = readBackendLabel(entry)
+                refreshLanInfo(entry)
+                setState(ServerState.RUNNING)
+                onResult("Nastavení obnoveno na výchozí hodnoty.", null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "settings reset failed", t)
+                onResult(null, describe(t))
+            } finally {
+                synchronized(lock) { inFlight = false }
+            }
+        }, "minisearch-settings-reset").start()
+    }
+
     /** Read ``lan_share`` / ``lan_url`` from the backend status JSON. */
     private fun refreshLanInfo(entry: com.chaquo.python.PyObject) {
         try {

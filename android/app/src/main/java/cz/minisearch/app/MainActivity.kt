@@ -2,48 +2,92 @@ package cz.minisearch.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.util.Log
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
- * Single-screen UI: a top bar with the two tabs (search and admin), a status
- * strip that reflects the *real* server state, and a WebView that is only
- * pointed at loopback once ``/health`` actually answers.
+ * The app shell: a native Clay home screen and a native Clay settings screen,
+ * plus the WebView for the two browser-based surfaces (public search and admin).
  *
- * The WebView is locked down: JavaScript is enabled (the Clay UI needs it) but
- * file/content access is off, no JavaScript bridge is exposed and any external
- * link opens in the system browser instead of this privileged view.
+ * The native screens are not a skin over the web UI — the home screen owns the
+ * real server controls (start/stop/restart, LAN sharing, dump import) and the
+ * settings screen renders ``SETTINGS_SPEC`` straight from the backend, so the
+ * configuration never lives in two places.
+ *
+ * The WebView is locked down: JavaScript on (the Clay UI needs it), no file or
+ * content access, no JavaScript bridge, external links leave for the system
+ * browser, and a [WebChromeClient] renders ``confirm``/``alert`` so the admin
+ * forms that guard destructive actions actually work.
  */
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var web: WebView
+    // Created lazily: see ensureWebView(). Null until the user first opens a
+    // web-backed tab, so Activity.onCreate stays cheap and the foreground
+    // service meets its start deadline even on a slow device.
+    private var web: WebView? = null
+    private lateinit var webContainer: android.widget.FrameLayout
+    private lateinit var homeView: View
+    private lateinit var settingsView: View
     private lateinit var status: TextView
     private lateinit var retry: Button
-    private lateinit var stopButton: Button
+
+    // Home screen widgets
+    private lateinit var homeStatus: TextView
+    private lateinit var homeBackend: TextView
+    private lateinit var homeError: TextView
     private lateinit var lanShare: CheckBox
     private lateinit var lanUrl: TextView
+    private lateinit var lanCopy: Button
+
+    // Settings screen widgets
+    private lateinit var settingsGroups: LinearLayout
+    private lateinit var settingsStatus: TextView
+    private lateinit var settingsSave: Button
+    private lateinit var settingsReset: Button
+
+    private val tabs = mutableMapOf<Int, Button>()
+    private var currentTab = R.id.tab_home
     private var onAdmin = false
     private var loadedOnce = false
+    private var settingsLoaded = false
     // Set while the code reflects the backend state into the checkbox, so the
     // programmatic change does not look like a user tap and re-trigger a restart.
     private var syncingLanToggle = false
+    // Maps a setting key to the widget that holds its current value, so saving
+    // can read every field without re-parsing the layout.
+    private val settingFields = mutableMapOf<String, () -> Any>()
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -62,26 +106,112 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        web = findViewById(R.id.web)
+        webContainer = findViewById(R.id.web_container)
+        homeView = findViewById(R.id.home_view)
+        settingsView = findViewById(R.id.settings_view)
         status = findViewById(R.id.status)
         retry = findViewById(R.id.retry)
-        stopButton = findViewById(R.id.stop_server)
+
+        homeStatus = findViewById(R.id.home_status)
+        homeBackend = findViewById(R.id.home_backend)
+        homeError = findViewById(R.id.home_error)
         lanShare = findViewById(R.id.lan_share)
         lanUrl = findViewById(R.id.lan_url)
+        lanCopy = findViewById(R.id.lan_copy)
 
-        configureWebView()
+        settingsGroups = findViewById(R.id.settings_groups)
+        settingsStatus = findViewById(R.id.settings_status)
+        settingsSave = findViewById(R.id.settings_save)
+        settingsReset = findViewById(R.id.settings_reset)
 
-        findViewById<Button>(R.id.tab_search).setOnClickListener { showSearch() }
-        findViewById<Button>(R.id.tab_admin).setOnClickListener { showAdmin() }
+        tabs[R.id.tab_home] = findViewById(R.id.tab_home)
+        tabs[R.id.tab_search] = findViewById(R.id.tab_search)
+        tabs[R.id.tab_admin] = findViewById(R.id.tab_admin)
+        tabs[R.id.tab_settings] = findViewById(R.id.tab_settings)
+
+        wireTabs()
+        wireHome()
+        wireSettings()
+
         findViewById<Button>(R.id.import_dump).setOnClickListener { pickDump() }
         retry.setOnClickListener {
             UserState.serverEnabled = true
             ServerService.start(this)
             ServerController.restart(this)
         }
-        stopButton.setOnClickListener {
+
+        requestNotificationPermissionIfNeeded()
+
+        ServerController.addListener(stateListener)
+        // The controller may already be RUNNING (rotation, return from
+        // background), in which case no new state event fires: reflect the
+        // current state once so the screens are correct immediately.
+        renderState(ServerController.state)
+        selectTab(currentTab)
+        if (UserState.serverEnabled) {
+            ServerService.start(this)
+        }
+    }
+
+    // ---------------------------------------------------------------- tabs ----
+
+    private fun wireTabs() {
+        for ((id, button) in tabs) {
+            button.setOnClickListener { selectTab(id) }
+        }
+    }
+
+    private fun selectTab(id: Int) {
+        currentTab = id
+        for ((tabId, button) in tabs) {
+            button.isSelected = tabId == id
+        }
+        homeView.visibility = if (id == R.id.tab_home) View.VISIBLE else View.GONE
+        settingsView.visibility = if (id == R.id.tab_settings) View.VISIBLE else View.GONE
+        val webTab = id == R.id.tab_search || id == R.id.tab_admin
+        webContainer.visibility = if (webTab) View.VISIBLE else View.GONE
+
+        when (id) {
+            R.id.tab_search -> {
+                onAdmin = false
+                ensureWebView()
+                if (ServerController.state == ServerState.RUNNING) load(ServerController.BASE_URL)
+            }
+            R.id.tab_admin -> {
+                onAdmin = true
+                ensureWebView()
+                if (ServerController.state == ServerState.RUNNING) load("${ServerController.BASE_URL}admin")
+            }
+            R.id.tab_settings -> loadSettings()
+        }
+    }
+
+    // ---------------------------------------------------------------- home ----
+
+    private fun wireHome() {
+        findViewById<Button>(R.id.home_open_web).setOnClickListener {
+            if (ServerController.state != ServerState.RUNNING) {
+                toast(getString(R.string.dump_need_running))
+                return@setOnClickListener
+            }
+            selectTab(R.id.tab_search)
+        }
+        findViewById<Button>(R.id.home_restart).setOnClickListener {
+            UserState.serverEnabled = true
+            ServerService.start(this)
+            ServerController.restart(this)
+        }
+        findViewById<Button>(R.id.home_stop).setOnClickListener {
             UserState.serverEnabled = false
             ServerService.stop(this)
+        }
+        lanCopy.setOnClickListener {
+            val url = ServerController.lanUrl
+            if (url.isNotEmpty()) {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("Mini Search", url))
+                toast(getString(R.string.home_copied))
+            }
         }
         lanShare.setOnCheckedChangeListener { _, checked ->
             if (syncingLanToggle) return@setOnCheckedChangeListener
@@ -96,18 +226,389 @@ class MainActivity : AppCompatActivity() {
             }
             ServerController.setLanShare(this, checked)
         }
+    }
 
-        requestNotificationPermissionIfNeeded()
-
-        ServerController.addListener(stateListener)
-        // The controller may already be RUNNING (rotation, return from
-        // background), in which case no new state event fires: reflect the
-        // current state once so the switch and status are correct immediately.
-        renderState(ServerController.state)
-        if (UserState.serverEnabled) {
-            ServerService.start(this)
+    /** Reflect the backend's LAN state into the checkbox and the address label. */
+    private fun syncLanToggle() {
+        syncingLanToggle = true
+        lanShare.isChecked = ServerController.lanShareEnabled
+        syncingLanToggle = false
+        val url = ServerController.lanUrl
+        if (ServerController.lanShareEnabled && url.isNotEmpty()) {
+            lanUrl.text = getString(R.string.lan_share_url, url)
+            lanUrl.visibility = View.VISIBLE
+            lanCopy.visibility = View.VISIBLE
+        } else if (ServerController.lanShareEnabled) {
+            lanUrl.text = getString(R.string.lan_share_no_address)
+            lanUrl.visibility = View.VISIBLE
+            lanCopy.visibility = View.GONE
+        } else {
+            lanUrl.visibility = View.GONE
+            lanCopy.visibility = View.GONE
         }
     }
+
+    // ------------------------------------------------------------ settings ----
+
+    private fun wireSettings() {
+        settingsSave.setOnClickListener { saveSettings() }
+        settingsReset.setOnClickListener {
+            AlertDialog.Builder(this)
+                .setMessage(getString(R.string.settings_reset_confirm))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(android.R.string.ok) { _, _ -> resetSettings() }
+                .show()
+        }
+    }
+
+    private fun loadSettings() {
+        if (settingsLoaded) return
+        settingsSave.isEnabled = false
+        settingsReset.isEnabled = false
+        ServerController.loadSettings { json, error ->
+            runOnUiThread {
+                if (error != null || json == null) {
+                    showSettingsStatus(getString(R.string.settings_load_error, error ?: ""), false)
+                    return@runOnUiThread
+                }
+                try {
+                    buildSettingsUi(JSONObject(json).getJSONArray("groups"))
+                    settingsLoaded = true
+                    settingsSave.isEnabled = true
+                    settingsReset.isEnabled = true
+                    settingsStatus.visibility = View.GONE
+                } catch (t: Throwable) {
+                    showSettingsStatus(getString(R.string.settings_load_error, t.message ?: ""), false)
+                }
+            }
+        }
+    }
+
+    /** Build one card per settings group, one row per item, from the backend JSON. */
+    private fun buildSettingsUi(groups: JSONArray) {
+        settingsGroups.removeAllViews()
+        settingFields.clear()
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+
+        for (g in 0 until groups.length()) {
+            val group = groups.getJSONObject(g)
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundResource(R.drawable.clay_card)
+                setPadding(dp(18), dp(18), dp(18), dp(18))
+                val lp = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                lp.bottomMargin = dp(14)
+                layoutParams = lp
+            }
+            card.addView(TextView(this).apply {
+                text = group.optString("label")
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                textSize = 16f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, 0, 0, dp(8))
+            })
+
+            val items = group.optJSONArray("items") ?: JSONArray()
+            for (i in 0 until items.length()) {
+                card.addView(buildSettingRow(items.getJSONObject(i), ::dp))
+            }
+            settingsGroups.addView(card)
+        }
+    }
+
+    private fun buildSettingRow(item: JSONObject, dp: (Int) -> Int): View {
+        val key = item.optString("key")
+        val kind = item.optString("kind")
+        val label = item.optString("label")
+        val help = item.optString("help")
+        val env = item.optString("env")
+        val restart = item.optBoolean("restart", false)
+
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(10))
+        }
+
+        val labelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        labelRow.addView(TextView(this).apply {
+            text = label
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            textSize = 14f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        if (restart) {
+            labelRow.addView(TextView(this).apply {
+                text = " " + getString(R.string.settings_restart_badge)
+                setTextColor(ContextCompat.getColor(context, R.color.clay_accent))
+                textSize = 11f
+                setPadding(dp(6), 0, 0, 0)
+            })
+        }
+        column.addView(labelRow)
+
+        when (kind) {
+            "bool" -> {
+                val check = CheckBox(this).apply {
+                    text = getString(R.string.settings_on)
+                    isChecked = item.optBoolean("value", false)
+                    setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                }
+                column.addView(check)
+                settingFields[key] = { check.isChecked }
+            }
+            "choice" -> {
+                val choices = item.optJSONArray("choices") ?: JSONArray()
+                val labels = ArrayList<String>()
+                val values = ArrayList<String>()
+                for (c in 0 until choices.length()) {
+                    val value = choices.getString(c)
+                    values.add(value)
+                    labels.add(choiceLabel(value))
+                }
+                val spinner = Spinner(this)
+                spinner.adapter = ArrayAdapter(
+                    this, android.R.layout.simple_spinner_dropdown_item, labels)
+                val current = item.optString("value")
+                val index = values.indexOf(current)
+                if (index >= 0) spinner.setSelection(index)
+                column.addView(spinner)
+                settingFields[key] = { values[spinner.selectedItemPosition] }
+            }
+            "int" -> {
+                val edit = EditText(this).apply {
+                    inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+                    setText(item.optString("value"))
+                    setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                }
+                column.addView(edit)
+                settingFields[key] = { edit.text.toString().trim() }
+            }
+            else -> {
+                val edit = EditText(this).apply {
+                    setText(item.optString("value"))
+                    setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                }
+                column.addView(edit)
+                settingFields[key] = { edit.text.toString().trim() }
+            }
+        }
+
+        val helpText = buildString {
+            append(help)
+            if (env.isNotEmpty()) {
+                append("\n")
+                append(getString(R.string.settings_env_hint, env))
+            }
+        }
+        column.addView(TextView(this).apply {
+            text = helpText
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+            textSize = 12f
+            setPadding(0, dp(4), 0, 0)
+        })
+        return column
+    }
+
+    private fun choiceLabel(value: String): String = when (value) {
+        "auto" -> getString(R.string.settings_choice_auto)
+        "1" -> getString(R.string.settings_choice_on)
+        "0" -> getString(R.string.settings_choice_off)
+        else -> value
+    }
+
+    private fun saveSettings() {
+        val settings = JSONObject()
+        for ((key, reader) in settingFields) {
+            settings.put(key, reader())
+        }
+        settingsSave.isEnabled = false
+        settingsReset.isEnabled = false
+        showSettingsStatus(getString(R.string.settings_save) + "…", true)
+        ServerController.saveSettings(settings.toString(), this) { message, error, restarted ->
+            runOnUiThread {
+                settingsSave.isEnabled = true
+                settingsReset.isEnabled = true
+                if (error != null) {
+                    showSettingsStatus(getString(R.string.settings_error, error), false)
+                    return@runOnUiThread
+                }
+                val text = if (restarted) getString(R.string.settings_saved_restart)
+                           else (message ?: getString(R.string.settings_saved))
+                showSettingsStatus(text, true)
+                // The values may have been clamped; reload so the UI shows what
+                // was actually stored.
+                settingsLoaded = false
+                if (restarted) loadSettings()
+            }
+        }
+    }
+
+    private fun resetSettings() {
+        settingsSave.isEnabled = false
+        settingsReset.isEnabled = false
+        ServerController.resetSettings(this) { _, error ->
+            runOnUiThread {
+                settingsSave.isEnabled = true
+                settingsReset.isEnabled = true
+                if (error != null) {
+                    showSettingsStatus(getString(R.string.settings_error, error), false)
+                } else {
+                    showSettingsStatus(getString(R.string.settings_reset_done), true)
+                    settingsLoaded = false
+                    loadSettings()
+                }
+            }
+        }
+    }
+
+    private fun showSettingsStatus(text: String, ok: Boolean) {
+        settingsStatus.text = text
+        settingsStatus.setBackgroundResource(
+            if (ok) R.drawable.clay_status_ok else R.drawable.clay_status_err)
+        settingsStatus.setTextColor(ContextCompat.getColor(
+            this, if (ok) R.color.clay_ok_text else R.color.clay_err_text))
+        settingsStatus.visibility = View.VISIBLE
+    }
+
+    // ------------------------------------------------------------- webview ----
+
+    /**
+     * Create and configure the WebView the first time a web-backed tab is
+     * opened. Doing this in onCreate made activity creation heavy enough to
+     * miss the foreground-service start deadline on a slow device, so it is
+     * deferred until it is actually needed.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun ensureWebView(): WebView {
+        web?.let { return it }
+        val view = WebView(this)
+        view.layoutParams = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+        webContainer.addView(view)
+        web = view
+        view.settings.javaScriptEnabled = true
+        view.settings.domStorageEnabled = true
+        // No local file or content access: the page is served over HTTP only.
+        view.settings.allowFileAccess = false
+        view.settings.allowContentAccess = false
+        view.settings.javaScriptCanOpenWindowsAutomatically = false
+        view.settings.setSupportMultipleWindows(false)
+        view.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        // The Clay CSS is light-only. Android's "algorithmic darkening" would
+        // invert the page in system dark mode and paint it black, so it is
+        // turned off explicitly (the theme pins light colours as well).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            view.settings.isAlgorithmicDarkeningAllowed = false
+        } else {
+            @Suppress("DEPRECATION")
+            run { view.settings.forceDark = WebSettings.FORCE_DARK_OFF }
+        }
+        view.setBackgroundColor(android.graphics.Color.parseColor("#F5F5F5"))
+        // Never add a JavaScript interface: that would expose native calls to
+        // any page. Keep the WebView free of bridges.
+        //
+        // A WebChromeClient *is* required, though: without one the WebView
+        // silently drops window.confirm()/window.alert() (onJsConfirm returns
+        // false by default), so every admin form guarded by a confirm() — delete
+        // a site, recrawl all, pause/resume all, reset settings — would look
+        // like a dead button. Rendering the dialogs is what makes those work.
+        view.webChromeClient = object : WebChromeClient() {
+            override fun onJsConfirm(
+                view: WebView?, url: String?, message: String?, result: JsResult?
+            ): Boolean {
+                if (message == null || result == null) return super.onJsConfirm(view, url, message, result)
+                buildJsDialog(message, confirm = true,
+                    onConfirm = { result.confirm() },
+                    onCancel = { result.cancel() })
+                return true
+            }
+
+            override fun onJsAlert(
+                view: WebView?, url: String?, message: String?, result: JsResult?
+            ): Boolean {
+                if (message == null || result == null) return super.onJsAlert(view, url, message, result)
+                buildJsDialog(message, confirm = false, onConfirm = { result.confirm() })
+                return true
+            }
+        }
+        view.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val url = request.url
+                return if (isLocal(url)) {
+                    false
+                } else {
+                    // External links leave the privileged WebView.
+                    startActivity(Intent(Intent.ACTION_VIEW, url))
+                    true
+                }
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                loadedOnce = true
+            }
+
+            /**
+             * A renderer crash (typically the system killing the sandboxed
+             * renderer under memory pressure) would otherwise take the whole
+             * process down. Recover by reloading the local page instead.
+             */
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                Log.w(TAG, "WebView renderer gone (crashed=${detail.didCrash()})")
+                loadedOnce = false
+                if (ServerController.state == ServerState.RUNNING) {
+                    view.postDelayed({
+                        load(if (onAdmin) "${ServerController.BASE_URL}admin"
+                             else ServerController.BASE_URL)
+                    }, 500)
+                }
+                return true
+            }
+        }
+        return view
+    }
+
+    /**
+     * Show a JS dialog and hand the outcome back through [onConfirm]/[onCancel].
+     *
+     * Kept as a separate, side-effect-light method so an instrumentation test
+     * can drive the same AlertDialog the WebChromeClient builds without a real
+     * DevTools session attached (an attached DevTools client intercepts
+     * window.confirm()/window.alert() itself, so onJsConfirm is never called).
+     */
+    internal fun buildJsDialog(
+        message: String,
+        confirm: Boolean,
+        onConfirm: () -> Unit,
+        onCancel: () -> Unit = {},
+    ): AlertDialog {
+        val builder = AlertDialog.Builder(this)
+            .setMessage(message)
+            .setCancelable(false)
+            .setPositiveButton(android.R.string.ok) { _, _ -> onConfirm() }
+        if (confirm) {
+            builder.setNegativeButton(android.R.string.cancel) { _, _ -> onCancel() }
+        }
+        val dialog = builder.create()
+        dialog.show()
+        return dialog
+    }
+
+    private fun isLocal(uri: Uri): Boolean {
+        val host = uri.host ?: return false
+        return uri.scheme == "http" && (host == "127.0.0.1" || host == "localhost")
+    }
+
+    private fun load(url: String) {
+        ensureWebView().loadUrl(url)
+    }
+
+    // ---------------------------------------------------------- dump import ----
 
     private fun pickDump() {
         if (ServerController.state != ServerState.RUNNING) {
@@ -143,70 +644,62 @@ class MainActivity : AppCompatActivity() {
         }, "minisearch-dump-copy").start()
     }
 
-    private fun toast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-    }
+    // ------------------------------------------------------------ rendering ----
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun configureWebView() {
-        web.settings.javaScriptEnabled = true
-        web.settings.domStorageEnabled = true
-        // No local file or content access: the page is served over HTTP only.
-        web.settings.allowFileAccess = false
-        web.settings.allowContentAccess = false
-        web.settings.javaScriptCanOpenWindowsAutomatically = false
-        web.settings.setSupportMultipleWindows(false)
-        web.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        // The Clay CSS is light-only. Android's "algorithmic darkening" would
-        // invert the page in system dark mode and paint it black, so it is
-        // turned off explicitly (the theme pins light colours as well).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            web.settings.isAlgorithmicDarkeningAllowed = false
-        } else {
-            @Suppress("DEPRECATION")
-            run { web.settings.forceDark = WebSettings.FORCE_DARK_OFF }
-        }
-        web.setBackgroundColor(android.graphics.Color.parseColor("#F5F5F5"))
-        // Never add a JavaScript interface: that would expose native calls to
-        // any page. Keep the WebView free of bridges.
-        web.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val url = request.url
-                return if (isLocal(url)) {
-                    false
+    private fun renderState(state: ServerState) {
+        when (state) {
+            ServerState.STARTING -> {
+                status.text = getString(R.string.state_starting)
+                retry.visibility = View.GONE
+                setHomeStatus(getString(R.string.state_starting), true)
+                homeError.visibility = View.GONE
+            }
+            ServerState.RUNNING -> {
+                status.text = getString(R.string.state_running, ServerController.backendLabel)
+                retry.visibility = View.GONE
+                setHomeStatus(getString(R.string.state_running, ServerController.backendLabel), true)
+                homeError.visibility = View.GONE
+                if (ServerController.backendLabel.isNotEmpty()) {
+                    homeBackend.text = getString(R.string.home_status_detail, ServerController.backendLabel)
+                    homeBackend.visibility = View.VISIBLE
                 } else {
-                    // External links leave the privileged WebView.
-                    startActivity(Intent(Intent.ACTION_VIEW, url))
-                    true
+                    homeBackend.visibility = View.GONE
+                }
+                syncLanToggle()
+                // Only now is localhost reachable.
+                if ((currentTab == R.id.tab_search || currentTab == R.id.tab_admin) &&
+                    (!loadedOnce || web?.url == null)) {
+                    load(if (onAdmin) "${ServerController.BASE_URL}admin" else ServerController.BASE_URL)
                 }
             }
-
-            override fun onPageFinished(view: WebView, url: String) {
-                loadedOnce = true
+            ServerState.STOPPING -> {
+                status.text = getString(R.string.state_stopping)
+                setHomeStatus(getString(R.string.state_stopping), true)
             }
-
-            /**
-             * A renderer crash (typically the system killing the sandboxed
-             * renderer under memory pressure) would otherwise take the whole
-             * process down. Recover by reloading the local page instead.
-             */
-            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                Log.w(TAG, "WebView renderer gone (crashed=${detail.didCrash()})")
-                loadedOnce = false
-                if (ServerController.state == ServerState.RUNNING) {
-                    view.postDelayed({
-                        load(if (onAdmin) "${ServerController.BASE_URL}admin"
-                             else ServerController.BASE_URL)
-                    }, 500)
-                }
-                return true
+            ServerState.STOPPED -> {
+                status.text = getString(R.string.state_stopped)
+                retry.visibility = View.VISIBLE
+                setHomeStatus(getString(R.string.state_stopped), false)
+                homeError.visibility = View.GONE
+                syncLanToggle()
+            }
+            ServerState.ERROR -> {
+                status.text = getString(R.string.state_error, ServerController.lastError)
+                retry.visibility = View.VISIBLE
+                setHomeStatus(getString(R.string.state_error, ServerController.lastError), false)
+                homeError.text = ServerController.lastError
+                homeError.visibility = View.VISIBLE
+                syncLanToggle()
             }
         }
     }
 
-    private fun isLocal(uri: Uri): Boolean {
-        val host = uri.host ?: return false
-        return uri.scheme == "http" && (host == "127.0.0.1" || host == "localhost")
+    private fun setHomeStatus(text: String, ok: Boolean) {
+        homeStatus.text = text
+        homeStatus.setBackgroundResource(
+            if (ok) R.drawable.clay_status_ok else R.drawable.clay_status_err)
+        homeStatus.setTextColor(ContextCompat.getColor(
+            this, if (ok) R.color.clay_ok_text else R.color.clay_err_text))
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -219,76 +712,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showSearch() {
-        onAdmin = false
-        if (ServerController.state == ServerState.RUNNING) load(ServerController.BASE_URL)
-    }
-
-    private fun showAdmin() {
-        onAdmin = true
-        if (ServerController.state == ServerState.RUNNING) load("${ServerController.BASE_URL}admin")
-    }
-
-    private fun load(url: String) {
-        web.loadUrl(url)
-    }
-
-    /** Reflect the backend's LAN state into the checkbox and the address label. */
-    private fun syncLanToggle() {
-        syncingLanToggle = true
-        lanShare.isChecked = ServerController.lanShareEnabled
-        syncingLanToggle = false
-        val url = ServerController.lanUrl
-        if (ServerController.lanShareEnabled && url.isNotEmpty()) {
-            lanUrl.text = getString(R.string.lan_share_url, url)
-            lanUrl.visibility = View.VISIBLE
-        } else if (ServerController.lanShareEnabled) {
-            lanUrl.text = getString(R.string.lan_share_no_address)
-            lanUrl.visibility = View.VISIBLE
-        } else {
-            lanUrl.visibility = View.GONE
-        }
-    }
-
-    private fun renderState(state: ServerState) {
-        when (state) {
-            ServerState.STARTING -> {
-                status.text = getString(R.string.state_starting)
-                status.visibility = View.VISIBLE
-                retry.visibility = View.GONE
-            }
-            ServerState.RUNNING -> {
-                status.text = getString(R.string.state_running, ServerController.backendLabel)
-                status.visibility = View.VISIBLE
-                retry.visibility = View.GONE
-                syncLanToggle()
-                // Only now is localhost reachable.
-                if (!loadedOnce || web.url == null) {
-                    load(if (onAdmin) "${ServerController.BASE_URL}admin" else ServerController.BASE_URL)
-                }
-            }
-            ServerState.STOPPING -> {
-                status.text = getString(R.string.state_stopping)
-                status.visibility = View.VISIBLE
-            }
-            ServerState.STOPPED -> {
-                status.text = getString(R.string.state_stopped)
-                status.visibility = View.VISIBLE
-                retry.visibility = View.VISIBLE
-                syncLanToggle()
-            }
-            ServerState.ERROR -> {
-                status.text = getString(R.string.state_error, ServerController.lastError)
-                status.visibility = View.VISIBLE
-                retry.visibility = View.VISIBLE
-                syncLanToggle()
-            }
-        }
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     override fun onDestroy() {
         ServerController.removeListener(stateListener)
-        web.destroy()
+        web?.destroy()
+        web = null
         super.onDestroy()
     }
 

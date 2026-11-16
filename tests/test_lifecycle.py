@@ -168,7 +168,7 @@ def main():
     # ------------------------------------------------------------------
     m.get_db()
     m.execute_db("INSERT INTO sites (canonical_url, status) VALUES (?, 'active')",
-                 ("http://127.0.0.1/keepme",))
+                 ("http://127.0.0.1/keepme",), commit=True)
     check("site row written", m.execute_db_fetchone(
         "SELECT COUNT(*) FROM sites WHERE canonical_url = ?",
         ("http://127.0.0.1/keepme",))[0] == 1)
@@ -220,11 +220,12 @@ def main():
             "INSERT INTO pages (url, url_hash, title, body_text, embedding, "
             "embedding_space) VALUES (?, ?, ?, ?, ?, ?)",
             ("http://x/hash", "hash-row", "Hash", "obsah", raw,
-             m.HASH_EMBEDDING_SPACE))
+             m.HASH_EMBEDDING_SPACE), commit=True)
         m.execute_db(
             "INSERT INTO pages (url, url_hash, title, body_text, embedding, "
             "embedding_space) VALUES (?, ?, ?, ?, ?, ?)",
-            ("http://x/real", "real-row", "Real", "obsah", raw, fake_space))
+            ("http://x/real", "real-row", "Real", "obsah", raw, fake_space),
+            commit=True)
         hash_hits = m._bruteforce_neighbours(q, 10, space=m.HASH_EMBEDDING_SPACE)
         real_hits = m._bruteforce_neighbours(q, 10, space=fake_space)
         hash_titles = [r[0] for r in hash_hits]
@@ -271,12 +272,74 @@ def main():
     m.get_db()
     m.execute_db(
         "INSERT INTO crawl_queue (site_id, url, url_hash, status, locked_by) "
-        "VALUES (1, 'http://127.0.0.1/recover', 'h1', 'locked', 'dead-worker')")
+        "VALUES (1, 'http://127.0.0.1/recover', 'h1', 'locked', 'dead-worker')",
+        commit=True)
     m._recover_interrupted_queue()
     row = m.execute_db_fetchone(
         "SELECT status FROM crawl_queue WHERE url_hash = 'h1'")
     check("interrupted queue row recovered to pending",
           row is not None and row[0] == "pending", str(row))
+
+    # ------------------------------------------------------------------
+    # 8. Concurrent readers: several threads read in parallel beside a writer
+    # ------------------------------------------------------------------
+    # The Android app serves several people at once, so reads must not be
+    # serialised behind each other and must not corrupt the writer. Each thread
+    # gets its own connection (WAL), and the results must be consistent.
+    import threading as _threading
+
+    m.execute_db("DELETE FROM pages", commit=True)
+    for i in range(20):
+        m.execute_db(
+            "INSERT INTO pages (url, url_hash, title, body_text) "
+            "VALUES (?, ?, ?, ?)",
+            (f"http://127.0.0.1/p{i}", f"p{i}", f"Stranka {i}",
+             "obsah stranky pro soubezny test"), commit=True)
+
+    read_errors = []
+    seen_counts = []
+    read_barrier = _threading.Barrier(6)
+
+    def _reader():
+        try:
+            # Every reader holds a connection at the same time.
+            read_barrier.wait(timeout=10)
+            for _ in range(15):
+                rows = m.execute_db_fetchall(
+                    "SELECT COUNT(*) AS c FROM pages")
+                seen_counts.append(rows[0]["c"])
+        except Exception as exc:  # pragma: no cover - failure reporting
+            read_errors.append(repr(exc))
+
+    readers = [_threading.Thread(target=_reader, name=f"reader-{i}")
+               for i in range(5)]
+    for thread in readers:
+        thread.start()
+    # A writer runs beside the readers; it must not be starved or fail.
+    write_errors = []
+    try:
+        read_barrier.wait(timeout=10)
+        for i in range(5):
+            m.execute_db(
+                "INSERT INTO pages (url, url_hash, title, body_text) "
+                "VALUES (?, ?, ?, ?)",
+                (f"http://127.0.0.1/w{i}", f"w{i}", f"Writer {i}", "obsah"),
+                commit=True)
+    except Exception as exc:  # pragma: no cover - failure reporting
+        write_errors.append(repr(exc))
+    for thread in readers:
+        thread.join(timeout=20)
+
+    check("concurrent readers raised no error", not read_errors, str(read_errors))
+    check("concurrent writer raised no error", not write_errors, str(write_errors))
+    check("every reader saw at least the initial 20 pages",
+          seen_counts and min(seen_counts) >= 20, str(sorted(set(seen_counts))))
+    check("writer rows all landed",
+          m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0] == 25,
+          str(m.execute_db_fetchone("SELECT COUNT(*) FROM pages")[0]))
+    # Distinct connections, one per reader thread: no shared, serialised handle.
+    check("threads used their own connections",
+          len(m._db_all_conns) >= 2, str(len(m._db_all_conns)))
 
     m.stop_server()
 

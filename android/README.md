@@ -2,15 +2,24 @@
 
 Samostatná aplikace pro Android, která **nevyžaduje Termux**. Server
 (`app_combined.py`) i jeho Python závislosti jsou zabalené přímo v APK pomocí
-[Chaquopy](https://chaquo.com/chaquopy/); UI je WebView, které načítá
-`http://127.0.0.1:8070/`.
+[Chaquopy](https://chaquo.com/chaquopy/). Aplikace má **nativní české UI**
+(obrazovky Domů / Hledat / Správa / Nastavení) a ve dvou záložkách (Hledat,
+Správa) zobrazuje lokální server v uzamčeném WebView.
 
-- **Vyhledávač** – veřejná stránka `/`.
-- **Správa** – panel `/admin`; server poslouchá jen na `127.0.0.1`, takže
-  administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`). Mutující
-  akce (recrawl, pauza, obnovení, smazání) jsou **POST-only**, aby je nešlo
-  spustit obyčejným cross-site odkazem; požadavky s cizím `Origin`/`Referer`
-  se odmítají (403).
+- **Domů** – nativní ovládání serveru: stav (`STOPPED`/`STARTING`/`RUNNING`/
+  `STOPPING`/`ERROR`), tlačítka Start / Zastavit / Znovu spustit, přepínač
+  „Sdílet v síti" (LAN), zobrazení LAN adresy pro PC a import wiki dumpu.
+- **Hledat** – veřejná stránka `/` v WebView.
+- **Správa** – panel `/admin` v WebView; server poslouchá jen na `127.0.0.1`,
+  takže administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`).
+  Mutující akce (recrawl, pauza, obnovení, smazání) jsou **POST-only**, aby je
+  nešlo spustit obyčejným cross-site odkazem; požadavky s cizím
+  `Origin`/`Referer` se odmítají (403). `confirm()`/`alert()` z admin formulářů
+  vykresluje `WebChromeClient` jako nativní dialog (ověřeno instrumentačním
+  testem).
+- **Nastavení** – nativní obrazovka, která vykresluje `SETTINGS_SPEC` přímo
+  z backendu (v Kotlinu není druhá konfigurace). Uložení, obnovení výchozích
+  hodnot a restart při změně, která to vyžaduje.
 - Server drží na pozadí foreground služba (`ServerService`, typ `specialUse`),
   takže indexace neusne. Data (SQLite + logy) jsou v privátním úložišti
   aplikace (`filesDir`).
@@ -48,9 +57,13 @@ pokračování). API importér funguje bez dumpu.
 `ServerController` drží stavy `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`,
 `ERROR`. Do stavu `RUNNING` se přejde až po úspěšné HTTP kontrole `/health`
 s timeoutem; samotné spuštění Python vlákna se za běžící server nepovažuje.
-Start je idempotentní (rotace ani opakované spuštění služby nevytvoří druhý
-server). `stop_server()` korektně ukončí workery, scheduler i HTTP server,
-udělá SQLite checkpoint a zavře spojení; nový start ve stejném procesu funguje.
+Start je idempotentní (rotace, návrat do aplikace ani opakované spuštění služby
+nevytvoří druhý server, scheduler ani workery — `inFlight`/`state` hlídač).
+Chaquopy se inicializuje **právě jednou za proces** (`PythonRuntime.ensureStarted`,
+na pozadí a před použitím `Python.getInstance()`). `stop_server()` zastaví
+příjem další práce, ukončí workery, scheduler i HTTP server (řiditelný server
+s `shutdown`), udělá SQLite checkpoint a zavře spojení; nový start ve stejném
+procesu funguje.
 
 ## Build
 
@@ -67,14 +80,14 @@ cd android
 
 | Varianta | Model | Velikost | Poznámka |
 |---|---|---|---|
-| plná | reálný MiniLM (118 MB) | ~142,5 MB | sémantické hledání, **nad limitem GitHubu (100 MB)** |
-| hashovací | žádný (`-PskipEmbeddingModel`) | ~65 MB | menší, jen FTS5 + hashovací fallback; vhodná ke commitu |
+| plná | reálný MiniLM (118 MB) | ~136,6 MiB | sémantické hledání, **nad limitem GitHubu (100 MB)** |
+| hashovací | žádný (`-PskipEmbeddingModel`) | ~62,5 MiB | menší, jen FTS5 + hashovací fallback; vhodná ke commitu |
 
-Plná varianta se nedá nahrát do GitHubu jako běžný soubor (limit 100 MB na
-soubor, LFS v tomto prostředí není k dispozici). Proto je v repozitáři
-commitnutá **hashovací** varianta (`mini-search-7.6-nomodel-debug.apk`) a plná
-varianta se sestaví jedním příkazem výše (model se stáhne a ověří proti
-SHA-256).
+Obě varianty jsou v repozitáři **přes Git LFS** (`mini-search-7.9-debug.apk`,
+`mini-search-7.9-nomodel-debug.apk`), protože i malá má přes 50 MB. GitHub má
+tvrdý limit 100 MB na soubor v běžném gitu. Klon bez `git-lfs` dostane jen
+pointer; obě varianty lze kdykoli sestavit jedním příkazem výše (model se při
+buildu stáhne a ověří proti SHA-256).
 
 Při prvním buildu se stáhnou dva artefakty z Hugging Face (model 118 MB a
 `tokenizer.json`) a ověří se proti SHA-256. Pro offline build je lze dodat
@@ -115,12 +128,14 @@ nikdy nespouští `git pull` ani `pip install`. Data, logy a pomocné soubory
 
 ## Aktualizace aplikace
 
-`applicationId` je `cz.minisearch.app`. `versionCode` se zvýšil z 1 na 2
-(`versionName` 7.5 → 7.6). Baseline `mini-search-7.5-debug.apk` byl podepsaný
-**jiným** debug klíčem, než jaký je v tomto prostředí, takže běžná aktualizace
-přes původní instalaci nemusí být možná (odinstalace by smazala data). Release
-se podepisuje jen dodatečným klíčem přes bezpečnou konfiguraci; klíče a hesla
-nejsou součástí repozitáře.
+`applicationId` je `cz.minisearch.app`. `versionCode` se zvýšil z 4 na 5
+(`versionName` 7.8 → 7.9). Předchozí APK (7.8) byl podepsaný **jiným** debug
+klíčem, než jaký je v tomto prostředí (7.9 je podepsaný klíčem s otiskem
+`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`), takže
+běžná aktualizace přes původní instalaci **nemusí být možná** (Android odmítne
+APK s jiným podpisem). Odinstalace staré verze by smazala data a **není**
+náhradou migrace; databázi nikdy nemažte. Release se podepisuje jen dodatečným
+klíčem přes bezpečnou konfiguraci; klíče a hesla nejsou součástí repozitáře.
 
 ## Doklad o buildu a testech
 
