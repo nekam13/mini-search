@@ -9,6 +9,9 @@ provedeným krokům; nic není odhad ani ukázka.
 - Zdrojový commit obou APK: **`b961309`** (`Document the x86_64 emulator build
   and the UI test split`) — obě APK byla v rámci tohoto cyklu znovu sestavena
   z těchto zdrojů (`--rerun-tasks`, 48/48 úloh) a znovu otestována.
+  APK soubory jsou v repu odevzdané commitem `6451f0a`
+  (`Cross-platform packaging…`), který jinak mění jen desktopové balíčky a
+  dokumentaci — samotné zdroje Android aplikace jsou v něm shodné s `b961309`.
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
