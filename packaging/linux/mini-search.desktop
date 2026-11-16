@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Mini Search
+Name[cs]=Mini Search
+Comment=Hybridní vyhledávač s lokálním indexem
+Comment[en]=Hybrid search engine with a local index
+Exec=mini-search
+Icon=mini-search
+Terminal=false
+Categories=Utility;Network;
+Keywords=search;vyhledavani;index;crawler;
+StartupNotify=true

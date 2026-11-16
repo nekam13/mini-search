@@ -1,0 +1,46 @@
+# Briefcase project for the Mini Search iOS / iPadOS app.
+#
+# BeeWare's Briefcase bundles the Python runtime, the dependencies and the
+# backend into a real Xcode project, so the phone needs neither Termux nor a
+# remote server. The UI is a Toga WebView pointed at the same Flask server the
+# Android app uses (127.0.0.1), so search and admin look identical everywhere.
+#
+# Build (on macOS with Xcode):
+#     bash packaging/ios/build_ios.sh --version 7.9
+#
+# The app source in src/minisearch/ is augmented at build time with
+# app_combined.py, templates/ and static/ (see build_ios.sh); those are the very
+# files the Android APK ships, so there is no second copy of the logic.
+
+[tool.briefcase]
+project_name = "Mini Search"
+bundle = "cz.minisearch"
+version = "7.9"
+url = "https://github.com/nekam13/mini-search"
+author = "nekam13"
+author_email = "nekam13@users.noreply.github.com"
+
+[tool.briefcase.app.minisearch]
+formal_name = "Mini Search"
+description = "Hybridní vyhledávač s lokálním indexem"
+long_description = """
+Mini Search crawluje weby, sitemapy, RSS/Atom a českou Wikipedii do SQLite
+s FTS5 a hledá hybridně (fulltext + volitelně vektorově). Běží celý v zařízení,
+bez účtu a bez cloudu.
+"""
+sources = ["src/minisearch"]
+requires = [
+    "flask",
+    "requests",
+    "beautifulsoup4",
+    "lxml",
+    "feedparser",
+    "apscheduler",
+    "markupsafe",
+]
+test_sources = ["tests"]
+
+[tool.briefcase.app.minisearch.iOS]
+requires = []
+# iOS sandbox: the server binds to loopback only and the WebView loads it.
+info = { NSLocalNetworkUsageDescription = "Mini Search indexuje weby ve vaší lokální síti, když to výslovně zadáte." }

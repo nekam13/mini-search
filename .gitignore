@@ -22,3 +22,13 @@ data/
 # get the real file; otherwise only a small pointer is fetched. It is also
 # reproducible with `cd android && ./gradlew :app:assembleDebug`.
 nohup.out
+
+# Desktop packaging: keep the sources, drop intermediate build trees and the
+# downloaded appimagetool cache. The final dist/ artefacts are committed so the
+# built packages are part of the deliverable.
+packaging/**/build/
+packaging/**/.cache/
+packaging/**/pyinstaller-work/
+packaging/ios/src/minisearch/app_combined.py
+packaging/ios/src/minisearch/templates/
+packaging/ios/src/minisearch/static/

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>cz.minisearch.MiniSearch.desktop</id>
+  <name>Mini Search</name>
+  <summary>Hybridní vyhledávač s lokálním indexem</summary>
+  <summary xml:lang="en">Hybrid search engine with a local index</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Mini Search je lokální vyhledávač: crawluje weby, sitemapy, RSS/Atom a
+      českou Wikipedii, ukládá je do SQLite s FTS5 a hledá hybridně (fulltext +
+      volitelně vektorově). Běží celý na vašem počítači, bez účtu a bez cloudu.
+    </p>
+    <p xml:lang="en">
+      Mini Search is a local search engine: it crawls sites, sitemaps, RSS/Atom
+      feeds and Czech Wikipedia into SQLite with FTS5 and searches them
+      hybridly (full-text plus optional vectors). Everything runs on your own
+      machine, with no account and no cloud.
+    </p>
+  </description>
+  <launchable type="desktop-id">mini-search.desktop</launchable>
+  <url type="homepage">https://github.com/nekam13/mini-search</url>
+  <provides>
+    <binary>mini-search</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

@@ -6,8 +6,9 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`7996c3e`** (`Android 7.9: nativní Clay UI,
-  souběžné čtení a nové APK`)
+- Zdrojový commit obou APK: **`b961309`** (`Document the x86_64 emulator build
+  and the UI test split`) — obě APK byla v rámci tohoto cyklu znovu sestavena
+  z těchto zdrojů (`--rerun-tasks`, 48/48 úloh) a znovu otestována.
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
@@ -24,8 +25,15 @@ provedeným krokům; nic není odhad ani ukázka.
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.9-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 214 586 B (~136,6 MiB) | `f9e3586d27e5a0f3cb6701e1b738bf29b53dd27c93ad4c452d5e71e9c3e3a2ab` |
-| `mini-search-7.9-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 579 557 B (~62,5 MiB) | `7a7ad75e7fe7b35712143c37c8c75b086ac15c50496e2d73f25a9095724ddeb3` |
+| `mini-search-7.9-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 214 586 B (~136,6 MiB) | `ad39dbaeb78c7064fdca7091983452e722fdf9760044d2b802e4284f6758c8ab` |
+| `mini-search-7.9-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 579 917 B (~62,5 MiB) | `e2eccaf49e51c4045616fad77f607bd0683211c84f61575b4d0e1ec8c9071f31` |
+
+> Poznámka k opakovatelnosti: SHA-256 se mezi jednotlivými buildy **liší**, i
+> když je obsah shodný — ZIP záznamy nesou časové značky a `classes*.dex` nese
+> D8 checksum tabulku. Podstatné je, že se v obou variantách nemění zabalený
+> model (přesně `783fea82…`, shodný s připnutou hodnotou v `build.gradle`),
+> tokenizer, `templates/`+`static/` v `app.imy` a přeložené moduly. Obsahová
+> reprodukovatelnost je ověřená, bit-identická nikoli (viz § 8).
 
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 5`, `versionName = 7.9`, `minSdk = 30`, `targetSdk = 34`,
@@ -168,9 +176,10 @@ Zachované vlastnosti z předchozí dodávky:
 
 ## 3. Výsledky testů (skutečně spuštěné)
 
-### Backendové testy (všech 18 skriptů)
+### Backendové testy (všech 19 skriptů)
 
-Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exit 0):
+Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exit 0)
+(znovu ověřeno v tomto cyklu na commitu `b961309`):
 
 | Skript | PASS |
 |---|---|
@@ -192,11 +201,18 @@ Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exi
 | `test_lifecycle.py` | 42 |
 | `test_android_compat.py` | 5 |
 | `test_lan_share.py` | 31 |
+| `test_desktop_launcher.py` | 19 (desktop start/readiness/stop/restart) |
 
 Testy životního cyklu (`test_lifecycle.py`) pokrývají start → `RUNNING` až po
 `/health`, opakovaný start jako no-op bez druhého serveru/scheduleru/workerů,
 stop a restart ve stejném procesu, zachování dat, oddělení vektorových prostorů
 a obnovu přerušené fronty.
+
+Nový `test_desktop_launcher.py` (19 testů) ověřuje desktopový launcher
+(`desktop/launcher.py`) proti skutečnému backendu na loopbacku: volbu privátního
+datového adresáře, zapojení prostředí (DB v datovém adresáři, vypnutá autoupdate,
+lowmem), start → `RUNNING` až po HTTP `/health`, stop a restart ve stejném
+procesu bez duplicitních workerů. Podrobnosti v `DODANI-DESKTOP.md`.
 
 Nový `test_android_compat.py` (5 testů) ověřuje přesně to, co je specifické pro
 Android: detekci FTS5, fallback tabulku s triggery, skládání diakritiky v LIKE
@@ -213,7 +229,8 @@ LAN adresu.
 ### Android JVM testy
 
 `./gradlew :app:testDebugUnitTest` – `SpmTokenizerTest` (6 testů) a
-`EmbeddingBridgeTest` (1 test), **7 testů, 0 selhání, 0 přeskočeno**. Ověřují
+`EmbeddingBridgeTest` (1 test), **7 testů, 0 selhání, 0 přeskočeno** (znovu
+ověřeno v tomto cyklu na commitu `b961309`). Ověřují
 shodu tokenizeru s referencí a embedding výstupu (mean pooling, L2 normalizace)
 proti referenčním vektorům `sentence-transformers` na českých textech.
 
@@ -221,8 +238,9 @@ proti referenčním vektorům `sentence-transformers` na českých textech.
 
 `./gradlew :app:connectedDebugAndroidTest` (ekvivalentně `adb shell am instrument
 -w cz.minisearch.app.test/androidx.test.runner.AndroidJUnitRunner`) na emulátoru
-`msx(AVD) - 14`: **12 testů, 0 selhání** (úspěšný běh na odevzdaném `arm64-v8a`
-APK). Tvoří je `ServerSmokeTest` (8) a `MainActivityUiTest` (4).
+`msx(AVD) - 14`: **12 testů, 0 selhání** (znovu spuštěno v tomto cyklu na
+nově sestaveném `arm64-v8a` APK z commitu `b961309`; tvoří je `ServerSmokeTest`
+(8) a `MainActivityUiTest` (4)).
 
 `ServerSmokeTest.kt` spouští skutečný Chaquopy backend a ověřuje:
 
@@ -333,7 +351,7 @@ oprav a bez absolutních cest v repu.
 - V malé variantě model **není**, tokenizer ano.
 - `templates/` a `static/` jsou zabalené v `app.imy` (`templates/search.html`,
   `templates/base_clay.html`, `static/css/clay.css`, `static/js/search.js`).
-- 18 backendových sad, 7 JVM testů a 12 instrumentačních testů prochází.
+- 19 backendových sad, 7 JVM testů a 12 instrumentačních testů prochází.
 - **Nativní UI na odevzdaném `arm64-v8a` APK.** `MainActivityUiTest` ověřil na
   zařízení, že existují čtyři záložky s českými popisky a že přepnutí na Správu
   schová Domů a zobrazí webový kontejner; dialogy `confirm()`/`alert()`
