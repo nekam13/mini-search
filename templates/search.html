@@ -2,6 +2,9 @@
 {% block title %}{% if query %}{{ query }}{% else %}Vyhledávání{% endif %}{% endblock %}
 {% block layout_class %}layout-narrow{% endblock %}
 {% block subtitle %}Vyhledávání v lokálním indexu{% endblock %}
+{% block topnav %}
+<a href="/" class="{% if active_page == 'search' %}active{% endif %}">Vyhledávání</a>
+{% endblock %}
 {% block extra_css %}<link rel="stylesheet" href="{{ url_for('static', filename='css/search.css') }}">{% endblock %}
 {% block footer %}Mini Search v7.3{% if query %} · {{ total_results }} {{ total_results|plural_cz('výsledek', 'výsledky', 'výsledků') }} v indexu{% endif %}{% endblock %}
 
@@ -9,9 +12,6 @@
 <div class="hero">
     {% if not query %}<h2>Co chcete najít?</h2>{% endif %}
     <p>Prohledávejte lokálně indexované stránky přirozeným jazykem, česky i v dalších jazycích.</p>
-
-    {% if public_message %}<div class="msg msg-ok">{{ public_message }}</div>{% endif %}
-    {% if public_error %}<div class="msg msg-err">{{ public_error }}</div>{% endif %}
 
     <form id="searchForm" action="/" method="get" role="search">
         <input type="hidden" name="filter" id="filterInput" value="{{ current_filter }}">
@@ -186,11 +186,10 @@
             {% if current_filter == 'images' %}
             Pro „{{ query }}“ se nenašly žádné obrázky. Zkuste jiný výraz nebo jiný filtr.
             {% else %}
-            Pro „{{ query }}“ se nic nenašlo. Zkuste jiný výraz nebo přidejte zdroje ve správě.
+            Pro „{{ query }}“ se nic nenašlo. Zkuste jiný výraz.
             {% endif %}
         </p>
         <div class="actions">
-            <a href="/admin/sources/new" class="btn btn-secondary">Přidat zdroj</a>
             <a href="/" class="btn btn-ghost">Zrušit hledání</a>
         </div>
     </div>
@@ -255,22 +254,6 @@
 {% endif %}
 
 <div class="card card-static">
-    <div class="card-header"><h2>Přidat zdroj</h2></div>
-    <p class="hint">
-        Vložte adresu webu, konkrétní stránky, sitemapy nebo RSS/Atom feedu.
-        Typ se rozpozná automaticky a indexace začne na pozadí.
-    </p>
-    <form method="post" action="/add" class="public-add-form">
-        <div class="search-row">
-            <input type="text" name="url" inputmode="url" autocomplete="off"
-                   placeholder="https://example.com nebo example.com/feed"
-                   aria-label="Adresa zdroje">
-            <button type="submit" class="btn btn-primary">Přidat a indexovat</button>
-        </div>
-    </form>
-</div>
-
-<div class="card card-static">
     <div class="empty-state" style="padding-bottom:10px">
         <div class="icon">⌕</div>
         <h3>Zadejte dotaz</h3>
@@ -286,11 +269,6 @@
             <div class="tip-icon" aria-hidden="true">≡</div>
             <strong>Využijte filtry</strong>
             Omezte výsledky na články, podcasty, audio nebo stránky s cenami.
-        </div>
-        <div class="tip">
-            <div class="tip-icon" aria-hidden="true">⚙</div>
-            <strong>Spravujte zdroje</strong>
-            Domény, konkrétní URL, sitemapy a feedy přidáte v <a href="/admin/sources/new">správě zdrojů</a>.
         </div>
     </div>
 </div>

@@ -353,6 +353,23 @@ scheduler only registers a job when its interval is non-zero.
   (hashed folded tokens, unit-normalised) so vector search still works at low
   quality; the real model is always preferred. `get_model()` returns `None` only
   when numpy itself is missing. Tests must not assume a real model is present.
+  A failed load is remembered for `MODEL_RETRY_COOLDOWN` only (not forever): the
+  Android ONNX bridge is often not ready on the very first call, and latching
+  the fallback for the whole process would silently downgrade semantic search.
+- **Embedding-space recovery.** Vector search only compares rows whose
+  `embedding_space` equals `active_embedding_space()`. A backend switch (hash
+  fallback <-> real model) or an upgrade that stamped untagged vectors with the
+  historical hash space therefore leaves semantic search empty until the rows
+  are re-embedded. `_migrate_db` stamps untagged rows with `HASH_EMBEDDING_SPACE`
+  (their true origin — a 384-dim hash vector is indistinguishable from a
+  MiniLM one), and two helpers repair the index instead of leaving it dead:
+  `startup_embedding_recovery()` (kicked from `start_server` and from
+  `maybe_start_embedding_recovery()` on the `vector_search` hot path, once per
+  space per process) re-embeds a bounded `STARTUP_EMBED_RECOVERY_BATCH` of stale
+  rows via `maintenance_backfill_embeddings()`. Recovery only runs when the
+  active backend is a *real* model (`_active_backend_is_real()`), never the hash
+  fallback, so a momentarily-unavailable model can never overwrite good
+  real-model vectors with hash ones. `tests/test_ai_recovery.py` pins this.
 - Expected console noise: `Model nelze nacist: ...` and `FTS5 table backfilled ...`.
 - Existing databases are migrated in place; never drop `console.db`. Migration
   runs automatically inside `get_db()` and `run_self_migration()` only deletes a
@@ -376,23 +393,32 @@ scheduler only registers a job when its interval is non-zero.
 ## Android APK (`android/`)
 
 An APK bundles the same `app_combined.py` server via Chaquopy (Python 3.13) and
-shows it in a **native Czech UI** (Home / Search / Admin / Settings tabs); the
-Search and Admin tabs embed the local server in a locked-down WebView, while
-Home and Settings are pure Android views. It does **not** need Termux, root or a
-separate Python. `android_entry.py` is the Python entry point (sets
-lowmem/loopback env, calls `start_server()`/`stop_server()`, exposes
-`settings_json()`/`save_settings_json()`); Kotlin `PythonRuntime` starts the
-interpreter exactly once per process and `ServerController` + `ServerService`
-own the lifecycle. Build with `cd android && ./gradlew :app:assembleDebug`.
+shows it in a **native Czech UI** (Home / Search / Sources / Admin / Settings
+tabs); only the Search and Admin tabs embed the local server in a locked-down
+WebView, while Home, Sources and Settings are pure Android views. It does **not**
+need Termux, root or a separate Python. `android_entry.py` is the Python entry
+point (sets lowmem/loopback env, calls `start_server()`/`stop_server()`, exposes
+`settings_json()`/`save_settings_json()` and the source bridges); Kotlin
+`PythonRuntime` starts the interpreter exactly once per process and
+`ServerController` + `ServerService` own the lifecycle. Build with
+`cd android && ./gradlew :app:assembleDebug`.
 
 Facts to preserve:
 
 - **Native UI + single source of truth.** The Settings screen renders whatever
   `android_entry.settings_json()` returns from `SETTINGS_SPEC`; never add a
-  second, unsynchronised config in Kotlin. `MainActivity` builds the WebView
-  lazily (first time the Search/Admin tab opens) so `onCreate` does not delay
-  the foreground service, and `WebChromeClient` turns `confirm()`/`alert()` into
-  native dialogs (`MainActivity.buildJsDialog`, covered by `MainActivityUiTest`).
+  second, unsynchronised config in Kotlin. Adding and managing sources is a
+  *native* screen (the „Zdroje" tab, `view_sources.xml` + `MainActivity`), not
+  the public web page and not the admin WebView: it calls
+  `android_entry.sources_json()` / `add_source_json()` / `delete_source_json()`
+  / `recrawl_source_json()`, which reuse `get_all_sources()`, `add_source()`,
+  `delete_source()` and `recrawl_async()` so `site_sources` stays the only
+  source of truth. The public `/` page offers **no** add-source surface and no
+  admin links (its nav is the `topnav` block override in `search.html`).
+  `MainActivity` builds the WebView lazily (first time the Search/Admin tab
+  opens) so `onCreate` does not delay the foreground service, and
+  `WebChromeClient` turns `confirm()`/`alert()` into native dialogs
+  (`MainActivity.buildJsDialog`, covered by `MainActivityUiTest`).
 - **Lifecycle states** are real: `STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/
   `ERROR`. `RUNNING` is only set after a successful HTTP `/health` probe, never
   just because a thread was spawned; `start` is idempotent (rotation/repeat

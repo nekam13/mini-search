@@ -14,6 +14,19 @@
         android:padding="6dp"
         android:gravity="center_vertical">
 
+        <!-- The tab strip scrolls horizontally so five tabs plus the pinned
+             "Import dumpu" action never overflow a narrow phone screen. -->
+        <HorizontalScrollView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
         <Button
             android:id="@+id/tab_home"
             style="?android:attr/borderlessButtonStyle"
@@ -35,6 +48,16 @@
             android:text="@string/tab_search" />
 
         <Button
+            android:id="@+id/tab_sources"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textAllCaps="false"
+            android:background="@drawable/clay_tab"
+            android:textColor="@color/clay_tab_text"
+            android:text="@string/tab_sources" />
+
+        <Button
             android:id="@+id/tab_admin"
             style="?android:attr/borderlessButtonStyle"
             android:layout_width="wrap_content"
@@ -54,10 +77,8 @@
             android:textColor="@color/clay_tab_text"
             android:text="@string/tab_settings" />
 
-        <Space
-            android:layout_width="0dp"
-            android:layout_height="1dp"
-            android:layout_weight="1" />
+            </LinearLayout>
+        </HorizontalScrollView>
 
         <Button
             android:id="@+id/import_dump"
@@ -110,6 +131,11 @@
         <include
             android:id="@+id/settings_view"
             layout="@layout/view_settings"
+            android:visibility="gone" />
+
+        <include
+            android:id="@+id/sources_view"
+            layout="@layout/view_sources"
             android:visibility="gone" />
 
         <!-- The WebView is created programmatically and only when the user

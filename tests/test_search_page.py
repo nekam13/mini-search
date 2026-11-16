@@ -107,7 +107,13 @@ def main():
     resp = client.get("/?q=zzzzneexistuje")
     body = resp.get_data(as_text=True)
     check("empty result state", "Žádné výsledky" in body)
-    check("empty state offers admin link", "/admin/sources/new" in body)
+    # The public page must not expose any source-management surface: adding
+    # sources is an app/admin action, never something the (LAN-shared) public
+    # page offers.
+    check("empty state exposes no admin link",
+          "/admin/sources/new" not in body and "/add" not in body)
+    check("public page has no add-source form",
+          "public-add-form" not in body and "Přidat zdroj" not in body)
 
     # ---- pagination ----
     # 30 extra matches force a second page (SEARCH_PAGE_SIZE is 25).

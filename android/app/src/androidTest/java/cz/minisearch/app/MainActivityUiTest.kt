@@ -45,8 +45,8 @@ class MainActivityUiTest {
     fun nativeTabsArePresentAndSwitchScreens() {
         launch().use { scenario ->
             scenario.onActivity { activity ->
-                // The four Clay tabs must exist and be labelled in Czech.
-                for (id in listOf(R.id.tab_home, R.id.tab_search,
+                // The five Clay tabs must exist and be labelled in Czech.
+                for (id in listOf(R.id.tab_home, R.id.tab_search, R.id.tab_sources,
                                   R.id.tab_admin, R.id.tab_settings)) {
                     val tab = activity.findViewById<Button>(id)
                     assertNotNull("tab $id missing", tab)
@@ -57,6 +57,18 @@ class MainActivityUiTest {
                 assertTrue("home_view should be visible on launch",
                     home.visibility == View.VISIBLE)
 
+                // The native sources screen replaces the admin panel for adding
+                // sources: selecting it shows the native view, not the WebView.
+                val sources = activity.findViewById<View>(R.id.sources_view)
+                activity.findViewById<Button>(R.id.tab_sources).performClick()
+                assertTrue("sources_view should show for the sources tab",
+                    sources.visibility == View.VISIBLE)
+                assertTrue("home_view should hide for the sources tab",
+                    home.visibility == View.GONE)
+                val webHidden = activity.findViewById<View>(R.id.web_container)
+                assertTrue("web_container should stay hidden for the sources tab",
+                    webHidden.visibility == View.GONE)
+
                 // Selecting the Admin tab hides Home and shows the web container.
                 activity.findViewById<Button>(R.id.tab_admin).performClick()
                 val web = activity.findViewById<View>(R.id.web_container)
@@ -64,6 +76,8 @@ class MainActivityUiTest {
                     web.visibility == View.VISIBLE)
                 assertTrue("home_view should hide for the admin tab",
                     home.visibility == View.GONE)
+                assertTrue("sources_view should hide for the admin tab",
+                    sources.visibility == View.GONE)
             }
         }
     }

@@ -247,6 +247,15 @@ EMBED_MIN_FREE_MB = _env_int("MINISEARCH_MIN_FREE_MB", 300, 50, 100000)
 # Below this battery percentage, and while unplugged, automatic mode drops them.
 EMBED_MIN_BATTERY_PCT = _env_int("MINISEARCH_MIN_BATTERY_PCT", 15, 0, 100)
 EMBED_MAX_CHARS = _env_int("MINISEARCH_EMBED_MAX_CHARS", 1000, 100, 8000)
+# How long a failed model load is remembered before it is retried. Without a
+# retry a single early failure (e.g. the Android ONNX bridge not being ready on
+# the very first call) would pin the hash fallback for the whole process.
+MODEL_RETRY_COOLDOWN = _env_int("MINISEARCH_MODEL_RETRY_S", 60, 0, 86400)
+# Startup embedding recovery: how many pages whose vectors belong to an inactive
+# space are re-embedded in the background at start, so semantic search recovers
+# on its own after a backend switch instead of waiting for the nightly job.
+STARTUP_EMBED_RECOVERY_BATCH = _env_int(
+    "MINISEARCH_STARTUP_EMBED_BATCH", 500 if LOW_MEMORY_MODE else 2000, 0, 1000000)
 
 # --- Embedding space identity -------------------------------------------------
 # Vectors from different models are not comparable even when they share a
@@ -690,6 +699,11 @@ _hnsw_index = None
 _hnsw_space = None
 _model = None
 _model_failed = False
+# When the last model load failed, so a retry can be throttled (see get_model).
+_model_failed_at = 0.0
+# Embedding space for which the startup recovery has already been kicked, so the
+# check runs once per space per process instead of on every search.
+_embed_recovery_space = None
 _scheduler = None
 _worker_threads = []
 
@@ -1198,7 +1212,14 @@ def _migrate_db(conn):
         except sqlite3.OperationalError:
             pass
 
-    # Backfill the space tag for rows written before the column existed.
+    # Backfill the space tag for rows written before the column existed. Untagged
+    # vectors have no recorded space, and their dimension (384) is identical for
+    # the hash fallback and the real model, so there is no way to tell them
+    # apart. They are stamped with the historical hash space (what a fallback
+    # install always wrote); if the active space differs, the rows are picked up
+    # by ``startup_embedding_recovery`` and recomputed. Mis-tagging them with the
+    # *active* space instead would risk comparing hash vectors against real-model
+    # queries, which is silently wrong rather than merely empty.
     try:
         cursor.execute(
             "UPDATE pages SET embedding_space = ? "
@@ -2583,50 +2604,6 @@ def _mirror_source_to_legacy(site_id, url, source_type):
         log_error(f"Could not mirror source {url} to sitemaps_feeds", e)
 
 
-def submit_public_source(raw_url):
-    """Register a source from the public page: URL in, indexing started.
-
-    The public form is deliberately minimal — the visitor types an address and
-    the type is detected (sitemap/feed/wiki/domain), the parent domain is
-    created if new, and indexing runs asynchronously so the HTTP request returns
-    at once instead of waiting on robots.txt / sitemap discovery. Returns
-    ``(ok, message)``.
-    """
-    value = (raw_url or '').strip()
-    if not value:
-        return False, 'Zadejte adresu webu nebo zdroje.'
-
-    source_type = detect_source_type(value, fallback='url')
-    is_wiki = source_type == WIKI_SOURCE_TYPE
-    if is_wiki:
-        site_url, _importer, _lang = normalize_wiki_source(value)
-        if not site_url:
-            return False, 'Neplatný odkaz na Wikipedii.'
-        value = site_url
-    else:
-        ok, message = validate_url(value)
-        if not ok:
-            return False, message
-        value = normalize_url(value)
-
-    # ``add_site`` accepts a full URL and stores the canonical domain, so a
-    # sitemap/feed lands under the same domain as its site.
-    site_id = add_site(value, is_local=False if is_wiki else None)
-    if not site_id:
-        return False, 'Doménu se nepodařilo založit.'
-
-    source_id, error = add_source(site_id, value, source_type=source_type)
-    if source_id is None:
-        # Already registered is not a failure for the visitor: the site is
-        # there and indexing, which is what they asked for.
-        if error and 'již' in error:
-            return True, 'Tento zdroj je již zaregistrovaný a průběžně se indexuje.'
-        return False, error or 'Zdroj se nepodařilo přidat.'
-
-    index_source_async(source_id)
-    return True, 'Zdroj byl přidán a indexace běží na pozadí.'
-
-
 def update_source(source_id, **kwargs):
     """Update fields of a source. Returns (ok, message)."""
     source = get_source_by_id(source_id)
@@ -3812,21 +3789,31 @@ def get_model():
     the desktop ``sentence-transformers`` model, then :class:`_HashingEmbedding`
     as a clearly-labelled fallback. Returns ``None`` only when the numpy stack
     itself is unavailable.
+
+    A failed load is remembered for ``MODEL_RETRY_COOLDOWN`` only, not forever:
+    on Android the ONNX bridge is often not ready on the very first call (the
+    interpreter starts before ``EmbeddingBridge.setContext`` runs), and latching
+    the hash fallback for the whole process would silently downgrade semantic
+    search until the next restart.
     """
-    global _model, _model_failed
+    global _model, _model_failed, _model_failed_at
     if _model is not None:
         return _model
-    if _model_failed:
-        return _HashingEmbedding() if np is not None else None
     if EMBEDDING_BACKEND == 'off':
         _model_failed = True
+        _model_failed_at = time.time()
         return None
+    if _model_failed and (time.time() - _model_failed_at) < MODEL_RETRY_COOLDOWN:
+        return _HashingEmbedding() if np is not None else None
     model = _android_onnx_model() or _sentence_transformer_model()
     if model is not None:
         _model = model
+        _model_failed = False
         return _model
-    print("Reálný model není k dispozici (fallback: lokalni hashovaci embedding)")
+    if not _model_failed:
+        print("Reálný model není k dispozici (fallback: lokalni hashovaci embedding)")
     _model_failed = True
+    _model_failed_at = time.time()
     return _HashingEmbedding() if np is not None else None
 
 
@@ -4066,6 +4053,15 @@ def vector_search(query, limit=25, filter_type=None):
     Returns ``[]`` when embeddings are disabled (low-memory mode) so
     :func:`hybrid_search` silently falls back to full-text search.
     """
+    # A space change (backend switch, or an upgrade that stamped vectors with
+    # the wrong space) makes the stored vectors unusable; kick a bounded
+    # re-embed in the background so the *next* search is semantic again instead
+    # of silently FTS-only. Guarded to fire once per space per process. This
+    # must run before the "empty index" early return below, because an index
+    # that is empty *because* of the space mismatch is precisely the case it
+    # exists to heal.
+    maybe_start_embedding_recovery()
+
     idx = get_hnsw_index()
     if idx is not None and idx.element_count == 0:
         return []
@@ -6302,6 +6298,108 @@ def maintenance_backfill_embeddings(batch=None):
     return done
 
 
+def _stale_embedding_count():
+    """Rows whose stored vector does not belong to the active embedding space.
+
+    Covers both ``embedding IS NULL`` (never computed) and a vector tagged with
+    a different space (a backend switch), which vector search ignores.
+    """
+    try:
+        space = active_embedding_space()
+    except Exception:
+        return 0
+    try:
+        row = execute_db_fetchone(
+            """SELECT COUNT(*) FROM pages
+               WHERE embedding IS NULL OR embedding_space IS NULL OR embedding_space != ?""",
+            (space,)
+        )
+    except Exception:
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _active_backend_is_real():
+    """True when the active embedder is a real model, not the hash fallback.
+
+    Automatic re-embedding is only safe in the *upgrade* direction (hash vectors
+    replaced by real-model vectors). Re-embedding real-model vectors as hash
+    would destroy a good index just because the model was momentarily
+    unavailable, so the recovery helpers refuse to run for the fallback.
+    """
+    if not embeddings_enabled():
+        return False
+    model = get_model()
+    return bool(model is not None and getattr(model, 'is_real_model', False))
+
+
+def startup_embedding_recovery():
+    """Re-embed a bounded batch of stale vectors in the background at start.
+
+    Vector search only compares rows whose ``embedding_space`` matches the
+    active space, so a backend switch (or an upgrade that stamped vectors with
+    the wrong space) leaves semantic search empty until something re-embeds the
+    rows. The nightly maintenance does that, but it is off by default in the
+    APK, so a phone would silently lose semantic search until the next night.
+
+    This runs once per start, in a daemon thread, and only when there is stale
+    work and embeddings are allowed, so it never delays readiness and never
+    fights the resource gates. The batch is capped; anything left over is picked
+    up by the next start or the nightly pass. Returns the number re-embedded.
+    """
+    if STARTUP_EMBED_RECOVERY_BATCH <= 0:
+        return 0
+    if not _active_backend_is_real():
+        return 0
+    global _embed_recovery_space
+    _embed_recovery_space = active_embedding_space()
+    if _stale_embedding_count() == 0:
+        return 0
+    done = maintenance_backfill_embeddings(batch=STARTUP_EMBED_RECOVERY_BATCH)
+    if done:
+        maintenance_log(
+            f"startup embedding recovery: znovu spočítáno {done} vektorů "
+            f"(aktivní prostor {active_embedding_space()})"
+        )
+    return done
+
+
+def start_embedding_recovery_async():
+    """Kick ``startup_embedding_recovery`` on a daemon thread (best effort)."""
+    def _run():
+        try:
+            startup_embedding_recovery()
+        except Exception as e:  # pragma: no cover - background best effort
+            log_error("Startup embedding recovery failed", e)
+
+    threading.Thread(target=_run, name="minisearch-embed-recovery",
+                     daemon=True).start()
+
+
+def maybe_start_embedding_recovery():
+    """Start recovery once per active space, from the search hot path.
+
+    The startup kick in :func:`start_server` misses one real case: on Android the
+    real model can become available *after* start (the ONNX bridge is not ready
+    during the first ``get_model``), so the space that needs recovering is not
+    the one that existed at boot. Checking here — on a search, where a
+    mismatched space is exactly what makes results empty — covers that without a
+    timer. It is guarded so it fires at most once per space per process.
+    """
+    global _embed_recovery_space
+    try:
+        space = active_embedding_space()
+    except Exception:
+        return
+    if not space or space == _embed_recovery_space:
+        return
+    if _stale_embedding_count() == 0:
+        _embed_recovery_space = space
+        return
+    _embed_recovery_space = space
+    start_embedding_recovery_async()
+
+
 def maintenance_import_wiki(max_pages=None):
     """Continue any configured wiki source for a bounded number of articles.
 
@@ -7186,23 +7284,7 @@ def search_index():
         page=page,
         has_prev=page > 1,
         has_next=has_next,
-        public_message=request.args.get('ok', ''),
-        public_error=request.args.get('error', ''),
     )
-
-
-@app.route('/add', methods=['POST'])
-def public_add_source():
-    """Public, minimal "add a source" form: a URL in, indexing started.
-
-    Deliberately simpler than the admin panel — no type, no priority, no
-    domain picker. The type is detected from the address and indexing runs in
-    the background, so the visitor is never left waiting on a crawl. This is the
-    only mutating route the shared (LAN) page exposes; admin stays loopback-only.
-    """
-    ok, message = submit_public_source(request.form.get('url', ''))
-    key = 'ok' if ok else 'error'
-    return redirect('/?' + urlencode({key: message}))
 
 
 @app.route('/autocomplete')
@@ -7991,6 +8073,11 @@ def start_server(host=None, port=None, block=False):
             print('hnswlib index initialized')
         if embeddings_enabled() and get_model() is not None:
             print(f'Model loaded ({embedding_backend_label()})')
+            # A backend switch (or an upgrade that stamped vectors with the
+            # wrong space) leaves semantic search empty until the rows are
+            # re-embedded; do that in the background so it recovers on its own
+            # instead of waiting for the nightly job (off by default in the APK).
+            start_embedding_recovery_async()
         else:
             print('Embeddings off - FTS5 fallback active (crawling unaffected)')
 

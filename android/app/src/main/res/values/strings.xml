@@ -2,6 +2,7 @@
     <string name="app_name">Mini Search</string>
     <string name="tab_home">Domů</string>
     <string name="tab_search">Vyhledávač</string>
+    <string name="tab_sources">Zdroje</string>
     <string name="tab_admin">Správa</string>
     <string name="tab_settings">Nastavení</string>
     <string name="action_stop">Zastavit</string>
@@ -39,7 +40,7 @@
     <string name="home_actions_title">Akce</string>
     <string name="home_battery_note">Server běží na pozadí jako foreground služba. Nepřetržitý provoz spotřebovává baterii a data; pokud vyhledávač nepotřebujete, zastavte jej tlačítkem Zastavit. Systém může proces při nedostatku paměti ukončit i tak – po návratu do aplikace se server znovu připraví.</string>
     <string name="home_lan_title">Sdílení ve veřejné síti</string>
-    <string name="home_lan_note">Webové rozhraní (vyhledávání, novinky a přidání zdroje) se zpřístupní na adrese níže pro ostatní zařízení ve stejné síti. Administrace zůstává dostupná jen v tomto zařízení.</string>
+    <string name="home_lan_note">Vyhledávání (a novinky v indexu) se zpřístupní na adrese níže pro ostatní zařízení ve stejné síti. Zdroje se přidávají v aplikaci, administrace zůstává dostupná jen v tomto zařízení.</string>
     <string name="home_web_note">Webové rozhraní běží na 127.0.0.1 a je dostupné jen v tomto zařízení.</string>
     <string name="home_copy">Kopírovat adresu</string>
     <string name="home_copied">Adresa zkopírována do schránky.</string>
@@ -61,4 +62,27 @@
     <string name="settings_choice_on">zapnuto</string>
     <string name="settings_choice_off">vypnuto</string>
     <string name="settings_load_error">Nastavení se nepodařilo načíst: %1$s</string>
+
+    <!-- Native sources screen -->
+    <string name="sources_title">Zdroje</string>
+    <string name="sources_note">Přidávejte a spravujte zdroje přímo v aplikaci. Typ zdroje se rozpozná automaticky z adresy a indexace začne na pozadí.</string>
+    <string name="sources_url_hint">https://example.com nebo example.com/feed</string>
+    <string name="sources_type_label">Typ zdroje</string>
+    <string name="sources_add">Přidat a indexovat</string>
+    <string name="sources_empty">Zatím žádné zdroje. Přidejte první adresu výše.</string>
+    <string name="sources_load_error">Zdroje se nepodařilo načíst: %1$s</string>
+    <string name="sources_added">Zdroj přidán.</string>
+    <string name="sources_deleted">Zdroj smazán.</string>
+    <string name="sources_recrawl">Re-crawl</string>
+    <string name="sources_delete">Smazat</string>
+    <string name="sources_delete_confirm">Smazat zdroj „%1$s“? U domény se smaže celý web i jeho indexované stránky.</string>
+    <string name="sources_error">Operace se nezdařila: %1$s</string>
+    <string name="sources_need_running">Nejdřív spusťte server.</string>
+    <string name="sources_type_auto">automaticky</string>
+    <string name="sources_type_domain">celý web (doména)</string>
+    <string name="sources_type_url">konkrétní stránka</string>
+    <string name="sources_type_sitemap">sitemap</string>
+    <string name="sources_type_rss">RSS/Atom feed</string>
+    <string name="sources_type_wiki">Wikipedie</string>
+    <string name="sources_last_checked">Naposledy zkontrolováno: %1$s</string>
 </resources>

@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webContainer: android.widget.FrameLayout
     private lateinit var homeView: View
     private lateinit var settingsView: View
+    private lateinit var sourcesView: View
     private lateinit var status: TextView
     private lateinit var retry: Button
 
@@ -76,6 +77,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var settingsStatus: TextView
     private lateinit var settingsSave: Button
     private lateinit var settingsReset: Button
+
+    // Sources screen widgets
+    private lateinit var sourceList: LinearLayout
+    private lateinit var sourceStatus: TextView
+    private lateinit var sourceUrl: EditText
+    private lateinit var sourceType: Spinner
+    private lateinit var sourceAdd: Button
 
     private val tabs = mutableMapOf<Int, Button>()
     private var currentTab = R.id.tab_home
@@ -109,6 +117,7 @@ class MainActivity : AppCompatActivity() {
         webContainer = findViewById(R.id.web_container)
         homeView = findViewById(R.id.home_view)
         settingsView = findViewById(R.id.settings_view)
+        sourcesView = findViewById(R.id.sources_view)
         status = findViewById(R.id.status)
         retry = findViewById(R.id.retry)
 
@@ -124,14 +133,22 @@ class MainActivity : AppCompatActivity() {
         settingsSave = findViewById(R.id.settings_save)
         settingsReset = findViewById(R.id.settings_reset)
 
+        sourceList = findViewById(R.id.source_list)
+        sourceStatus = findViewById(R.id.source_status)
+        sourceUrl = findViewById(R.id.source_url)
+        sourceType = findViewById(R.id.source_type)
+        sourceAdd = findViewById(R.id.source_add)
+
         tabs[R.id.tab_home] = findViewById(R.id.tab_home)
         tabs[R.id.tab_search] = findViewById(R.id.tab_search)
+        tabs[R.id.tab_sources] = findViewById(R.id.tab_sources)
         tabs[R.id.tab_admin] = findViewById(R.id.tab_admin)
         tabs[R.id.tab_settings] = findViewById(R.id.tab_settings)
 
         wireTabs()
         wireHome()
         wireSettings()
+        wireSources()
 
         findViewById<Button>(R.id.import_dump).setOnClickListener { pickDump() }
         retry.setOnClickListener {
@@ -168,6 +185,7 @@ class MainActivity : AppCompatActivity() {
         }
         homeView.visibility = if (id == R.id.tab_home) View.VISIBLE else View.GONE
         settingsView.visibility = if (id == R.id.tab_settings) View.VISIBLE else View.GONE
+        sourcesView.visibility = if (id == R.id.tab_sources) View.VISIBLE else View.GONE
         val webTab = id == R.id.tab_search || id == R.id.tab_admin
         webContainer.visibility = if (webTab) View.VISIBLE else View.GONE
 
@@ -182,6 +200,7 @@ class MainActivity : AppCompatActivity() {
                 ensureWebView()
                 if (ServerController.state == ServerState.RUNNING) load("${ServerController.BASE_URL}admin")
             }
+            R.id.tab_sources -> loadSources()
             R.id.tab_settings -> loadSettings()
         }
     }
@@ -475,6 +494,229 @@ class MainActivity : AppCompatActivity() {
         settingsStatus.visibility = View.VISIBLE
     }
 
+    // ------------------------------------------------------------- sources ----
+
+    private fun wireSources() {
+        val labels = listOf(
+            getString(R.string.sources_type_auto),
+            getString(R.string.sources_type_domain),
+            getString(R.string.sources_type_url),
+            getString(R.string.sources_type_sitemap),
+            getString(R.string.sources_type_rss),
+            getString(R.string.sources_type_wiki))
+        sourceType.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, labels)
+        sourceAdd.setOnClickListener { addSource() }
+    }
+
+    /** The backend source-type value matching the spinner position. */
+    private fun selectedSourceType(): String = when (sourceType.selectedItemPosition) {
+        1 -> "domain"
+        2 -> "url"
+        3 -> "sitemap"
+        4 -> "rss"
+        5 -> "wiki"
+        else -> "auto"
+    }
+
+    private fun loadSources() {
+        if (ServerController.state != ServerState.RUNNING) {
+            renderSources(JSONArray())
+            showSourceStatus(getString(R.string.sources_need_running), false)
+            return
+        }
+        sourceAdd.isEnabled = false
+        ServerController.loadSources { json, error ->
+            runOnUiThread {
+                sourceAdd.isEnabled = true
+                if (error != null || json == null) {
+                    renderSources(JSONArray())
+                    showSourceStatus(
+                        getString(R.string.sources_load_error, error ?: ""), false)
+                    return@runOnUiThread
+                }
+                try {
+                    val obj = JSONObject(json)
+                    if (obj.has("error")) {
+                        renderSources(JSONArray())
+                        showSourceStatus(getString(
+                            R.string.sources_load_error, obj.optString("error")), false)
+                    } else {
+                        renderSources(obj.optJSONArray("sources") ?: JSONArray())
+                    }
+                } catch (t: Throwable) {
+                    renderSources(JSONArray())
+                    showSourceStatus(getString(
+                        R.string.sources_load_error, t.message ?: ""), false)
+                }
+            }
+        }
+    }
+
+    private fun addSource() {
+        val url = sourceUrl.text.toString().trim()
+        if (url.isEmpty()) {
+            showSourceStatus(getString(R.string.sources_error, ""), false)
+            return
+        }
+        if (ServerController.state != ServerState.RUNNING) {
+            showSourceStatus(getString(R.string.sources_need_running), false)
+            return
+        }
+        val payload = JSONObject()
+        payload.put("url", url)
+        payload.put("type", selectedSourceType())
+        sourceAdd.isEnabled = false
+        showSourceStatus(getString(R.string.sources_add) + "…", true)
+        ServerController.addSource(payload.toString()) { message, error ->
+            runOnUiThread {
+                sourceAdd.isEnabled = true
+                if (error != null) {
+                    showSourceStatus(getString(R.string.sources_error, error), false)
+                } else {
+                    sourceUrl.setText("")
+                    showSourceStatus(message ?: getString(R.string.sources_added), true)
+                    loadSources()
+                }
+            }
+        }
+    }
+
+    private fun deleteSource(id: Int, label: String) {
+        AlertDialog.Builder(this)
+            .setMessage(getString(R.string.sources_delete_confirm, label))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                ServerController.deleteSource(id) { message, error ->
+                    runOnUiThread {
+                        if (error != null) {
+                            showSourceStatus(getString(R.string.sources_error, error), false)
+                        } else {
+                            showSourceStatus(
+                                message ?: getString(R.string.sources_deleted), true)
+                            loadSources()
+                        }
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun recrawlSource(id: Int) {
+        ServerController.recrawlSource(id) { message, error ->
+            runOnUiThread {
+                if (error != null) {
+                    showSourceStatus(getString(R.string.sources_error, error), false)
+                } else {
+                    showSourceStatus(message ?: "", true)
+                }
+            }
+        }
+    }
+
+    /** Render one card per source, built from the backend JSON. */
+    private fun renderSources(sources: JSONArray) {
+        sourceList.removeAllViews()
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+
+        if (sources.length() == 0) {
+            sourceList.addView(TextView(this).apply {
+                text = getString(R.string.sources_empty)
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 14f
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+            })
+            return
+        }
+
+        for (i in 0 until sources.length()) {
+            val source = sources.getJSONObject(i)
+            val id = source.optInt("id", -1)
+            val url = source.optString("url")
+            val domain = source.optString("domain")
+            val type = source.optString("type")
+            val lastChecked = source.optString("last_checked")
+
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundResource(R.drawable.clay_card)
+                setPadding(dp(18), dp(14), dp(18), dp(14))
+                val lp = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                lp.bottomMargin = dp(10)
+                layoutParams = lp
+            }
+
+            card.addView(TextView(this).apply {
+                text = if (domain.isNotEmpty()) domain else url
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                textSize = 15f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            card.addView(TextView(this).apply {
+                text = sourceTypeLabel(type) + "\n" + url
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 12f
+                setPadding(0, dp(2), 0, 0)
+            })
+            if (lastChecked.isNotEmpty()) {
+                card.addView(TextView(this).apply {
+                    text = getString(R.string.sources_last_checked, lastChecked)
+                    setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                    textSize = 12f
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }
+
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+            }
+            actions.addView(Button(this).apply {
+                text = getString(R.string.sources_recrawl)
+                isAllCaps = false
+                setBackgroundResource(R.drawable.clay_btn_ghost)
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                setOnClickListener { recrawlSource(id) }
+            })
+            actions.addView(Button(this).apply {
+                text = getString(R.string.sources_delete)
+                isAllCaps = false
+                setBackgroundResource(R.drawable.clay_btn_danger)
+                setTextColor(android.graphics.Color.WHITE)
+                setOnClickListener {
+                    deleteSource(id, if (domain.isNotEmpty()) domain else url)
+                }
+            })
+            card.addView(actions)
+
+            sourceList.addView(card)
+        }
+    }
+
+    private fun sourceTypeLabel(type: String): String = when (type) {
+        "domain" -> getString(R.string.sources_type_domain)
+        "url" -> getString(R.string.sources_type_url)
+        "sitemap" -> getString(R.string.sources_type_sitemap)
+        "rss", "atom", "feed" -> getString(R.string.sources_type_rss)
+        "wiki" -> getString(R.string.sources_type_wiki)
+        else -> type
+    }
+
+    private fun showSourceStatus(text: String, ok: Boolean) {
+        if (text.isEmpty()) {
+            sourceStatus.visibility = View.GONE
+            return
+        }
+        sourceStatus.text = text
+        sourceStatus.setBackgroundResource(
+            if (ok) R.drawable.clay_status_ok else R.drawable.clay_status_err)
+        sourceStatus.setTextColor(ContextCompat.getColor(
+            this, if (ok) R.color.clay_ok_text else R.color.clay_err_text))
+        sourceStatus.visibility = View.VISIBLE
+    }
+
     // ------------------------------------------------------------- webview ----
 
     /**
@@ -670,6 +912,9 @@ class MainActivity : AppCompatActivity() {
                 if ((currentTab == R.id.tab_search || currentTab == R.id.tab_admin) &&
                     (!loadedOnce || web?.url == null)) {
                     load(if (onAdmin) "${ServerController.BASE_URL}admin" else ServerController.BASE_URL)
+                }
+                if (currentTab == R.id.tab_sources) {
+                    loadSources()
                 }
             }
             ServerState.STOPPING -> {

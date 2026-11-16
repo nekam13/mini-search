@@ -3,13 +3,20 @@
 Samostatná aplikace pro Android, která **nevyžaduje Termux**. Server
 (`app_combined.py`) i jeho Python závislosti jsou zabalené přímo v APK pomocí
 [Chaquopy](https://chaquo.com/chaquopy/). Aplikace má **nativní české UI**
-(obrazovky Domů / Hledat / Správa / Nastavení) a ve dvou záložkách (Hledat,
-Správa) zobrazuje lokální server v uzamčeném WebView.
+(obrazovky Domů / Hledat / Zdroje / Správa / Nastavení) a jen ve dvou záložkách
+(Hledat, Správa) zobrazuje lokální server v uzamčeném WebView. Přidávání
+a správa zdrojů je **součástí aplikace** (nativní obrazovka Zdroje), ne webová
+stránka — veřejná stránka `/` žádné přidávání zdrojů nenabízí.
 
 - **Domů** – nativní ovládání serveru: stav (`STOPPED`/`STARTING`/`RUNNING`/
   `STOPPING`/`ERROR`), tlačítka Start / Zastavit / Znovu spustit, přepínač
   „Sdílet v síti" (LAN), zobrazení LAN adresy pro PC a import wiki dumpu.
-- **Hledat** – veřejná stránka `/` v WebView.
+- **Hledat** – veřejná stránka `/` v WebView (jen vyhledávání a novinky).
+- **Zdroje** – nativní obrazovka: přidání zdroje (typ se rozpozná automaticky
+  z adresy), seznam zdrojů s re-crawlem a smazáním. Volá Python přes
+  `android_entry.sources_json()` / `add_source_json()` / `delete_source_json()`
+  / `recrawl_source_json()`, takže platí jediný zdroj pravdy (`site_sources`)
+  a indexace se spouští na pozadí.
 - **Správa** – panel `/admin` v WebView; server poslouchá jen na `127.0.0.1`,
   takže administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`).
   Mutující akce (recrawl, pauza, obnovení, smazání) jsou **POST-only**, aby je

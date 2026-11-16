@@ -214,6 +214,124 @@ def page_count():
         return int(row[0]) if row else 0
 
 
+def sources_json():
+    """Display-ready source list for the native "Zdroje" screen.
+
+    Reads the same ``site_sources`` rows the admin panel uses, enriched with the
+    parent domain and the last-checked label, so the native screen renders real
+    state instead of a second, unsynchronised copy. Returns JSON.
+    """
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        try:
+            sources = module.get_all_sources()
+        except Exception as exc:  # pragma: no cover - defensive
+            return json.dumps({"error": str(exc), "sources": []})
+        items = []
+        for source in sources:
+            items.append({
+                "id": source.get("id"),
+                "site_id": source.get("site_id"),
+                "url": source.get("url") or "",
+                "domain": source.get("site_domain") or "",
+                "type": source.get("source_type") or "",
+                "priority": source.get("priority"),
+                "status": source.get("status") or "",
+                "last_checked": source.get("last_checked_str") or "",
+                "notes": source.get("notes") or "",
+            })
+        return json.dumps({"sources": items, "count": len(items)})
+
+
+def add_source_json(payload_json):
+    """Register a source typed on the native screen. Returns JSON.
+
+    The payload is ``{"url": "...", "type": "auto"|"url"|"domain"|"sitemap"|
+    "rss"|"wiki"}``. ``auto`` detects the type from the address, and a new
+    domain is created when needed, so the user only has to paste an address.
+    Indexing is kicked off asynchronously. The result carries ``message`` or
+    ``error``; a duplicate is reported as a message, not an error.
+    """
+    _apply_android_defaults()
+    try:
+        payload = json.loads(payload_json or "{}")
+    except ValueError:
+        return json.dumps({"error": "Neplatná data."})
+    raw_url = (payload.get("url") or "").strip()
+    if not raw_url:
+        return json.dumps({"error": "Zadejte adresu webu nebo zdroje."})
+
+    with _lock:
+        module = _module()
+        requested = (payload.get("type") or "auto").strip().lower()
+        if requested in ("", "auto"):
+            source_type = module.detect_source_type(raw_url, fallback="url")
+        else:
+            source_type = requested
+        if source_type not in module.VALID_SOURCE_TYPES:
+            return json.dumps({"error": f"Nepodporovaný typ zdroje: {source_type}"})
+
+        is_wiki = source_type == module.WIKI_SOURCE_TYPE
+        if is_wiki:
+            site_url, importer, _lang = module.normalize_wiki_source(raw_url)
+            if not site_url:
+                return json.dumps({"error": "Neplatný odkaz na Wikipedii."})
+            value = site_url
+        else:
+            ok, message = module.validate_url(raw_url)
+            if not ok:
+                return json.dumps({"error": message})
+            value = module.normalize_url(raw_url)
+
+        site_id = module.add_site(value, is_local=False if is_wiki else None)
+        if not site_id:
+            return json.dumps({"error": "Doménu se nepodařilo založit."})
+
+        source_id, error = module.add_source(site_id, value, source_type=source_type,
+                                             importer="dump" if is_wiki else None)
+        if source_id is None:
+            if error and "již" in error:
+                return json.dumps({
+                    "message": "Tento zdroj je již zaregistrovaný a průběžně se indexuje."})
+            return json.dumps({"error": error or "Zdroj se nepodařilo přidat."})
+
+        module.index_source_async(source_id)
+        return json.dumps({"source_id": source_id,
+                           "message": "Zdroj byl přidán a indexace běží na pozadí."})
+
+
+def delete_source_json(source_id):
+    """Delete a source (or a whole domain for a ``domain`` source). Returns JSON."""
+    _apply_android_defaults()
+    try:
+        source_id = int(source_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID zdroje."})
+    with _lock:
+        module = _module()
+        ok, message = module.delete_source(source_id)
+        if not ok:
+            return json.dumps({"error": message or "Zdroj se nepodařilo smazat."})
+        return json.dumps({"message": message or "Zdroj byl smazán."})
+
+
+def recrawl_source_json(source_id):
+    """Queue an immediate re-crawl of one source's site. Returns JSON."""
+    _apply_android_defaults()
+    try:
+        source_id = int(source_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID zdroje."})
+    with _lock:
+        module = _module()
+        source = module.get_source_by_id(source_id)
+        if not source:
+            return json.dumps({"error": "Zdroj nenalezen."})
+        module.recrawl_async(source["site_id"])
+        return json.dumps({"message": "Re-crawl byl spuštěn na pozadí."})
+
+
 def base_url():
     """URL the WebView should load."""
     return f"http://{HOST}:{PORT}/"

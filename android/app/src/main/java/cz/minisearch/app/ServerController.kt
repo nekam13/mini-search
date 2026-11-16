@@ -364,6 +364,75 @@ object ServerController {
         }, "minisearch-dump").start()
     }
 
+    /**
+     * Load the source list for the native "Zdroje" screen. Runs on a background
+     * thread and hands the JSON (or an error) to [onResult].
+     */
+    fun loadSources(onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("sources_json").toString()
+                onResult(json, null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "sources load failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-sources-load").start()
+    }
+
+    /**
+     * Register a source typed on the native screen. [payloadJson] is
+     * ``{"url": "...", "type": "auto"|...}``; indexing starts on the backend.
+     * [onResult] receives the parsed ``(message, error)``.
+     */
+    fun addSource(payloadJson: String, onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("add_source_json", payloadJson).toString()
+                reportSourceResult(json, onResult)
+            } catch (t: Throwable) {
+                Log.e(TAG, "source add failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-source-add").start()
+    }
+
+    /** Delete a source (or its whole domain) and report ``(message, error)``. */
+    fun deleteSource(sourceId: Int, onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("delete_source_json", sourceId).toString()
+                reportSourceResult(json, onResult)
+            } catch (t: Throwable) {
+                Log.e(TAG, "source delete failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-source-delete").start()
+    }
+
+    /** Queue an immediate re-crawl of one source's site. */
+    fun recrawlSource(sourceId: Int, onResult: (String?, String?) -> Unit) {
+        Thread({
+            try {
+                val json = pythonEntry().callAttr("recrawl_source_json", sourceId).toString()
+                reportSourceResult(json, onResult)
+            } catch (t: Throwable) {
+                Log.e(TAG, "source recrawl failed", t)
+                onResult(null, describe(t))
+            }
+        }, "minisearch-source-recrawl").start()
+    }
+
+    /** Split a Python ``{message}|{error}`` JSON reply into ``(message, error)``. */
+    private fun reportSourceResult(json: String, onResult: (String?, String?) -> Unit) {
+        val obj = org.json.JSONObject(json)
+        if (obj.has("error")) {
+            onResult(null, obj.optString("error"))
+        } else {
+            onResult(obj.optString("message", "Hotovo"), null)
+        }
+    }
+
     /** Poll ``/health`` until it answers or the timeout expires. */
     private fun awaitReady(): Boolean {
         val deadline = System.currentTimeMillis() + READY_TIMEOUT_MS

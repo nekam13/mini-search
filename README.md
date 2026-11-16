@@ -161,7 +161,7 @@ Prvky rozhraní:
 | Obrázky | Samostatná sekce s náhledy obrázků z nalezených stránek (viz níže) |
 | Rich Results | Wikipedie, produkt, recept, organizace a článek – každý s vlastními informacemi |
 | Stránkování | 25 výsledků na stránku, parametr `page` (nad 500 výsledků se nepokračuje) |
-| Prázdné stavy | Vysvětlení a přímý odkaz do správy zdrojů, když se nic nenajde |
+| Prázdné stavy | Vysvětlení, když se nic nenajde (bez odkazů do správy – zdroje se přidávají v adminu / v aplikaci) |
 
 Vzhled stojí na „clay" principech: měkký vnější stín (`--clay-drop`) doplněný
 vnitřním odleskem (`--clay-lift`) u vyvýšených ploch a vnitřním stínem
