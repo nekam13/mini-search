@@ -45,6 +45,16 @@ object ServerController {
     var backendLabel: String = ""
         private set
 
+    /** URL a PC on the same network can open, or "" when LAN sharing is off. */
+    @Volatile
+    var lanUrl: String = ""
+        private set
+
+    /** True when the public search page is currently shared on the LAN. */
+    @Volatile
+    var lanShareEnabled: Boolean = false
+        private set
+
     private val listeners = CopyOnWriteArrayList<(ServerState) -> Unit>()
     private val lock = Any()
     private var inFlight = false
@@ -106,6 +116,7 @@ object ServerController {
                     "Server neodpověděl na http://$HOST:$PORT/health do ${READY_TIMEOUT_MS / 1000} s")
             }
             backendLabel = readBackendLabel(entry)
+            refreshLanInfo(entry)
             setState(ServerState.RUNNING)
         } catch (t: Throwable) {
             Log.e(TAG, "server start failed", t)
@@ -159,6 +170,7 @@ object ServerController {
                     throw IllegalStateException("Server se nepodařilo znovu spustit.")
                 }
                 backendLabel = readBackendLabel(entry)
+                refreshLanInfo(entry)
                 setState(ServerState.RUNNING)
             } catch (t: Throwable) {
                 Log.e(TAG, "restart failed", t)
@@ -167,6 +179,61 @@ object ServerController {
                 synchronized(lock) { inFlight = false }
             }
         }, "minisearch-restart").start()
+    }
+
+    /**
+     * Turn LAN sharing on or off and restart the server so the new bind address
+     * takes effect. The value is persisted by Python (``app_settings``), so it
+     * survives a restart. Runs on a background thread; the UI follows the state
+     * listener.
+     */
+    fun setLanShare(context: Context, enabled: Boolean) {
+        val appContext = context.applicationContext
+        synchronized(lock) {
+            if (inFlight) {
+                Log.i(TAG, "setLanShare ignored, a transition is in flight")
+                return
+            }
+            inFlight = true
+        }
+        setState(ServerState.STARTING)
+        Thread({
+            try {
+                val entry = pythonEntry()
+                entry.callAttr("set_lan_share", enabled)
+                // The bind address is only read at start, so re-bind now.
+                entry.callAttr("stop")
+                EmbeddingBridge.reset()
+                val dataDir = appContext.filesDir.absolutePath
+                entry.callAttr("start", dataDir)
+                if (!awaitReady()) {
+                    throw IllegalStateException("Server se nepodařilo znovu spustit.")
+                }
+                backendLabel = readBackendLabel(entry)
+                refreshLanInfo(entry)
+                setState(ServerState.RUNNING)
+            } catch (t: Throwable) {
+                Log.e(TAG, "LAN share change failed", t)
+                setState(ServerState.ERROR, describe(t))
+            } finally {
+                synchronized(lock) { inFlight = false }
+            }
+        }, "minisearch-lan").start()
+    }
+
+    /** Read ``lan_share`` / ``lan_url`` from the backend status JSON. */
+    private fun refreshLanInfo(entry: com.chaquo.python.PyObject) {
+        try {
+            val json = entry.callAttr("status").toString()
+            lanShareEnabled = Regex("\"lan_share\"\\s*:\\s*(true|false)")
+                .find(json)?.groupValues?.get(1) == "true"
+            lanUrl = Regex("\"lan_url\"\\s*:\\s*\"([^\"]*)\"")
+                .find(json)?.groupValues?.get(1) ?: ""
+        } catch (t: Throwable) {
+            Log.w(TAG, "lan info read failed", t)
+            lanShareEnabled = false
+            lanUrl = ""
+        }
     }
 
     /**
