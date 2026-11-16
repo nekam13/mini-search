@@ -34,7 +34,6 @@ requires = [
     "flask",
     "requests",
     "beautifulsoup4",
-    "lxml",
     "feedparser",
     "apscheduler",
     "markupsafe",

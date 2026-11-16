@@ -53,6 +53,23 @@ from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 import feedparser
 
+# BeautifulSoup's "lxml" parser is faster and more lenient, but lxml has no
+# iOS wheel (Briefcase), so fall back to the stdlib html.parser there. Nothing
+# in the app uses lxml directly — only its name as a parser argument.
+try:
+    import lxml  # noqa: F401
+    BS_PARSER = "lxml"
+except ImportError:  # pragma: no cover - depends on install profile
+    BS_PARSER = "html.parser"
+    # Sitemaps are still parsed correctly by the HTML parser (only direct-child
+    # <loc> is read), but bs4 warns about XML-as-HTML on every call.
+    import warnings
+    try:
+        from bs4 import XMLParsedAsHTMLWarning
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    except ImportError:  # pragma: no cover - very old bs4
+        pass
+
 # extruct parses JSON-LD, but drags in rdflib/jstyleson, which have no Android
 # wheels. It is optional: _extract_jsonld() falls back to per-script parsing.
 try:
@@ -1871,7 +1888,7 @@ def _jsonld_scripts(content):
     extruct's whole-document parse would do.
     """
     try:
-        soup = BeautifulSoup(content, 'lxml')
+        soup = BeautifulSoup(content, BS_PARSER)
     except Exception:
         return
     for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
@@ -4335,7 +4352,7 @@ def _parse_sitemap_locs(content):
     back to the lenient HTML one) handles both namespaced and plain documents.
     """
     soup = None
-    for parser in ('xml', 'lxml'):
+    for parser in ('xml', BS_PARSER):
         try:
             soup = BeautifulSoup(content, parser)
             break
@@ -4498,7 +4515,7 @@ def crawl_homepage_for_links(site_url, max_pages):
         resp = _http_get(site_url, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES,
                          purpose='homepage-crawl')
         if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, 'lxml')
+            soup = BeautifulSoup(resp.content, BS_PARSER)
             urls = extract_links_from_soup(soup, site_url, limit=max_pages)
     except Exception as e:
         log_error(f"Homepage crawl failed for {site_url}", e)
@@ -4536,7 +4553,7 @@ def discover_page_links(site_id, base_url, html, remaining_budget):
     if remaining_budget <= 0 or MAX_LINKS_PER_PAGE <= 0 or not html:
         return 0
     try:
-        soup = BeautifulSoup(html, 'lxml')
+        soup = BeautifulSoup(html, BS_PARSER)
     except Exception:
         return 0
     links = extract_links_from_soup(soup, base_url, limit=MAX_LINKS_PER_PAGE)
@@ -5575,7 +5592,7 @@ def extract_page_content(url, site_id, response=None, body_text=None,
         # Parse the decoded text, not the raw bytes: lxml ignores the HTTP
         # charset header and would mangle windows-1250 Czech pages if handed
         # bytes. Raw bytes are still kept for JSON-LD (extruct sniffs encoding).
-        soup = BeautifulSoup(text, 'lxml')
+        soup = BeautifulSoup(text, BS_PARSER)
 
         def meta(*props):
             for prop in props:

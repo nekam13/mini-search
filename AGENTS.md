@@ -25,6 +25,7 @@ python3 tests/test_maintenance.py            # nightly maintenance: dedup, vecto
 python3 tests/test_crawler_discovery.py      # link discovery, sitemap/gzip, lowmem scope
 python3 tests/test_search_quality.py         # charset, asset filtering, weights, image section
 python3 tests/test_settings_images.py        # admin settings, images filter, wiki images
+python3 tests/test_parser_fallback.py        # backend works without lxml (iOS/Briefcase)
 python3 tests/test_lifecycle.py              # server lifecycle: start/readiness/stop/restart, dedup
 python3 tests/test_android_compat.py         # FTS5 fallback, diacritics, start without FTS5/timezone
 python3 tests/test_lan_share.py              # opt-in LAN sharing of the public search page
@@ -449,4 +450,27 @@ Facts to preserve:
   `/sites/<id>/recrawl`, `/sites/<id>/delete` return 405). The templates submit
   those through `.inline-form` POST forms — keep it that way; a plain `<a href>`
   would reopen the cross-site vector.
+
+## Desktop / iOS packaging (`packaging/`)
+
+The same backend ships as desktop and iOS builds; `desktop/launcher.py` and
+`packaging/ios/src/minisearch/app.py` only set env and start `start_server()`,
+never re-implement search. Facts to preserve:
+
+- `lxml` has no iOS wheel, so `app_combined.py` picks the BeautifulSoup parser
+  via `BS_PARSER` (`lxml`, else `html.parser`). Nothing uses lxml directly — it
+  is only a parser name — so the fallback is safe; `tests/test_parser_fallback.py`
+  blocks lxml in a subprocess to keep it working. Do not add a hard `lxml`
+  dependency to `packaging/ios/pyproject.toml`.
+- PyInstaller's spec (`packaging/minisearch.spec`) collects the optional extruct
+  stack with `collect_all()`: a bare `hiddenimports` entry drops package data
+  and `mf2py` then fails on its missing `backcompat-rules` file. The `.app`
+  wrapper lives in the spec (guarded by `sys.platform == "darwin"`), not as a
+  `--windowed` CLI flag — PyInstaller rejects make-spec options with a `.spec`.
+- Linux packages use one reverse-DNS identity (`cz.minisearch.MiniSearch`) for
+  the `.desktop` file, the icons and the AppStream metadata, because
+  appimagetool validates the metadata with appstreamcli and both must agree on
+  filename, `<id>` and `<launchable>`.
+- `packaging/smoke_test.sh` starts an artifact on a throwaway data dir, waits
+  for `/health` 200, loads `/` and `/admin`, then checks the port is released.
 
