@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Cleartext is only allowed for the app's own loopback server, which the
-     WebView loads over http://127.0.0.1:8070. Every other host must use TLS.
-     This does not restrict the crawler: Chaquopy's Python talks over raw
-     sockets and is not subject to Android's cleartext policy. -->
+     native screens reach over http://127.0.0.1:8070 for the readiness probe.
+     Every other host must use TLS. This does not restrict the crawler:
+     Chaquopy's Python talks over raw sockets and is not subject to Android's
+     cleartext policy. -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
     <domain-config cleartextTrafficPermitted="true">

@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The whole app shell is native: five Clay tabs, each a real Android view.
+     There is no WebView anywhere — search, sources, sites and settings are all
+     native screens backed by the bundled Python server. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
@@ -27,55 +29,55 @@
                 android:layout_height="wrap_content"
                 android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/tab_home"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textAllCaps="false"
-            android:background="@drawable/clay_tab"
-            android:textColor="@color/clay_tab_text"
-            android:text="@string/tab_home" />
+                <Button
+                    android:id="@+id/tab_home"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textAllCaps="false"
+                    android:background="@drawable/clay_tab"
+                    android:textColor="@color/clay_tab_text"
+                    android:text="@string/tab_home" />
 
-        <Button
-            android:id="@+id/tab_search"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textAllCaps="false"
-            android:background="@drawable/clay_tab"
-            android:textColor="@color/clay_tab_text"
-            android:text="@string/tab_search" />
+                <Button
+                    android:id="@+id/tab_search"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textAllCaps="false"
+                    android:background="@drawable/clay_tab"
+                    android:textColor="@color/clay_tab_text"
+                    android:text="@string/tab_search" />
 
-        <Button
-            android:id="@+id/tab_sources"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textAllCaps="false"
-            android:background="@drawable/clay_tab"
-            android:textColor="@color/clay_tab_text"
-            android:text="@string/tab_sources" />
+                <Button
+                    android:id="@+id/tab_sources"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textAllCaps="false"
+                    android:background="@drawable/clay_tab"
+                    android:textColor="@color/clay_tab_text"
+                    android:text="@string/tab_sources" />
 
-        <Button
-            android:id="@+id/tab_admin"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textAllCaps="false"
-            android:background="@drawable/clay_tab"
-            android:textColor="@color/clay_tab_text"
-            android:text="@string/tab_admin" />
+                <Button
+                    android:id="@+id/tab_web"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textAllCaps="false"
+                    android:background="@drawable/clay_tab"
+                    android:textColor="@color/clay_tab_text"
+                    android:text="@string/tab_web" />
 
-        <Button
-            android:id="@+id/tab_settings"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textAllCaps="false"
-            android:background="@drawable/clay_tab"
-            android:textColor="@color/clay_tab_text"
-            android:text="@string/tab_settings" />
+                <Button
+                    android:id="@+id/tab_settings"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textAllCaps="false"
+                    android:background="@drawable/clay_tab"
+                    android:textColor="@color/clay_tab_text"
+                    android:text="@string/tab_settings" />
 
             </LinearLayout>
         </HorizontalScrollView>
@@ -129,8 +131,8 @@
             layout="@layout/view_home" />
 
         <include
-            android:id="@+id/settings_view"
-            layout="@layout/view_settings"
+            android:id="@+id/search_view"
+            layout="@layout/view_search"
             android:visibility="gone" />
 
         <include
@@ -138,15 +140,14 @@
             layout="@layout/view_sources"
             android:visibility="gone" />
 
-        <!-- The WebView is created programmatically and only when the user
-             first opens the search or admin tab. Inflating it here would make
-             Activity.onCreate heavy enough to blow the foreground-service
-             start deadline on a slow device (the service would be killed with
-             ForegroundServiceDidNotStartInTimeException). -->
-        <FrameLayout
-            android:id="@+id/web_container"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
+        <include
+            android:id="@+id/sites_view"
+            layout="@layout/view_sites"
+            android:visibility="gone" />
+
+        <include
+            android:id="@+id/settings_view"
+            layout="@layout/view_settings"
             android:visibility="gone" />
     </FrameLayout>
 

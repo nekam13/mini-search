@@ -412,15 +412,97 @@ object ServerController {
 
     /** Queue an immediate re-crawl of one source's site. */
     fun recrawlSource(sourceId: Int, onResult: (String?, String?) -> Unit) {
+        callJson("recrawl_source_json", sourceId, tag = "source recrawl", onResult = onResult)
+    }
+
+    // ------------------------------------------------- native screens --------
+
+    /**
+     * Load the overview (global stats + sites) for the native home screen.
+     * [onResult] receives the raw JSON or an error; the screen parses it.
+     */
+    fun loadDashboard(onResult: (String?, String?) -> Unit) {
+        callJson("dashboard_json", tag = "dashboard load", raw = true, onResult = onResult)
+    }
+
+    /** Load the filtered site list for the native "Weby" screen. */
+    fun loadSites(search: String, status: String, localOnly: Boolean,
+                  onResult: (String?, String?) -> Unit) {
+        callJson("sites_json", search, status, localOnly,
+            tag = "sites load", raw = true, onResult = onResult)
+    }
+
+    /** Load one site with its sources, recent pages and errors. */
+    fun loadSiteDetail(siteId: Int, onResult: (String?, String?) -> Unit) {
+        callJson("site_detail_json", siteId, tag = "site detail", raw = true, onResult = onResult)
+    }
+
+    /** Save the editable fields of a site. [onResult] gets ``(message, error)``. */
+    fun updateSite(payloadJson: String, onResult: (String?, String?) -> Unit) {
+        callJson("update_site_json", payloadJson, tag = "site update", onResult = onResult)
+    }
+
+    /** Delete a site and everything under it. */
+    fun deleteSite(siteId: Int, onResult: (String?, String?) -> Unit) {
+        callJson("delete_site_json", siteId, tag = "site delete", onResult = onResult)
+    }
+
+    /** Queue a re-crawl of a whole site. */
+    fun recrawlSite(siteId: Int, onResult: (String?, String?) -> Unit) {
+        callJson("recrawl_site_json", siteId, tag = "site recrawl", onResult = onResult)
+    }
+
+    /** Pause every active site. */
+    fun pauseAll(onResult: (String?, String?) -> Unit) {
+        callJson("pause_all_json", tag = "pause all", onResult = onResult)
+    }
+
+    /** Resume every paused site. */
+    fun resumeAll(onResult: (String?, String?) -> Unit) {
+        callJson("resume_all_json", tag = "resume all", onResult = onResult)
+    }
+
+    /** Queue a re-crawl of every active site. */
+    fun recrawlAll(onResult: (String?, String?) -> Unit) {
+        callJson("recrawl_all_json", tag = "recrawl all", onResult = onResult)
+    }
+
+    /**
+     * Run a hybrid search for the native search screen. [payloadJson] is
+     * ``{"q": ..., "filter": ..., "limit": ...}``; [onResult] receives the
+     * result JSON (not split into message/error) for the screen to render.
+     */
+    fun search(payloadJson: String, onResult: (String?, String?) -> Unit) {
+        callJson("search_json", payloadJson, tag = "search", raw = true, onResult = onResult)
+    }
+
+    /** Load the most recently indexed pages for the search screen's empty state. */
+    fun loadNews(onResult: (String?, String?) -> Unit) {
+        callJson("news_json", tag = "news load", raw = true, onResult = onResult)
+    }
+
+    /**
+     * Run a bridge function off the UI thread and report the outcome.
+     *
+     * With [raw] the reply is handed back verbatim (the caller renders it);
+     * otherwise a ``{message}|{error}`` reply is split into ``(message, error)``.
+     */
+    private fun callJson(
+        name: String,
+        vararg args: Any?,
+        tag: String,
+        raw: Boolean = false,
+        onResult: (String?, String?) -> Unit,
+    ) {
         Thread({
             try {
-                val json = pythonEntry().callAttr("recrawl_source_json", sourceId).toString()
-                reportSourceResult(json, onResult)
+                val json = pythonEntry().callAttr(name, *args).toString()
+                if (raw) onResult(json, null) else reportSourceResult(json, onResult)
             } catch (t: Throwable) {
-                Log.e(TAG, "source recrawl failed", t)
+                Log.e(TAG, "$tag failed", t)
                 onResult(null, describe(t))
             }
-        }, "minisearch-source-recrawl").start()
+        }, "minisearch-$tag".replace(' ', '-')).start()
     }
 
     /** Split a Python ``{message}|{error}`` JSON reply into ``(message, error)``. */

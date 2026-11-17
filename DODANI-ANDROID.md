@@ -14,11 +14,13 @@ provedeným krokům; nic není odhad ani ukázka.
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
 
-> **Aktuální verze 7.9 (nativní UI).** Od 7.8 přibylo **nativní české UI**
-> (obrazovky Domů / Hledat / Zdroje / Správa / Nastavení) místo jediného
-> WebView: Domů ovládá server (start/stop/restart, LAN sdílení, import dumpu),
-> Zdroje přidávají a spravují zdroje nativně (a přidávání zdrojů zmizelo
-> z veřejné stránky), Nastavení vykresluje `SETTINGS_SPEC` z backendu. Zůstává
+> **Aktuální verze 7.9 (nativní UI).** Od 7.8 je aplikace **kompletně
+> nativní** (žádný WebView): pět českých záložek (Domů / Hledat / Zdroje /
+> Weby / Nastavení). Domů ovládá server (start/stop/restart, přehled indexu,
+> rychlé akce, LAN sdílení, import dumpu), Hledat vyhledává nativně, Zdroje
+> přidávají a spravují zdroje, Weby zobrazují a editují weby a Nastavení
+> vykresluje `SETTINGS_SPEC` z backendu. Přidávání zdrojů i celá administrace
+> tedy zmizely z webové stránky, kterou APK nikde nevykresluje. Zůstává
 > možnost sdílet **veřejnou vyhledávací stránku** v LAN (`network.lan_share`,
 > výchozně vypnuto); administrace zůstává pouze na loopbacku. `versionCode` je
 > `5`, `versionName` `7.9`. Navíc opraveno sémantické (vektorové) hledání
@@ -63,19 +65,26 @@ sestavené z aktuálního zdrojového commitu, nikoli převzaté z dřívějška
 
 ### Nativní UI (nová funkce 7.9)
 
-Místo jediného WebView má aplikace **nativní české UI** s pěti záložkami
-(Horní lišta s přepínačem záložek, v duchu společného Clay designu; lišta je
-horizontálně posuvná, aby se pět záložek a akce „Import dumpu" vešly i na úzký
-telefon):
+Aplikace je **kompletně nativní** — nemá žádný WebView. Má **nativní české UI**
+s pěti záložkami (horní lišta s přepínačem záložek, v duchu společného Clay
+designu; lišta je horizontálně posuvná, aby se pět záložek a akce „Import
+dumpu" vešly i na úzký telefon). Všechny obrazovky se plní z JSON, který vrací
+Python bridge (`android_entry.py`), takže databáze a `SETTINGS_SPEC` zůstávají
+jediným zdrojem pravdy a v Kotlinu není druhá konfigurace.
 
 - **Domů** (`view_home.xml`) – nativní ovládání serveru: stav
   (`STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/`ERROR`), backend (jaký embedding
-  běží), chybová zpráva s diagnostikou, tlačítka Start / Zastavit / Znovu
-  spustit, přepínač „Sdílet v síti" (LAN) a zobrazení LAN adresy pro PC,
-  tlačítko importu wiki dumpu.
-- **Hledat** (`web_container`) – veřejná stránka `/` v uzamčeném WebView;
-  WebView se vytváří líně, až když záložku poprvé otevřete (aby `onCreate`
-  nezdržel start foreground služby).
+  běží), chybová zpráva s diagnostikou, tlačítka Start / Zastavit / Restartovat,
+  přehled indexu (weby / stránky / fronta / chyby / zdroje), rychlé akce
+  (re-crawl všech, pozastavit vše, obnovit vše), přepínač „Sdílet v síti" (LAN)
+  s LAN adresou pro PC (lze zkopírovat) a tlačítko importu wiki dumpu.
+- **Hledat** (`view_search.xml`) – **nativní vyhledávání**: dotaz, filtr
+  (vše / články / podcasty / audio / s cenou) a seznam výsledků. Data dodává
+  `android_entry.search_json()` nad stejným `hybrid_search()` jako web
+  (`prepare_results()`, `_result_snippet()`), ale do `TextView` jde **jen
+  prostý text** — bridge markup odstraní a dekóduje entity, takže se do
+  nativního UI nemůže dostat HTML z indexované stránky. Bez dotazu se zobrazí
+  „Naposledy indexované" (`news_json()`).
 - **Zdroje** (`view_sources.xml`) – **nativní správa zdrojů**, součást aplikace,
   ne webová stránka: přidání zdroje (typ se rozpozná automaticky z adresy),
   seznam zdrojů a u každého re-crawl a smazání (s potvrzením). Volá Python přes
@@ -86,15 +95,23 @@ telefon):
   zdrojů bylo zároveň **odstraněno z veřejné vyhledávací stránky** (route
   `/add`, `submit_public_source()` i formulář „Přidat zdroj" byly smazány;
   veřejná stránka má v navigaci jen odkaz na vyhledávání).
-- **Správa** – panel `/admin` ve stejném WebView. `confirm()`/`alert()`
-  z admin formulářů vykresluje `WebChromeClient` jako nativní dialog; ověřeno
-  instrumentačním testem `MainActivityUiTest` (dialog se zobrazí s českou
-  zprávou, OK vrátí `confirm()`, Zrušit vrátí `cancel()`).
+- **Weby** (`view_sites.xml`) – nativní přehled webů s filtrem (adresa, jen
+  místní) a detailem: editace (max. stránek, stav, aliasy, priorita, místní
+  web), re-crawl a smazání celého webu (s potvrzením), plus seznamy zdrojů,
+  naposledy indexovaných stránek a chyb. Data dodává
+  `android_entry.sites_json()` / `site_detail_json()` / `update_site_json()` /
+  `delete_site_json()` / `recrawl_site_json()`.
 - **Nastavení** (`view_settings.xml`) – nativní obrazovka, která dostane
   seskupená nastavení z backendu (`settings_json()` → `SETTINGS_SPEC`) a
   vykreslí je; ukládání, obnovení výchozích hodnot a restart, když to změna
-  vyžaduje. **V Kotlinu není druhá konfigurace** – jediným zdrojem pravdy
-  zůstává `SETTINGS_SPEC` v `app_combined.py`.
+  vyžaduje.
+
+Backend `/admin` i veřejná stránka `/` dál existují (používá je desktopová
+a iOS verze), ale APK je nevykresluje a nikam na ně neodkazuje. Potvrzovací
+dialogy pro destruktivní akce (smazání zdroje/webu, obnovení nastavení) staví
+`MainActivity.buildConfirmDialog()` nativně; ověřuje je instrumentační test
+`MainActivityUiTest`, který zároveň kontroluje, že se v celé hierarchii
+**nevyskytuje žádný `WebView`**.
 
 ### Oprava sémantického (vektorového) hledání
 
@@ -165,7 +182,7 @@ zařízením ve stejné síti (typicky PC), a to na pevném portu 8070, např.
   nepoužívá.
 
 Tato funkce je navíc k dosavadnímu dokončení aplikace (7.7), které řešilo
-čtyři **skutečné chyby nalezené spuštěním aplikace na emulátoru**:
+pět **skutečných chyb nalezených spuštěním aplikace na emulátoru**:
 
 - **Start neblokuje hlavní vlákno (oprava reálného pádu).** `Python.start()`
   volaný přímo v `Application.onCreate()` blokoval hlavní vlákno ~17 s; služba
@@ -174,10 +191,10 @@ Tato funkce je navíc k dosavadnímu dokončení aplikace (7.7), které řešilo
   na pozadí (`PythonRuntime.kt`) a všichni konzumenti čekají na latch.
   `ServerService.onStartCommand` volá `startForeground()` jako první věc.
 - **Temný režim už nezobrazuje bílé UI na bílém.** Téma bylo
-  `Theme.AppCompat.DayNight.NoActionBar` s pevně bílým oknem, ale Clay CSS je
-  jen světlé; v temném režimu vznikalo bílé pole (lišta) a ztmavený WebView.
+  `Theme.AppCompat.DayNight.NoActionBar` s pevně bílým oknem, ale Clay design je
+  jen světlý; v temném režimu vznikalo bílé pole (lišta) a nečitelné prvky.
   Téma je nyní jen světlé, okno odpovídá `#F5F5F5` a algoritmické ztmavování
-  WebView je vypnuté.
+  je vypnuté.
 - **FTS5 fallback pro Chaquopy.** Vestavěné SQLite v Chaquopy nemá FTS5
   (`no such module: fts5`). `get_db()` nyní FTS5 testuje a při jeho absenci
   použije tabulku `pages_fts_fallback` se skládáním diakritiky
@@ -189,8 +206,6 @@ Tato funkce je navíc k dosavadnímu dokončení aplikace (7.7), které řešilo
 - **Komprese modelu.** Model v APK je deflate-komprimovaný, takže `openFd()`
   vždy selhal a plná varianta tiše degradovala na hashovací fallback; kopie
   nyní streamuje z assetů s kontrolou velikosti.
-- **Pád rendereru WebView už neshodí aplikaci.** `onRenderProcessGone` znovu
-  načte lokální stránku místo smrti celého procesu.
 
 Zachované vlastnosti z předchozí dodávky:
 
@@ -291,11 +306,14 @@ tehdy sestaveném `arm64-v8a` APK; tvoří je `ServerSmokeTest` (8) a
 > **staticky a na JVM**: zabudovaný model má očekávaný SHA-256, `app.imy` nese
 > `app_combined.pyc` s novými symboly (`startup_embedding_recovery`,
 > `maybe_start_embedding_recovery`, `MODEL_RETRY_COOLDOWN`), `android_entry.pyc`
-> nese most pro zdroje (`sources_json`, `add_source_json`,
-> `delete_source_json`, `recrawl_source_json`), `classes3.dex` nese nativní UI
-> zdrojů (`renderSources`, `loadSources`, `deleteSource`, `recrawlSource`) a
-> prochází všech 20 backendových sad a 7 JVM testů. Znovuspuštění
-> instrumentační sady na emulátoru s KVM zůstává doporučeným dalším krokem.
+> nese most pro zdroje i weby (`sources_json`, `add_source_json`,
+> `delete_source_json`, `recrawl_source_json`, `sites_json`, `site_detail_json`,
+> `update_site_json`, `delete_site_json`, `search_json`, `dashboard_json`),
+> `classes3.dex` nese nativní obrazovky (`renderSources`, `renderSites`,
+> `renderSiteDetail`, `renderSearch`, `renderDashboard`) a prochází všech 21
+> backendových sad (20 původních + `test_android_bridge.py`) a 7 JVM testů.
+> Znovuspuštění instrumentační sady na emulátoru s KVM zůstává doporučeným
+> dalším krokem.
 
 `ServerSmokeTest.kt` spouští skutečný Chaquopy backend a ověřuje:
 
@@ -312,22 +330,20 @@ tehdy sestaveném `arm64-v8a` APK; tvoří je `ServerSmokeTest` (8) a
   ověří, že `/` na adrese zařízení vrací 200 a `/admin` na téže adrese vrací
   403 (tedy že server na LAN skutečně odpovídá a administrace se přesto odmítá).
 
-`MainActivityUiTest.kt` (nové) ověřuje nativní UI a dialogy:
+`MainActivityUiTest.kt` ověřuje nativní UI (bez WebView) a dialogy:
 
 - `nativeTabsArePresentAndSwitchScreens` – pět záložek (Domů/Hledat/Zdroje/
-  Správa/Nastavení) existuje s českými popisky a přepnutí na Správu schová Domů
-  a zobrazí webový kontejner.
-- `confirmDialogShowsAndReportsConfirm`, `cancelButtonReportsCancel`,
-  `alertDialogHasOnlyOkButton` – `MainActivity.buildJsDialog(...)` (přesně to,
-  co volá `WebChromeClient.onJsConfirm`/`onJsAlert`) zobrazí dialog s českou
-  zprávou; OK vrátí `confirm()`, Zrušit vrátí `cancel()`, alert nabídne jen OK.
+  Weby/Nastavení) existuje s českými popisky a každá zobrazí právě svou nativní
+  obrazovku (ostatní skryje).
+- `thereIsNoWebViewAnywhere` – v celé hierarchii pohledů **není žádný
+  `WebView`** (kdyby se veřejná/admin stránka vrátila dovnitř, test spadne).
+- `confirmDialogShowsAndReportsConfirm`, `cancelButtonDoesNotConfirm` –
+  `MainActivity.buildConfirmDialog(...)` zobrazí dialog s českou zprávou;
+  OK spustí akci, Zrušit ne.
 
 > Poznámka k dialogům: testy záměrně **nepřipojují DevTools/CDP klienta**.
-> Připojený DevTools klient totiž sám zachytí `window.confirm()`/`alert()`, takže
-> `onJsConfirm` se nikdy nezavolá a nativní dialog se neukáže — přes CDP tedy
-> dialog ověřit nelze. Test proto volá reálnou metodu bez CDP a kliká na
-> skutečné tlačítko `AlertDialog` na hlavním vlákně (kvůli pomalému emulátoru
-> bez KVM se místo Espresso čekání použije `waitForIdleSync`).
+> Klikají na skutečné tlačítko `AlertDialog` na hlavním vlákně (kvůli pomalému
+> emulátoru bez KVM se místo Espresso čekání použije `waitForIdleSync`).
 
 Poznámka k `searchAndAdminPagesLoad`: první dotaz na `/admin` na emulátoru bez
 KVM má studený start ~30 s (druhý už 0,7 s), proto test používá timeout 30 s;
@@ -406,18 +422,17 @@ oprav a bez absolutních cest v repu.
 - V malé variantě model **není**, tokenizer ano.
 - `templates/` a `static/` jsou zabalené v `app.imy` (`templates/search.html`,
   `templates/base_clay.html`, `static/css/clay.css`, `static/js/search.js`).
-- 20 backendových sad a 7 JVM testů prochází (instrumentační sada byla
+- 21 backendových sad a 7 JVM testů prochází (instrumentační sada byla
   spuštěna v dřívějším cyklu, viz § 3).
 - **Nativní UI na odevzdaném `arm64-v8a` APK.** `MainActivityUiTest` ověřil na
-  zařízení, že existují záložky s českými popisky a že přepnutí na Správu
-  schová Domů a zobrazí webový kontejner; dialogy `confirm()`/`alert()`
-  (co volá `WebChromeClient`) se zobrazí s českou zprávou a OK/Zrušit vrací
-  správnou hodnotu. V logu (`ServerController`) je vidět skutečný přechod do
+  zařízení, že existují záložky s českými popisky, že se v hierarchii
+  nevyskytuje žádný `WebView` a že potvrzovací dialog se zobrazí s českou
+  zprávou. V logu (`ServerController`) je vidět skutečný přechod do
   `state -> RUNNING` s `workers: 1`, `scheduler_running: true`,
   `embedding_space: "hash:384"` (nomodel varianta) a platným `lan_url`.
 - Instalace a běh **nového APK** na emulátoru `msx(AVD) - 14`: server se rozjede,
-  `/health` = 200, české hledání s diakritikou i bez ní funguje, crawling
-  a automatická indexace nového zdroje fungují, administrace se načte.
+  `/health` = 200, české hledání s diakritikou i bez ní funguje (nativně),
+  crawling a automatická indexace nového zdroje fungují.
 - **Plná varianta s reálným ONNX modelem na zařízení.** Emulátor má ARM
   překlad (`libndk_translation.so`, `ro.enable.native.bridge.exec=1`), takže
   i `arm64-v8a` APK se nainstaluje a spustí. Ověřeno:
@@ -465,10 +480,9 @@ oprav a bez absolutních cest v repu.
   že model běží a sémanticky vyhledává; přesná shoda vektorů s referenčním
   `sentence-transformers` je ověřená jen JVM testem (`EmbeddingBridgeTest`) na
   desktopu.
-- **Pád rendereru WebView na emulátoru** – renderer na emulátoru bez KVM
-  opakovaně padá na `SIGTRAP` (sandbox WebView, omezení prostředí, nikoli
-  aplikace). Aplikace díky `onRenderProcessGone` nespadne, ale vykreslení
-  stránky v emulátoru je tím poznamenané. Obsah stránek je ověřen přes HTTP.
+- **Pád rendereru WebView na emulátoru** – od 7.9 už aplikace žádný WebView
+  nemá, takže toto omezení pominulo. Zbývá jen pomalý studený start `/admin`
+  na emulátoru bez KVM, který se netýká APK (APK admin nevykresluje).
 - **Podpisová kompatibilita s předchozí instalací** – viz § 7.
 
 ## 6. Bezpečnostní opatření (souhrn)
@@ -481,17 +495,17 @@ oprav a bez absolutních cest v repu.
   zařízení ověřeno raw socketem.
 - `/admin` a `/admin/api/**` jsou dostupné jen z loopbacku; navíc se odmítají
   mutující požadavky s cizím `Origin`/`Referer` (403). Požadavek s `Origin`
-  z vlastní LAN adresy projde (kvůli WebView/stejnému zařízení), cizí veřejný
-  `Origin` se odmítá.
+  z vlastní LAN adresy projde (stejné zařízení), cizí veřejný `Origin` se
+  odmítá. APK tento panel nikdy nevykresluje ani na něj neodkazuje.
 - Všech sedm dříve GET-mutujících akcí (recrawl, recrawl-all, pause-all,
   resume-all, delete, check-update, apply-update) je nyní POST-only; GET vrací 405.
 - Z APK jsou vypnuté git aktualizace i jejich mutační endpointy
   (`BUNDLED_RUNTIME=1`); aplikace nikdy nespouští `git pull` ani `pip install`.
-- WebView: JS ano (Clay UI), ale `allowFileAccess=false`,
-  `allowContentAccess=false`, žádný JavaScript most, externí odkazy se otevírají
-  v systémovém prohlížeči, `MIXED_CONTENT_NEVER_ALLOW`. Cleartext je povolen
-  **jen** pro `127.0.0.1`/`localhost` (`network_security_config.xml`); proto se
-  LAN adresa nikdy nenačítá v privilegovaném WebView.
+- Aplikace **neobsahuje žádný WebView** – žádný JavaScript, žádný JavaScript
+  most, žádný přístup k souborům přes prohlížeč. Externí odkazy z výsledků
+  hledání se otevírají v systémovém prohlížeči (`ACTION_VIEW`). Cleartext je
+  povolen **jen** pro `127.0.0.1`/`localhost` (`network_security_config.xml`),
+  a to pro readiness probe vlastního serveru.
 - TLS se nikde nevypíná (žádné `verify=False`, trust-all ani obcházení).
 - Secret key se generuje za běhu (`os.urandom`), v repu není pevný klíč.
 
@@ -532,11 +546,11 @@ pořadí hashů v D8; to je vlastnost AGP/D8, ne našeho kódu.
 ## 9. Omezení prostředí během práce
 
 - Emulátor `msx(AVD) - 14` běží **bez `/dev/kvm`** (hostitel x86_64 bez
-  virtualizace), takže je velmi pomalý a ANR; to je důvod pádů rendereru WebView,
-  občasného překročení 120s timeoutu startu Pythonu a nutnosti delších timeoutů
-  u instrumentačních testů. Zátěž guest systému dosahovala 16–20 a systém sám
-  hlásil ANR (např. „Process system isn't responding"). Prostředí je proto
-  vhodné pro jednorázové ověření, ne pro opakované interaktivní testování.
+  virtualizace), takže je velmi pomalý a ANR; to je důvod občasného překročení
+  120s timeoutu startu Pythonu a nutnosti delších timeoutů u instrumentačních
+  testů. Zátěž guest systému dosahovala 16–20 a systém sám hlásil ANR (např.
+  „Process system isn't responding"). Prostředí je proto vhodné pro jednorázové
+  ověření, ne pro opakované interaktivní testování.
 - Emulátor má zapnutý **ARM překlad** (`libndk_translation.so`,
   `ro.enable.native.bridge.exec=1`), proto na něm běží i `arm64-v8a` APK včetně
   ONNX modelu. Instrumentační testy i ruční ověření běžely přímo na tomto

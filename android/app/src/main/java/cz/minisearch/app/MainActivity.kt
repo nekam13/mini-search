@@ -1,12 +1,13 @@
 package cz.minisearch.app
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,13 +16,6 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.JsResult
-import android.webkit.RenderProcessGoneDetail
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -38,64 +32,75 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * The app shell: a native Clay home screen and a native Clay settings screen,
- * plus the WebView for the two browser-based surfaces (public search and admin).
- *
- * The native screens are not a skin over the web UI — the home screen owns the
- * real server controls (start/stop/restart, LAN sharing, dump import) and the
- * settings screen renders ``SETTINGS_SPEC`` straight from the backend, so the
- * configuration never lives in two places.
- *
- * The WebView is locked down: JavaScript on (the Clay UI needs it), no file or
- * content access, no JavaScript bridge, external links leave for the system
- * browser, and a [WebChromeClient] renders ``confirm``/``alert`` so the admin
- * forms that guard destructive actions actually work.
+ * The app shell. Everything is native: five Clay tabs (Domů / Hledat / Zdroje /
+ * Weby / Nastavení), each a real Android view. There is no WebView anywhere —
+ * search, sources, sites and settings are all rendered from the bundled Python
+ * server through [ServerController], so the configuration and the index have a
+ * single source of truth and no web page is ever shown inside the app.
  */
 class MainActivity : AppCompatActivity() {
 
-    // Created lazily: see ensureWebView(). Null until the user first opens a
-    // web-backed tab, so Activity.onCreate stays cheap and the foreground
-    // service meets its start deadline even on a slow device.
-    private var web: WebView? = null
-    private lateinit var webContainer: android.widget.FrameLayout
     private lateinit var homeView: View
-    private lateinit var settingsView: View
+    private lateinit var searchView: View
     private lateinit var sourcesView: View
+    private lateinit var sitesView: View
+    private lateinit var settingsView: View
     private lateinit var status: TextView
     private lateinit var retry: Button
 
-    // Home screen widgets
+    // Home screen
     private lateinit var homeStatus: TextView
     private lateinit var homeBackend: TextView
     private lateinit var homeError: TextView
+    private lateinit var homeStats: LinearLayout
+    private lateinit var homeStart: Button
+    private lateinit var homeStop: Button
     private lateinit var lanShare: CheckBox
     private lateinit var lanUrl: TextView
     private lateinit var lanCopy: Button
 
-    // Settings screen widgets
-    private lateinit var settingsGroups: LinearLayout
-    private lateinit var settingsStatus: TextView
-    private lateinit var settingsSave: Button
-    private lateinit var settingsReset: Button
+    // Search screen
+    private lateinit var searchQuery: EditText
+    private lateinit var searchFilter: Spinner
+    private lateinit var searchStatus: TextView
+    private lateinit var searchResults: LinearLayout
+    private lateinit var searchNews: LinearLayout
+    private lateinit var searchNewsTitle: TextView
 
-    // Sources screen widgets
+    // Sources screen
     private lateinit var sourceList: LinearLayout
     private lateinit var sourceStatus: TextView
     private lateinit var sourceUrl: EditText
     private lateinit var sourceType: Spinner
     private lateinit var sourceAdd: Button
 
+    // Sites screen
+    private lateinit var sitesListPane: View
+    private lateinit var sitesFilter: EditText
+    private lateinit var sitesLocalOnly: CheckBox
+    private lateinit var sitesStatus: TextView
+    private lateinit var sitesList: LinearLayout
+    private lateinit var siteDetailPane: View
+    private lateinit var siteDetailTitle: TextView
+    private lateinit var siteDetailStatus: TextView
+    private lateinit var siteDetailBody: LinearLayout
+
+    // Settings screen
+    private lateinit var settingsGroups: LinearLayout
+    private lateinit var settingsStatus: TextView
+    private lateinit var settingsSave: Button
+    private lateinit var settingsReset: Button
+
     private val tabs = mutableMapOf<Int, Button>()
     private var currentTab = R.id.tab_home
-    private var onAdmin = false
-    private var loadedOnce = false
     private var settingsLoaded = false
-    // Set while the code reflects the backend state into the checkbox, so the
+    // Set while code reflects the backend state into the checkbox, so the
     // programmatic change does not look like a user tap and re-trigger a restart.
     private var syncingLanToggle = false
-    // Maps a setting key to the widget that holds its current value, so saving
-    // can read every field without re-parsing the layout.
     private val settingFields = mutableMapOf<String, () -> Any>()
+    // Widgets of the open site editor, keyed by field name.
+    private val siteFields = mutableMapOf<String, () -> Any>()
+    private var currentSiteId = -1
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -114,24 +119,30 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        webContainer = findViewById(R.id.web_container)
         homeView = findViewById(R.id.home_view)
-        settingsView = findViewById(R.id.settings_view)
+        searchView = findViewById(R.id.search_view)
         sourcesView = findViewById(R.id.sources_view)
+        sitesView = findViewById(R.id.sites_view)
+        settingsView = findViewById(R.id.settings_view)
         status = findViewById(R.id.status)
         retry = findViewById(R.id.retry)
 
         homeStatus = findViewById(R.id.home_status)
         homeBackend = findViewById(R.id.home_backend)
         homeError = findViewById(R.id.home_error)
+        homeStats = findViewById(R.id.home_stats)
+        homeStart = findViewById(R.id.home_start)
+        homeStop = findViewById(R.id.home_stop)
         lanShare = findViewById(R.id.lan_share)
         lanUrl = findViewById(R.id.lan_url)
         lanCopy = findViewById(R.id.lan_copy)
 
-        settingsGroups = findViewById(R.id.settings_groups)
-        settingsStatus = findViewById(R.id.settings_status)
-        settingsSave = findViewById(R.id.settings_save)
-        settingsReset = findViewById(R.id.settings_reset)
+        searchQuery = findViewById(R.id.search_query)
+        searchFilter = findViewById(R.id.search_filter)
+        searchStatus = findViewById(R.id.search_status)
+        searchResults = findViewById(R.id.search_results)
+        searchNews = findViewById(R.id.search_news)
+        searchNewsTitle = findViewById(R.id.search_news_title)
 
         sourceList = findViewById(R.id.source_list)
         sourceStatus = findViewById(R.id.source_status)
@@ -139,16 +150,33 @@ class MainActivity : AppCompatActivity() {
         sourceType = findViewById(R.id.source_type)
         sourceAdd = findViewById(R.id.source_add)
 
+        sitesListPane = findViewById(R.id.sites_list_pane)
+        sitesFilter = findViewById(R.id.sites_filter)
+        sitesLocalOnly = findViewById(R.id.sites_local_only)
+        sitesStatus = findViewById(R.id.sites_status)
+        sitesList = findViewById(R.id.sites_list)
+        siteDetailPane = findViewById(R.id.site_detail_pane)
+        siteDetailTitle = findViewById(R.id.site_detail_title)
+        siteDetailStatus = findViewById(R.id.site_detail_status)
+        siteDetailBody = findViewById(R.id.site_detail_body)
+
+        settingsGroups = findViewById(R.id.settings_groups)
+        settingsStatus = findViewById(R.id.settings_status)
+        settingsSave = findViewById(R.id.settings_save)
+        settingsReset = findViewById(R.id.settings_reset)
+
         tabs[R.id.tab_home] = findViewById(R.id.tab_home)
         tabs[R.id.tab_search] = findViewById(R.id.tab_search)
         tabs[R.id.tab_sources] = findViewById(R.id.tab_sources)
-        tabs[R.id.tab_admin] = findViewById(R.id.tab_admin)
+        tabs[R.id.tab_web] = findViewById(R.id.tab_web)
         tabs[R.id.tab_settings] = findViewById(R.id.tab_settings)
 
         wireTabs()
         wireHome()
-        wireSettings()
+        wireSearch()
         wireSources()
+        wireSites()
+        wireSettings()
 
         findViewById<Button>(R.id.import_dump).setOnClickListener { pickDump() }
         retry.setOnClickListener {
@@ -184,23 +212,16 @@ class MainActivity : AppCompatActivity() {
             button.isSelected = tabId == id
         }
         homeView.visibility = if (id == R.id.tab_home) View.VISIBLE else View.GONE
-        settingsView.visibility = if (id == R.id.tab_settings) View.VISIBLE else View.GONE
+        searchView.visibility = if (id == R.id.tab_search) View.VISIBLE else View.GONE
         sourcesView.visibility = if (id == R.id.tab_sources) View.VISIBLE else View.GONE
-        val webTab = id == R.id.tab_search || id == R.id.tab_admin
-        webContainer.visibility = if (webTab) View.VISIBLE else View.GONE
+        sitesView.visibility = if (id == R.id.tab_web) View.VISIBLE else View.GONE
+        settingsView.visibility = if (id == R.id.tab_settings) View.VISIBLE else View.GONE
 
         when (id) {
-            R.id.tab_search -> {
-                onAdmin = false
-                ensureWebView()
-                if (ServerController.state == ServerState.RUNNING) load(ServerController.BASE_URL)
-            }
-            R.id.tab_admin -> {
-                onAdmin = true
-                ensureWebView()
-                if (ServerController.state == ServerState.RUNNING) load("${ServerController.BASE_URL}admin")
-            }
+            R.id.tab_home -> loadDashboard()
+            R.id.tab_search -> loadNews()
             R.id.tab_sources -> loadSources()
+            R.id.tab_web -> loadSites()
             R.id.tab_settings -> loadSettings()
         }
     }
@@ -208,21 +229,40 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- home ----
 
     private fun wireHome() {
-        findViewById<Button>(R.id.home_open_web).setOnClickListener {
-            if (ServerController.state != ServerState.RUNNING) {
-                toast(getString(R.string.dump_need_running))
-                return@setOnClickListener
-            }
-            selectTab(R.id.tab_search)
+        homeStart.setOnClickListener {
+            UserState.serverEnabled = true
+            ServerService.start(this)
+            ServerController.start(this)
         }
         findViewById<Button>(R.id.home_restart).setOnClickListener {
             UserState.serverEnabled = true
             ServerService.start(this)
             ServerController.restart(this)
         }
-        findViewById<Button>(R.id.home_stop).setOnClickListener {
+        homeStop.setOnClickListener {
             UserState.serverEnabled = false
             ServerService.stop(this)
+        }
+        findViewById<Button>(R.id.home_recrawl_all).setOnClickListener {
+            ServerController.recrawlAll { message, error ->
+                runOnUiThread { toast(error?.let { getString(R.string.sources_error, it) } ?: message!!) }
+            }
+        }
+        findViewById<Button>(R.id.home_pause_all).setOnClickListener {
+            ServerController.pauseAll { message, error ->
+                runOnUiThread {
+                    toast(error?.let { getString(R.string.sources_error, it) } ?: message!!)
+                    loadDashboard()
+                }
+            }
+        }
+        findViewById<Button>(R.id.home_resume_all).setOnClickListener {
+            ServerController.resumeAll { message, error ->
+                runOnUiThread {
+                    toast(error?.let { getString(R.string.sources_error, it) } ?: message!!)
+                    loadDashboard()
+                }
+            }
         }
         lanCopy.setOnClickListener {
             val url = ServerController.lanUrl
@@ -235,16 +275,63 @@ class MainActivity : AppCompatActivity() {
         lanShare.setOnCheckedChangeListener { _, checked ->
             if (syncingLanToggle) return@setOnCheckedChangeListener
             if (ServerController.state != ServerState.RUNNING) {
-                // Nothing to re-bind; restore the switch to the real state.
                 syncLanToggle()
                 toast(getString(R.string.lan_share_needs_running))
                 return@setOnCheckedChangeListener
             }
-            if (checked) {
-                toast(getString(R.string.lan_share_hint))
-            }
             ServerController.setLanShare(this, checked)
         }
+    }
+
+    private fun loadDashboard() {
+        if (ServerController.state != ServerState.RUNNING) {
+            renderDashboard(null)
+            return
+        }
+        ServerController.loadDashboard { json, _ ->
+            runOnUiThread { renderDashboard(json) }
+        }
+    }
+
+    private fun renderDashboard(json: String?) {
+        homeStats.removeAllViews()
+        if (json == null) return
+        try {
+            val stats = JSONObject(json).getJSONObject("stats")
+            val entries = listOf(
+                stats.optInt("sites") to getString(R.string.home_stat_sites),
+                stats.optInt("pages") to getString(R.string.home_stat_pages),
+                stats.optInt("pending") to getString(R.string.home_stat_pending),
+                stats.optInt("errors") to getString(R.string.home_stat_errors),
+                stats.optInt("sources") to getString(R.string.home_stat_sources))
+            for ((value, label) in entries) {
+                homeStats.addView(statCell(value.toString(), label))
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "dashboard parse failed", t)
+        }
+    }
+
+    private fun statCell(value: String, label: String): View {
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        column.addView(TextView(this).apply {
+            text = value
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER
+        })
+        column.addView(TextView(this).apply {
+            text = label
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+            textSize = 11f
+            gravity = Gravity.CENTER
+        })
+        return column
     }
 
     /** Reflect the backend's LAN state into the checkbox and the address label. */
@@ -267,16 +354,169 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // -------------------------------------------------------------- search ----
+
+    private val searchFilterValues =
+        listOf("all", "articles", "podcasts", "audio", "price")
+
+    private fun wireSearch() {
+        val labels = listOf(
+            getString(R.string.filter_all), getString(R.string.filter_articles),
+            getString(R.string.filter_podcasts), getString(R.string.filter_audio),
+            getString(R.string.filter_price))
+        searchFilter.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, labels)
+        findViewById<Button>(R.id.search_button).setOnClickListener { doSearch() }
+        searchQuery.setOnEditorActionListener { _, _, _ -> doSearch(); true }
+    }
+
+    private fun doSearch() {
+        val query = searchQuery.text.toString().trim()
+        if (query.isEmpty()) {
+            showSearchStatus(getString(R.string.search_empty_prompt))
+            searchResults.removeAllViews()
+            loadNews()
+            return
+        }
+        if (ServerController.state != ServerState.RUNNING) {
+            showSearchStatus(getString(R.string.search_need_running))
+            return
+        }
+        showSearchStatus(getString(R.string.search_button) + "…")
+        val payload = JSONObject()
+        payload.put("q", query)
+        payload.put("filter", searchFilterValues[searchFilter.selectedItemPosition])
+        payload.put("limit", 25)
+        ServerController.search(payload.toString()) { json, error ->
+            runOnUiThread {
+                if (error != null || json == null) {
+                    showSearchStatus(getString(R.string.search_error, error ?: ""))
+                    return@runOnUiThread
+                }
+                renderSearch(json)
+            }
+        }
+    }
+
+    private fun renderSearch(json: String) {
+        searchResults.removeAllViews()
+        searchNews.visibility = View.GONE
+        searchNewsTitle.visibility = View.GONE
+        try {
+            val obj = JSONObject(json)
+            if (obj.has("error")) {
+                showSearchStatus(getString(R.string.search_error, obj.optString("error")))
+                return
+            }
+            val results = obj.optJSONArray("results") ?: JSONArray()
+            val query = obj.optString("query")
+            if (results.length() == 0) {
+                showSearchStatus(getString(R.string.search_no_results, query))
+                return
+            }
+            showSearchStatus(getString(R.string.search_result_count,
+                results.length(), plural(results.length()), query))
+            for (i in 0 until results.length()) {
+                searchResults.addView(resultCard(results.getJSONObject(i)))
+            }
+        } catch (t: Throwable) {
+            showSearchStatus(getString(R.string.search_error, t.message ?: ""))
+        }
+    }
+
+    private fun resultCard(item: JSONObject): View {
+        val card = card()
+        card.addView(TextView(this).apply {
+            text = item.optString("title")
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setOnClickListener { openUrl(item.optString("url")) }
+        })
+        card.addView(TextView(this).apply {
+            text = item.optString("domain") + item.optString("path")
+            setTextColor(ContextCompat.getColor(context, R.color.clay_secondary_dark))
+            textSize = 12f
+            setPadding(0, dp(2), 0, 0)
+        })
+        val snippet = item.optString("snippet")
+        if (snippet.isNotEmpty()) {
+            card.addView(TextView(this).apply {
+                text = snippet
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 13f
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+        val meta = buildString {
+            append(getString(R.string.sites_indexed)).append(": ")
+            append(item.optInt("relevance")).append("%")
+            val date = item.optString("date")
+            if (date.isNotEmpty()) append(" · ").append(date)
+        }
+        card.addView(TextView(this).apply {
+            text = meta
+            setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+            textSize = 11f
+            setPadding(0, dp(4), 0, 0)
+        })
+        return card
+    }
+
+    private fun loadNews() {
+        if (ServerController.state != ServerState.RUNNING) return
+        ServerController.loadNews { json, _ ->
+            runOnUiThread {
+                if (json == null) return@runOnUiThread
+                try {
+                    val items = JSONObject(json).optJSONArray("items") ?: JSONArray()
+                    searchNews.removeAllViews()
+                    if (items.length() == 0) {
+                        searchNews.visibility = View.GONE
+                        searchNewsTitle.visibility = View.GONE
+                        return@runOnUiThread
+                    }
+                    searchNewsTitle.visibility = View.VISIBLE
+                    searchNews.visibility = View.VISIBLE
+                    for (i in 0 until items.length()) {
+                        val item = items.getJSONObject(i)
+                        searchNews.addView(TextView(this).apply {
+                            text = item.optString("title")
+                            setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                            textSize = 14f
+                            setPadding(dp(4), dp(6), dp(4), dp(6))
+                            setOnClickListener { openUrl(item.optString("url")) }
+                        })
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "news parse failed", t)
+                }
+            }
+        }
+    }
+
+    private fun showSearchStatus(text: String) {
+        searchStatus.text = text
+    }
+
+    private fun plural(n: Int): String =
+        if (n == 1) "výsledek" else if (n in 2..4) "výsledky" else "výsledků"
+
+    private fun openUrl(url: String) {
+        if (url.isEmpty()) return
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (t: Throwable) {
+            toast(getString(R.string.search_open_failed))
+        }
+    }
+
     // ------------------------------------------------------------ settings ----
 
     private fun wireSettings() {
         settingsSave.setOnClickListener { saveSettings() }
         settingsReset.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setMessage(getString(R.string.settings_reset_confirm))
-                .setNegativeButton(android.R.string.cancel, null)
-                .setPositiveButton(android.R.string.ok) { _, _ -> resetSettings() }
-                .show()
+            buildConfirmDialog(getString(R.string.settings_reset_confirm)) { resetSettings() }
         }
     }
 
@@ -307,37 +547,19 @@ class MainActivity : AppCompatActivity() {
     private fun buildSettingsUi(groups: JSONArray) {
         settingsGroups.removeAllViews()
         settingFields.clear()
-        val density = resources.displayMetrics.density
-        fun dp(value: Int) = (value * density).toInt()
-
         for (g in 0 until groups.length()) {
             val group = groups.getJSONObject(g)
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundResource(R.drawable.clay_card)
-                setPadding(dp(18), dp(18), dp(18), dp(18))
-                val lp = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                lp.bottomMargin = dp(14)
-                layoutParams = lp
-            }
-            card.addView(TextView(this).apply {
-                text = group.optString("label")
-                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
-                textSize = 16f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setPadding(0, 0, 0, dp(8))
-            })
-
+            val card = card()
+            card.addView(sectionTitle(group.optString("label")))
             val items = group.optJSONArray("items") ?: JSONArray()
             for (i in 0 until items.length()) {
-                card.addView(buildSettingRow(items.getJSONObject(i), ::dp))
+                card.addView(buildSettingRow(items.getJSONObject(i)))
             }
             settingsGroups.addView(card)
         }
     }
 
-    private fun buildSettingRow(item: JSONObject, dp: (Int) -> Int): View {
+    private fun buildSettingRow(item: JSONObject): View {
         val key = item.optString("key")
         val kind = item.optString("kind")
         val label = item.optString("label")
@@ -349,7 +571,6 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(6), 0, dp(10))
         }
-
         val labelRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -358,7 +579,7 @@ class MainActivity : AppCompatActivity() {
             text = label
             setTextColor(ContextCompat.getColor(context, R.color.clay_text))
             textSize = 14f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTypeface(typeface, Typeface.BOLD)
         })
         if (restart) {
             labelRow.addView(TextView(this).apply {
@@ -392,8 +613,7 @@ class MainActivity : AppCompatActivity() {
                 val spinner = Spinner(this)
                 spinner.adapter = ArrayAdapter(
                     this, android.R.layout.simple_spinner_dropdown_item, labels)
-                val current = item.optString("value")
-                val index = values.indexOf(current)
+                val index = values.indexOf(item.optString("value"))
                 if (index >= 0) spinner.setSelection(index)
                 column.addView(spinner)
                 settingFields[key] = { values[spinner.selectedItemPosition] }
@@ -583,23 +803,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun deleteSource(id: Int, label: String) {
-        AlertDialog.Builder(this)
-            .setMessage(getString(R.string.sources_delete_confirm, label))
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                ServerController.deleteSource(id) { message, error ->
-                    runOnUiThread {
-                        if (error != null) {
-                            showSourceStatus(getString(R.string.sources_error, error), false)
-                        } else {
-                            showSourceStatus(
-                                message ?: getString(R.string.sources_deleted), true)
-                            loadSources()
-                        }
+        buildConfirmDialog(getString(R.string.sources_delete_confirm, label)) {
+            ServerController.deleteSource(id) { message, error ->
+                runOnUiThread {
+                    if (error != null) {
+                        showSourceStatus(getString(R.string.sources_error, error), false)
+                    } else {
+                        showSourceStatus(message ?: getString(R.string.sources_deleted), true)
+                        loadSources()
                     }
                 }
             }
-            .show()
+        }
     }
 
     private fun recrawlSource(id: Int) {
@@ -617,9 +832,6 @@ class MainActivity : AppCompatActivity() {
     /** Render one card per source, built from the backend JSON. */
     private fun renderSources(sources: JSONArray) {
         sourceList.removeAllViews()
-        val density = resources.displayMetrics.density
-        fun dp(value: Int) = (value * density).toInt()
-
         if (sources.length() == 0) {
             sourceList.addView(TextView(this).apply {
                 text = getString(R.string.sources_empty)
@@ -629,7 +841,6 @@ class MainActivity : AppCompatActivity() {
             })
             return
         }
-
         for (i in 0 until sources.length()) {
             val source = sources.getJSONObject(i)
             val id = source.optInt("id", -1)
@@ -638,21 +849,12 @@ class MainActivity : AppCompatActivity() {
             val type = source.optString("type")
             val lastChecked = source.optString("last_checked")
 
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundResource(R.drawable.clay_card)
-                setPadding(dp(18), dp(14), dp(18), dp(14))
-                val lp = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                lp.bottomMargin = dp(10)
-                layoutParams = lp
-            }
-
+            val card = card()
             card.addView(TextView(this).apply {
                 text = if (domain.isNotEmpty()) domain else url
                 setTextColor(ContextCompat.getColor(context, R.color.clay_text))
                 textSize = 15f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTypeface(typeface, Typeface.BOLD)
             })
             card.addView(TextView(this).apply {
                 text = sourceTypeLabel(type) + "\n" + url
@@ -668,29 +870,14 @@ class MainActivity : AppCompatActivity() {
                     setPadding(0, dp(2), 0, 0)
                 })
             }
-
-            val actions = LinearLayout(this).apply {
+            card.addView(LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(0, dp(8), 0, 0)
-            }
-            actions.addView(Button(this).apply {
-                text = getString(R.string.sources_recrawl)
-                isAllCaps = false
-                setBackgroundResource(R.drawable.clay_btn_ghost)
-                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
-                setOnClickListener { recrawlSource(id) }
-            })
-            actions.addView(Button(this).apply {
-                text = getString(R.string.sources_delete)
-                isAllCaps = false
-                setBackgroundResource(R.drawable.clay_btn_danger)
-                setTextColor(android.graphics.Color.WHITE)
-                setOnClickListener {
+                addView(ghostButton(getString(R.string.sources_recrawl)) { recrawlSource(id) })
+                addView(dangerButton(getString(R.string.sources_delete)) {
                     deleteSource(id, if (domain.isNotEmpty()) domain else url)
-                }
+                })
             })
-            card.addView(actions)
-
             sourceList.addView(card)
         }
     }
@@ -717,137 +904,377 @@ class MainActivity : AppCompatActivity() {
         sourceStatus.visibility = View.VISIBLE
     }
 
-    // ------------------------------------------------------------- webview ----
+    // --------------------------------------------------------------- sites ----
 
-    /**
-     * Create and configure the WebView the first time a web-backed tab is
-     * opened. Doing this in onCreate made activity creation heavy enough to
-     * miss the foreground-service start deadline on a slow device, so it is
-     * deferred until it is actually needed.
-     */
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun ensureWebView(): WebView {
-        web?.let { return it }
-        val view = WebView(this)
-        view.layoutParams = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT)
-        webContainer.addView(view)
-        web = view
-        view.settings.javaScriptEnabled = true
-        view.settings.domStorageEnabled = true
-        // No local file or content access: the page is served over HTTP only.
-        view.settings.allowFileAccess = false
-        view.settings.allowContentAccess = false
-        view.settings.javaScriptCanOpenWindowsAutomatically = false
-        view.settings.setSupportMultipleWindows(false)
-        view.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        // The Clay CSS is light-only. Android's "algorithmic darkening" would
-        // invert the page in system dark mode and paint it black, so it is
-        // turned off explicitly (the theme pins light colours as well).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            view.settings.isAlgorithmicDarkeningAllowed = false
-        } else {
-            @Suppress("DEPRECATION")
-            run { view.settings.forceDark = WebSettings.FORCE_DARK_OFF }
+    private fun wireSites() {
+        sitesFilter.setOnEditorActionListener { _, _, _ -> loadSites(); true }
+        sitesLocalOnly.setOnCheckedChangeListener { _, _ -> loadSites() }
+        findViewById<Button>(R.id.site_back).setOnClickListener { showSiteList() }
+    }
+
+    private fun loadSites() {
+        showSiteList()
+        if (ServerController.state != ServerState.RUNNING) {
+            renderSites(JSONArray())
+            showSitesStatus(getString(R.string.sources_need_running), false)
+            return
         }
-        view.setBackgroundColor(android.graphics.Color.parseColor("#F5F5F5"))
-        // Never add a JavaScript interface: that would expose native calls to
-        // any page. Keep the WebView free of bridges.
-        //
-        // A WebChromeClient *is* required, though: without one the WebView
-        // silently drops window.confirm()/window.alert() (onJsConfirm returns
-        // false by default), so every admin form guarded by a confirm() — delete
-        // a site, recrawl all, pause/resume all, reset settings — would look
-        // like a dead button. Rendering the dialogs is what makes those work.
-        view.webChromeClient = object : WebChromeClient() {
-            override fun onJsConfirm(
-                view: WebView?, url: String?, message: String?, result: JsResult?
-            ): Boolean {
-                if (message == null || result == null) return super.onJsConfirm(view, url, message, result)
-                buildJsDialog(message, confirm = true,
-                    onConfirm = { result.confirm() },
-                    onCancel = { result.cancel() })
-                return true
-            }
-
-            override fun onJsAlert(
-                view: WebView?, url: String?, message: String?, result: JsResult?
-            ): Boolean {
-                if (message == null || result == null) return super.onJsAlert(view, url, message, result)
-                buildJsDialog(message, confirm = false, onConfirm = { result.confirm() })
-                return true
+        ServerController.loadSites(
+            sitesFilter.text.toString().trim(), "", sitesLocalOnly.isChecked) { json, error ->
+            runOnUiThread {
+                if (error != null || json == null) {
+                    renderSites(JSONArray())
+                    showSitesStatus(getString(R.string.sites_load_error, error ?: ""), false)
+                    return@runOnUiThread
+                }
+                try {
+                    val obj = JSONObject(json)
+                    if (obj.has("error")) {
+                        renderSites(JSONArray())
+                        showSitesStatus(getString(R.string.sites_load_error, obj.optString("error")), false)
+                    } else {
+                        renderSites(obj.optJSONArray("sites") ?: JSONArray())
+                    }
+                } catch (t: Throwable) {
+                    renderSites(JSONArray())
+                    showSitesStatus(getString(R.string.sites_load_error, t.message ?: ""), false)
+                }
             }
         }
-        view.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val url = request.url
-                return if (isLocal(url)) {
-                    false
+    }
+
+    private fun showSiteList() {
+        sitesListPane.visibility = View.VISIBLE
+        siteDetailPane.visibility = View.GONE
+        currentSiteId = -1
+    }
+
+    private fun renderSites(sites: JSONArray) {
+        sitesList.removeAllViews()
+        if (sites.length() == 0) {
+            sitesList.addView(TextView(this).apply {
+                text = getString(R.string.sites_empty)
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 14f
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+            })
+            return
+        }
+        for (i in 0 until sites.length()) {
+            val site = sites.getJSONObject(i)
+            val id = site.optInt("id", -1)
+            val card = card()
+            card.addView(TextView(this).apply {
+                text = site.optString("url")
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                textSize = 16f
+                setTypeface(typeface, Typeface.BOLD)
+                setOnClickListener { openSite(id) }
+            })
+            val badges = buildString {
+                append(statusLabel(site.optString("status")))
+                if (site.optBoolean("is_local")) append(" · ").append(getString(R.string.sites_local_badge))
+            }
+            card.addView(TextView(this).apply {
+                text = badges
+                setTextColor(ContextCompat.getColor(context, R.color.clay_secondary_dark))
+                textSize = 12f
+                setPadding(0, dp(2), 0, 0)
+            })
+            card.addView(TextView(this).apply {
+                text = getString(R.string.sites_indexed) + ": " + site.optInt("indexed") +
+                        " · " + getString(R.string.sites_pending) + ": " + site.optInt("pending") +
+                        " · " + getString(R.string.sites_errors) + ": " + site.optInt("errors")
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 12f
+                setPadding(0, dp(4), 0, 0)
+            })
+            card.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+                addView(ghostButton(getString(R.string.sites_edit)) { openSite(id) })
+            })
+            sitesList.addView(card)
+        }
+    }
+
+    private fun showSitesStatus(text: String, ok: Boolean) {
+        if (text.isEmpty()) {
+            sitesStatus.visibility = View.GONE
+            return
+        }
+        sitesStatus.text = text
+        sitesStatus.setTextColor(ContextCompat.getColor(
+            this, if (ok) R.color.clay_ok_text else R.color.clay_err_text))
+        sitesStatus.visibility = View.VISIBLE
+    }
+
+    private fun statusLabel(status: String): String = when (status) {
+        "active" -> getString(R.string.sites_status_active)
+        "paused" -> getString(R.string.sites_status_paused)
+        "blocked" -> getString(R.string.sites_status_blocked)
+        else -> status
+    }
+
+    private fun openSite(id: Int) {
+        currentSiteId = id
+        sitesListPane.visibility = View.GONE
+        siteDetailPane.visibility = View.VISIBLE
+        siteDetailTitle.text = "…"
+        siteDetailStatus.text = ""
+        siteDetailBody.removeAllViews()
+        ServerController.loadSiteDetail(id) { json, error ->
+            runOnUiThread {
+                if (error != null || json == null) {
+                    siteDetailStatus.text = getString(R.string.sites_detail_error, error ?: "")
+                    return@runOnUiThread
+                }
+                renderSiteDetail(json)
+            }
+        }
+    }
+
+    private fun renderSiteDetail(json: String) {
+        siteDetailBody.removeAllViews()
+        siteFields.clear()
+        try {
+            val obj = JSONObject(json)
+            if (obj.has("error")) {
+                siteDetailStatus.text = getString(R.string.sites_detail_error, obj.optString("error"))
+                return
+            }
+            val site = obj.getJSONObject("site")
+            val siteId = site.optInt("id", currentSiteId)
+            siteDetailTitle.text = site.optString("url")
+            siteDetailStatus.text = getString(R.string.sites_last_crawled, site.optString("last_crawled"))
+
+            val editor = card()
+            editor.addView(sectionTitle(getString(R.string.sites_edit)))
+
+            val maxPages = EditText(this).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                setText(site.optInt("max_pages").toString())
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            }
+            editor.addView(fieldLabel(getString(R.string.sites_edit_max_pages)))
+            editor.addView(maxPages)
+            siteFields["max_pages"] = { maxPages.text.toString().trim() }
+
+            val statuses = obj.optJSONArray("statuses") ?: JSONArray()
+            val statusValues = ArrayList<String>()
+            val statusLabels = ArrayList<String>()
+            for (s in 0 until statuses.length()) {
+                val v = statuses.getString(s)
+                statusValues.add(v)
+                statusLabels.add(statusLabel(v))
+            }
+            val statusSpinner = Spinner(this)
+            statusSpinner.adapter = ArrayAdapter(
+                this, android.R.layout.simple_spinner_dropdown_item, statusLabels)
+            val sIndex = statusValues.indexOf(site.optString("status"))
+            if (sIndex >= 0) statusSpinner.setSelection(sIndex)
+            editor.addView(fieldLabel(getString(R.string.sites_edit_status)))
+            editor.addView(statusSpinner)
+            siteFields["status"] = { statusValues[statusSpinner.selectedItemPosition] }
+
+            val aliases = EditText(this).apply {
+                setText(joinAliases(site.optJSONArray("aliases")))
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            }
+            editor.addView(fieldLabel(getString(R.string.sites_edit_aliases)))
+            editor.addView(aliases)
+            siteFields["aliases"] = { aliases.text.toString().trim() }
+
+            val priority = EditText(this).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                setText(site.optDouble("priority", 1.0).toString())
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+            }
+            editor.addView(fieldLabel(getString(R.string.sites_edit_priority)))
+            editor.addView(priority)
+            siteFields["priority"] = { priority.text.toString().trim() }
+
+            val local = CheckBox(this).apply {
+                isChecked = site.optBoolean("is_local")
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+                text = getString(R.string.sites_edit_is_local)
+            }
+            editor.addView(local)
+            siteFields["is_local"] = { local.isChecked }
+
+            editor.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+                addView(primaryButton(getString(R.string.settings_save)) { saveSite(siteId) })
+                addView(ghostButton(getString(R.string.sites_recrawl)) { recrawlSite(siteId) })
+                addView(dangerButton(getString(R.string.sites_delete)) {
+                    deleteSite(siteId, site.optString("url"))
+                })
+            })
+            siteDetailBody.addView(editor)
+
+            siteDetailBody.addView(listCard(getString(R.string.sites_detail_sources),
+                obj.optJSONArray("sources") ?: JSONArray()) { s ->
+                sourceTypeLabel(s.optString("type")) + "\n" + s.optString("url")
+            })
+            siteDetailBody.addView(listCard(getString(R.string.sites_detail_pages),
+                obj.optJSONArray("pages") ?: JSONArray()) { p ->
+                p.optString("title") + "\n" + p.optString("indexed_at")
+            })
+            siteDetailBody.addView(listCard(getString(R.string.sites_detail_errors),
+                obj.optJSONArray("errors") ?: JSONArray()) { e ->
+                e.optString("url") + "\n" + e.optString("reason")
+            })
+        } catch (t: Throwable) {
+            siteDetailStatus.text = getString(R.string.sites_detail_error, t.message ?: "")
+        }
+    }
+
+    private fun joinAliases(aliases: JSONArray?): String {
+        if (aliases == null) return ""
+        val parts = ArrayList<String>()
+        for (i in 0 until aliases.length()) parts.add(aliases.optString(i))
+        return parts.joinToString(", ")
+    }
+
+    private fun listCard(title: String, items: JSONArray, line: (JSONObject) -> String): View {
+        val card = card()
+        card.addView(sectionTitle(title))
+        if (items.length() == 0) {
+            card.addView(TextView(this).apply {
+                text = getString(R.string.sites_detail_none)
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 13f
+            })
+            return card
+        }
+        for (i in 0 until items.length()) {
+            card.addView(TextView(this).apply {
+                text = line(items.getJSONObject(i))
+                setTextColor(ContextCompat.getColor(context, R.color.clay_text_light))
+                textSize = 12f
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+        return card
+    }
+
+    private fun saveSite(siteId: Int) {
+        val payload = JSONObject()
+        payload.put("id", siteId)
+        payload.put("max_pages", siteFields["max_pages"]?.invoke())
+        payload.put("status", siteFields["status"]?.invoke())
+        payload.put("aliases", siteFields["aliases"]?.invoke())
+        payload.put("priority", siteFields["priority"]?.invoke())
+        payload.put("is_local", siteFields["is_local"]?.invoke())
+        ServerController.updateSite(payload.toString()) { message, error ->
+            runOnUiThread {
+                if (error != null) {
+                    showSitesStatus(getString(R.string.sites_save_error, error), false)
                 } else {
-                    // External links leave the privileged WebView.
-                    startActivity(Intent(Intent.ACTION_VIEW, url))
-                    true
+                    showSitesStatus(message ?: getString(R.string.sites_saved), true)
+                    openSite(siteId)
                 }
-            }
-
-            override fun onPageFinished(view: WebView, url: String) {
-                loadedOnce = true
-            }
-
-            /**
-             * A renderer crash (typically the system killing the sandboxed
-             * renderer under memory pressure) would otherwise take the whole
-             * process down. Recover by reloading the local page instead.
-             */
-            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                Log.w(TAG, "WebView renderer gone (crashed=${detail.didCrash()})")
-                loadedOnce = false
-                if (ServerController.state == ServerState.RUNNING) {
-                    view.postDelayed({
-                        load(if (onAdmin) "${ServerController.BASE_URL}admin"
-                             else ServerController.BASE_URL)
-                    }, 500)
-                }
-                return true
             }
         }
-        return view
+    }
+
+    private fun deleteSite(siteId: Int, url: String) {
+        buildConfirmDialog(getString(R.string.sites_delete_confirm, url)) {
+            ServerController.deleteSite(siteId) { message, error ->
+                runOnUiThread {
+                    if (error != null) {
+                        showSitesStatus(getString(R.string.sites_save_error, error), false)
+                    } else {
+                        showSiteList()
+                        showSitesStatus(message ?: "", true)
+                        loadSites()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun recrawlSite(siteId: Int) {
+        ServerController.recrawlSite(siteId) { message, error ->
+            runOnUiThread {
+                if (error != null) {
+                    showSitesStatus(getString(R.string.sites_save_error, error), false)
+                } else {
+                    showSitesStatus(message ?: "", true)
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- shared widgets ---
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setBackgroundResource(R.drawable.clay_card)
+        setPadding(dp(18), dp(14), dp(18), dp(14))
+        val lp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.bottomMargin = dp(10)
+        layoutParams = lp
+    }
+
+    private fun sectionTitle(text: String): TextView = TextView(this).apply {
+        this.text = text
+        setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+        textSize = 15f
+        setTypeface(typeface, Typeface.BOLD)
+        setPadding(0, 0, 0, dp(6))
+    }
+
+    private fun fieldLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+        textSize = 12f
+        setPadding(0, dp(8), 0, 0)
+    }
+
+    private fun ghostButton(text: String, onClick: () -> Unit): Button = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setBackgroundResource(R.drawable.clay_btn_ghost)
+        setTextColor(ContextCompat.getColor(context, R.color.clay_text))
+        setOnClickListener { onClick() }
+    }
+
+    private fun primaryButton(text: String, onClick: () -> Unit): Button = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setBackgroundResource(R.drawable.clay_btn_primary)
+        setTextColor(Color.WHITE)
+        setOnClickListener { onClick() }
+    }
+
+    private fun dangerButton(text: String, onClick: () -> Unit): Button = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setBackgroundResource(R.drawable.clay_btn_danger)
+        setTextColor(Color.WHITE)
+        setOnClickListener { onClick() }
     }
 
     /**
-     * Show a JS dialog and hand the outcome back through [onConfirm]/[onCancel].
+     * Show a native confirm dialog and run [onConfirm] when the user accepts.
      *
      * Kept as a separate, side-effect-light method so an instrumentation test
-     * can drive the same AlertDialog the WebChromeClient builds without a real
-     * DevTools session attached (an attached DevTools client intercepts
-     * window.confirm()/window.alert() itself, so onJsConfirm is never called).
+     * can drive the same AlertDialog the screens build.
      */
-    internal fun buildJsDialog(
-        message: String,
-        confirm: Boolean,
-        onConfirm: () -> Unit,
-        onCancel: () -> Unit = {},
-    ): AlertDialog {
-        val builder = AlertDialog.Builder(this)
+    internal fun buildConfirmDialog(message: String, onConfirm: () -> Unit): AlertDialog {
+        val dialog = AlertDialog.Builder(this)
             .setMessage(message)
             .setCancelable(false)
             .setPositiveButton(android.R.string.ok) { _, _ -> onConfirm() }
-        if (confirm) {
-            builder.setNegativeButton(android.R.string.cancel) { _, _ -> onCancel() }
-        }
-        val dialog = builder.create()
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
         dialog.show()
         return dialog
-    }
-
-    private fun isLocal(uri: Uri): Boolean {
-        val host = uri.host ?: return false
-        return uri.scheme == "http" && (host == "127.0.0.1" || host == "localhost")
-    }
-
-    private fun load(url: String) {
-        ensureWebView().loadUrl(url)
     }
 
     // ---------------------------------------------------------- dump import ----
@@ -889,6 +1316,9 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------ rendering ----
 
     private fun renderState(state: ServerState) {
+        val running = state == ServerState.RUNNING
+        homeStart.isEnabled = state == ServerState.STOPPED || state == ServerState.ERROR
+        homeStop.isEnabled = running
         when (state) {
             ServerState.STARTING -> {
                 status.text = getString(R.string.state_starting)
@@ -897,9 +1327,9 @@ class MainActivity : AppCompatActivity() {
                 homeError.visibility = View.GONE
             }
             ServerState.RUNNING -> {
-                status.text = getString(R.string.state_running, ServerController.backendLabel)
+                status.text = getString(R.string.state_running)
                 retry.visibility = View.GONE
-                setHomeStatus(getString(R.string.state_running, ServerController.backendLabel), true)
+                setHomeStatus(getString(R.string.state_running), true)
                 homeError.visibility = View.GONE
                 if (ServerController.backendLabel.isNotEmpty()) {
                     homeBackend.text = getString(R.string.home_status_detail, ServerController.backendLabel)
@@ -908,13 +1338,11 @@ class MainActivity : AppCompatActivity() {
                     homeBackend.visibility = View.GONE
                 }
                 syncLanToggle()
-                // Only now is localhost reachable.
-                if ((currentTab == R.id.tab_search || currentTab == R.id.tab_admin) &&
-                    (!loadedOnce || web?.url == null)) {
-                    load(if (onAdmin) "${ServerController.BASE_URL}admin" else ServerController.BASE_URL)
-                }
-                if (currentTab == R.id.tab_sources) {
-                    loadSources()
+                when (currentTab) {
+                    R.id.tab_home -> loadDashboard()
+                    R.id.tab_search -> loadNews()
+                    R.id.tab_sources -> loadSources()
+                    R.id.tab_web -> loadSites()
                 }
             }
             ServerState.STOPPING -> {
@@ -927,6 +1355,7 @@ class MainActivity : AppCompatActivity() {
                 setHomeStatus(getString(R.string.state_stopped), false)
                 homeError.visibility = View.GONE
                 syncLanToggle()
+                renderDashboard(null)
             }
             ServerState.ERROR -> {
                 status.text = getString(R.string.state_error, ServerController.lastError)
@@ -935,6 +1364,7 @@ class MainActivity : AppCompatActivity() {
                 homeError.text = ServerController.lastError
                 homeError.visibility = View.VISIBLE
                 syncLanToggle()
+                renderDashboard(null)
             }
         }
     }
@@ -963,8 +1393,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         ServerController.removeListener(stateListener)
-        web?.destroy()
-        web = null
         super.onDestroy()
     }
 

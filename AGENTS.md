@@ -393,32 +393,36 @@ scheduler only registers a job when its interval is non-zero.
 ## Android APK (`android/`)
 
 An APK bundles the same `app_combined.py` server via Chaquopy (Python 3.13) and
-shows it in a **native Czech UI** (Home / Search / Sources / Admin / Settings
-tabs); only the Search and Admin tabs embed the local server in a locked-down
-WebView, while Home, Sources and Settings are pure Android views. It does **not**
-need Termux, root or a separate Python. `android_entry.py` is the Python entry
-point (sets lowmem/loopback env, calls `start_server()`/`stop_server()`, exposes
-`settings_json()`/`save_settings_json()` and the source bridges); Kotlin
-`PythonRuntime` starts the interpreter exactly once per process and
-`ServerController` + `ServerService` own the lifecycle. Build with
+shows it in a **fully native Czech UI** — five tabs (Domů / Hledat / Zdroje /
+Weby / Nastavení), **no WebView anywhere**: search, sources, sites and settings
+are all real Android views rendered from JSON the Python bridge returns. It does
+**not** need Termux, root or a separate Python. `android_entry.py` is the Python
+entry point (sets lowmem/loopback env, calls `start_server()`/`stop_server()`,
+exposes `settings_json()`/`save_settings_json()` and the source/site/search
+bridges); Kotlin `PythonRuntime` starts the interpreter exactly once per process
+and `ServerController` + `ServerService` own the lifecycle. Build with
 `cd android && ./gradlew :app:assembleDebug`.
 
 Facts to preserve:
 
-- **Native UI + single source of truth.** The Settings screen renders whatever
-  `android_entry.settings_json()` returns from `SETTINGS_SPEC`; never add a
-  second, unsynchronised config in Kotlin. Adding and managing sources is a
-  *native* screen (the „Zdroje" tab, `view_sources.xml` + `MainActivity`), not
-  the public web page and not the admin WebView: it calls
-  `android_entry.sources_json()` / `add_source_json()` / `delete_source_json()`
-  / `recrawl_source_json()`, which reuse `get_all_sources()`, `add_source()`,
-  `delete_source()` and `recrawl_async()` so `site_sources` stays the only
+- **Native UI + single source of truth.** Every screen renders what the bridge
+  returns; never add a second, unsynchronised config in Kotlin. Settings come
+  from `android_entry.settings_json()` (`SETTINGS_SPEC`); sources, sites and
+  search come from `sources_json()` / `add_source_json()` / `delete_source_json()`
+  / `recrawl_source_json()`, `sites_json()` / `site_detail_json()` /
+  `update_site_json()` / `delete_site_json()` / `recrawl_site_json()` and
+  `search_json()` / `news_json()` / `dashboard_json()`. Those reuse
+  `get_all_sources()`, `add_source()`, `delete_source()`, `recrawl_async()`,
+  `hybrid_search()`/`prepare_results()` etc., so the database stays the only
   source of truth. The public `/` page offers **no** add-source surface and no
   admin links (its nav is the `topnav` block override in `search.html`).
-  `MainActivity` builds the WebView lazily (first time the Search/Admin tab
-  opens) so `onCreate` does not delay the foreground service, and
-  `WebChromeClient` turns `confirm()`/`alert()` into native dialogs
-  (`MainActivity.buildJsDialog`, covered by `MainActivityUiTest`).
+  `tests/test_android_bridge.py` pins this contract without a device.
+- **No WebView, ever.** `MainActivity` is pure Android views; the bridge must
+  send **plain text** (it strips tags and decodes entities) because a native
+  `TextView` has no HTML escape step. Destructive actions use the native
+  `MainActivity.buildConfirmDialog` (covered by `MainActivityUiTest`, which also
+  asserts no `WebView` exists in the view tree). The backend `/admin` panel and
+  `/` page still exist for desktop/iOS, but the APK never renders them.
 - **Lifecycle states** are real: `STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/
   `ERROR`. `RUNNING` is only set after a successful HTTP `/health` probe, never
   just because a thread was spawned; `start` is idempotent (rotation/repeat

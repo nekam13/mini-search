@@ -13,8 +13,10 @@ Environment overrides are applied here *before* ``app_combined`` is imported,
 because the module reads its configuration at import time.
 """
 
+import html as html_module
 import json
 import os
+import re
 import threading
 
 HOST = "127.0.0.1"
@@ -335,6 +337,290 @@ def recrawl_source_json(source_id):
 def base_url():
     """URL the WebView should load."""
     return f"http://{HOST}:{PORT}/"
+
+
+# ---------------------------------------------------------------------------
+# Native screens (the app has no WebView): overview, search and site admin.
+# Everything below returns display-ready JSON built from the same backend
+# helpers the web templates used, so there is still one source of truth.
+# ---------------------------------------------------------------------------
+
+def _site_brief(module, site):
+    """Flatten one decorated site row into a display dict for the native list."""
+    return {
+        "id": site.get("id"),
+        "url": site.get("canonical_url") or "",
+        "status": site.get("status") or "",
+        "is_local": bool(site.get("is_local")),
+        "indexed": site.get("indexed", 0),
+        "pending": site.get("pending", 0),
+        "errors": site.get("errors", 0),
+        "sources": site.get("sources", 0),
+        "max_pages": site.get("max_pages", 0),
+        "priority": site.get("search_priority_multiplier", 1.0),
+        "last_crawled": site.get("last_crawled_str") or "",
+        "aliases": site.get("aliases_list") or [],
+    }
+
+
+def dashboard_json():
+    """Overview for the native home screen: global stats plus every site.
+
+    Mirrors ``/admin`` (global counters) and ``/admin/sites`` (per-site cards)
+    in one payload, so the native home screen renders real numbers instead of a
+    second, unsynchronised copy.
+    """
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        stats = module.get_db_stats()
+        sites = [_site_brief(module, site) for site in module.get_all_sites()]
+        return json.dumps({
+            "stats": {
+                "sites": stats.get("sites", 0),
+                "pages": stats.get("pages", 0),
+                "pending": stats.get("pending", 0),
+                "errors": stats.get("errors", 0),
+                "sources": stats.get("sources", 0),
+            },
+            "sites": sites,
+            "backend": module.embedding_backend_label(),
+        })
+
+
+def sites_json(search="", status="", local_only=False):
+    """Filtered site list for the native "Weby" screen. Returns JSON."""
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        try:
+            sites = module.get_filtered_sites(
+                search=search or "", status=status or "", local_only=bool(local_only))
+        except Exception as exc:  # pragma: no cover - defensive
+            return json.dumps({"error": str(exc), "sites": []})
+        return json.dumps({
+            "sites": [_site_brief(module, site) for site in sites],
+            "count": len(sites),
+        })
+
+
+def site_detail_json(site_id):
+    """One site with its sources, recent pages and crawl errors. Returns JSON."""
+    _apply_android_defaults()
+    try:
+        site_id = int(site_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID webu."})
+    with _lock:
+        module = _module()
+        site = module.get_site_by_id(site_id)
+        if not site:
+            return json.dumps({"error": "Web nenalezen."})
+        module._decorate_site(site)
+        sources = []
+        for source in module.get_site_sources(site_id):
+            sources.append({
+                "id": source.get("id"),
+                "url": source.get("url") or "",
+                "type": source.get("source_type") or "",
+                "status": source.get("status") or "",
+                "priority": source.get("priority"),
+                "last_checked": source.get("last_checked_str") or "",
+            })
+        pages = []
+        for page in module.get_recent_pages(site_id, limit=15):
+            pages.append({
+                "title": _plain_text(page.get("title")),
+                "url": page.get("url") or "",
+                "indexed_at": page.get("indexed_at_str") or "",
+            })
+        errors = []
+        for row in module.execute_db_fetchall(
+            "SELECT url, error_reason, retry_count FROM crawl_queue "
+            "WHERE site_id = ? AND status = 'error' ORDER BY id DESC LIMIT 20",
+            (site_id,),
+        ):
+            errors.append({
+                "url": row[0] or "",
+                "reason": row[1] or "",
+                "retries": row[2] or 0,
+            })
+        return json.dumps({
+            "site": _site_brief(module, site),
+            "sources": sources,
+            "pages": pages,
+            "errors": errors,
+            "max_pages_min": module.MAX_PAGES_MIN,
+            "max_pages_max": module.MAX_PAGES_MAX,
+            "statuses": list(module.VALID_SITE_STATUSES),
+        })
+
+
+def update_site_json(payload_json):
+    """Save the editable site fields from the native editor. Returns JSON."""
+    _apply_android_defaults()
+    try:
+        payload = json.loads(payload_json or "{}")
+    except ValueError:
+        return json.dumps({"error": "Neplatná data."})
+    try:
+        site_id = int(payload.get("id"))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID webu."})
+    with _lock:
+        module = _module()
+        ok, message = module.update_site(
+            site_id,
+            max_pages=payload.get("max_pages"),
+            status=payload.get("status"),
+            aliases=payload.get("aliases"),
+            is_local=payload.get("is_local"),
+            search_priority_multiplier=payload.get("priority"),
+        )
+        if not ok:
+            return json.dumps({"error": message or "Web se nepodařilo uložit."})
+        return json.dumps({"message": message or "Web byl uložen."})
+
+
+def delete_site_json(site_id):
+    """Delete a site and everything under it. Returns JSON."""
+    _apply_android_defaults()
+    try:
+        site_id = int(site_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID webu."})
+    with _lock:
+        module = _module()
+        if not module.get_site_by_id(site_id):
+            return json.dumps({"error": "Web nenalezen."})
+        module.delete_site(site_id)
+        return json.dumps({"message": "Web byl smazán."})
+
+
+def recrawl_site_json(site_id):
+    """Queue an immediate re-crawl of a whole site. Returns JSON."""
+    _apply_android_defaults()
+    try:
+        site_id = int(site_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Neplatné ID webu."})
+    with _lock:
+        module = _module()
+        ok, message = module.recrawl_async(site_id)
+        if not ok:
+            return json.dumps({"error": message or "Re-crawl se nepodařilo spustit."})
+        return json.dumps({"message": message or "Re-crawl byl spuštěn."})
+
+
+def _set_all_status(status):
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        if status == "paused":
+            module.execute_db(
+                "UPDATE sites SET status='paused' WHERE status='active'", commit=True)
+            return json.dumps({"message": "Všechny aktivní weby byly pozastaveny."})
+        module.execute_db(
+            "UPDATE sites SET status='active' WHERE status='paused'", commit=True)
+        return json.dumps({"message": "Všechny pozastavené weby byly obnoveny."})
+
+
+def pause_all_json():
+    """Pause every active site (native quick action). Returns JSON."""
+    return _set_all_status("paused")
+
+
+def resume_all_json():
+    """Resume every paused site (native quick action). Returns JSON."""
+    return _set_all_status("active")
+
+
+def recrawl_all_json():
+    """Queue a re-crawl of every active site on a background thread. Returns JSON."""
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        threading.Thread(target=module.recrawl_all_sites,
+                         name="minisearch-recrawl-all", daemon=True).start()
+        return json.dumps({"message": "Re-crawl všech aktivních webů byl spuštěn."})
+
+
+def _plain_text(value):
+    """Strip HTML tags from a string bound for a native TextView.
+
+    The web template escapes and highlights the snippet itself; a native
+    ``TextView`` has no HTML step, so any leftover markup (a page whose body
+    carried a literal ``<script>`` block) would show up as literal angle
+    brackets. The native bridge is the display boundary, so it flattens the
+    text here.
+    """
+    if not value:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", str(value))
+    text = html_module.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_json(payload_json):
+    """Run a hybrid search for the native search screen. Returns JSON.
+
+    The payload is ``{"q": "...", "filter": "all"|"articles"|"podcasts"|
+    "audio"|"price", "limit": N}``. Results carry plain-text fields (no HTML),
+    because the native screen renders them itself; the snippet is produced by
+    the same ``_result_snippet`` helper the web page uses, so the windowing and
+    diacritic-insensitive matching are identical.
+    """
+    _apply_android_defaults()
+    try:
+        payload = json.loads(payload_json or "{}")
+    except ValueError:
+        return json.dumps({"error": "Neplatná data."})
+    query = (payload.get("q") or "").strip()
+    if not query:
+        return json.dumps({"results": [], "count": 0, "query": ""})
+    filter_type = (payload.get("filter") or "all").strip()
+    try:
+        limit = int(payload.get("limit") or 25)
+    except (TypeError, ValueError):
+        limit = 25
+    limit = max(1, min(limit, 100))
+    with _lock:
+        module = _module()
+        raw = module.hybrid_search(
+            query, limit=limit,
+            filter_type=filter_type if filter_type != "all" else None)
+        prepared = module.prepare_results(raw, query)
+        results = []
+        for item in prepared:
+            results.append({
+                "title": _plain_text(item.get("display_title")),
+                "url": item.get("url") or "",
+                "domain": item.get("domain") or "",
+                "path": item.get("display_url_path") or "",
+                "snippet": _plain_text(module._result_snippet(item, query)),
+                "relevance": item.get("relevance_pct") or 0,
+                "date": item.get("display_date") or "",
+                "card_type": item.get("card_type") or "",
+                "badge": item.get("card_badge") or "",
+                "thumb": item.get("thumb") or "",
+            })
+        return json.dumps({"results": results, "count": len(results), "query": query})
+
+
+def news_json(limit=12):
+    """Most recently indexed pages, for the native search screen's empty state."""
+    _apply_android_defaults()
+    with _lock:
+        module = _module()
+        items = []
+        for page in module.latest_indexed_pages(limit=limit):
+            items.append({
+                "title": _plain_text(page.get("og_title") or page.get("title")
+                                     or page.get("url") or ""),
+                "url": page.get("url") or "",
+                "domain": page.get("site_domain") or "",
+            })
+        return json.dumps({"items": items})
 
 
 def _wiki_dump_url(path):

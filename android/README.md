@@ -2,34 +2,38 @@
 
 Samostatná aplikace pro Android, která **nevyžaduje Termux**. Server
 (`app_combined.py`) i jeho Python závislosti jsou zabalené přímo v APK pomocí
-[Chaquopy](https://chaquo.com/chaquopy/). Aplikace má **nativní české UI**
-(obrazovky Domů / Hledat / Zdroje / Správa / Nastavení) a jen ve dvou záložkách
-(Hledat, Správa) zobrazuje lokální server v uzamčeném WebView. Přidávání
-a správa zdrojů je **součástí aplikace** (nativní obrazovka Zdroje), ne webová
-stránka — veřejná stránka `/` žádné přidávání zdrojů nenabízí.
+[Chaquopy](https://chaquo.com/chaquopy/). Aplikace je **kompletně nativní**:
+pět českých záložek (Domů / Hledat / Zdroje / Weby / Nastavení), žádný WebView.
+Veškerá konfigurace i správa zdrojů jsou součástí aplikace, ne webové stránky —
+veřejná stránka `/` žádné přidávání zdrojů ani odkaz do administrace nenabízí.
 
 - **Domů** – nativní ovládání serveru: stav (`STOPPED`/`STARTING`/`RUNNING`/
-  `STOPPING`/`ERROR`), tlačítka Start / Zastavit / Znovu spustit, přepínač
-  „Sdílet v síti" (LAN), zobrazení LAN adresy pro PC a import wiki dumpu.
-- **Hledat** – veřejná stránka `/` v WebView (jen vyhledávání a novinky).
+  `STOPPING`/`ERROR`), tlačítka Start / Zastavit / Restartovat, přehled indexu
+  (weby / stránky / fronta / chyby / zdroje), rychlé akce (re-crawl všech,
+  pozastavit vše, obnovit vše), přepínač „Sdílet v síti" (LAN) s adresou pro PC
+  a import wiki dumpu.
+- **Hledat** – nativní vyhledávání: dotaz, filtr (vše / články / podcasty /
+  audio / s cenou) a seznam výsledků. Data dodává `android_entry.search_json()`
+  (stejný `hybrid_search` jako web), takže se v aplikaci nezobrazuje žádná
+  webová stránka.
 - **Zdroje** – nativní obrazovka: přidání zdroje (typ se rozpozná automaticky
   z adresy), seznam zdrojů s re-crawlem a smazáním. Volá Python přes
   `android_entry.sources_json()` / `add_source_json()` / `delete_source_json()`
   / `recrawl_source_json()`, takže platí jediný zdroj pravdy (`site_sources`)
   a indexace se spouští na pozadí.
-- **Správa** – panel `/admin` v WebView; server poslouchá jen na `127.0.0.1`,
-  takže administrace není dostupná z LAN (`MINISEARCH_ADMIN_LOCAL_ONLY=1`).
-  Mutující akce (recrawl, pauza, obnovení, smazání) jsou **POST-only**, aby je
-  nešlo spustit obyčejným cross-site odkazem; požadavky s cizím
-  `Origin`/`Referer` se odmítají (403). `confirm()`/`alert()` z admin formulářů
-  vykresluje `WebChromeClient` jako nativní dialog (ověřeno instrumentačním
-  testem).
+- **Weby** – nativní přehled webů s filtrem (adresa, jen místní), detailem
+  (zdroje, naposledy indexované stránky, chyby) a editací (max. stránek, stav,
+  aliasy, priorita, místní web), včetně re-crawlu a smazání celého webu.
 - **Nastavení** – nativní obrazovka, která vykresluje `SETTINGS_SPEC` přímo
   z backendu (v Kotlinu není druhá konfigurace). Uložení, obnovení výchozích
   hodnot a restart při změně, která to vyžaduje.
 - Server drží na pozadí foreground služba (`ServerService`, typ `specialUse`),
   takže indexace neusne. Data (SQLite + logy) jsou v privátním úložišti
   aplikace (`filesDir`).
+
+Backend `/admin` a veřejná stránka `/` dál existují (používá je desktopová
+a iOS verze), ale APK je **nevykresluje** — nemá WebView ani odkaz do
+administrace.
 
 ## Reálné embeddingy (ONNX, offline)
 
@@ -127,7 +131,9 @@ SDK nastavte do `android/local.properties` (`sdk.dir=...`).
 
 Instrumentační sada má dvě části: `ServerSmokeTest` (spouští reálný Chaquopy
 backend a kontroluje `/health`, `/`, `/admin`, stop/restart, LAN sdílení) a
-`MainActivityUiTest` (pět nativních záložek a dialogy `confirm()`/`alert()`).
+`MainActivityUiTest` (pět nativních záložek, nepřítomnost WebView a potvrzovací
+dialog pro destruktivní akce). Bridge mezi Kotlinem a Pythonsem ověřuje
+`tests/test_android_bridge.py` (běží bez zařízení, jen `python3`).
 
 ## Konfigurace
 

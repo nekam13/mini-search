@@ -3,8 +3,7 @@
          light card with dark text. A DayNight parent would follow the system
          dark mode and hand the borderless buttons and the status TextView
          light-on-light colours (invisible UI), so the theme is pinned to
-         Light and algorithmic darkening is disabled for the WebView too
-         (see MainActivity). -->
+         Light and algorithmic darkening is disabled. -->
     <style name="Theme.MiniSearch" parent="Theme.AppCompat.Light.NoActionBar">
         <item name="android:windowBackground">@color/window_background</item>
         <item name="android:forceDarkAllowed">false</item>

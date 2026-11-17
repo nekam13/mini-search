@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Native "Weby" screen. It holds two panes toggled in code: the site list and
+     the site detail (with edit, re-crawl and delete). Everything is rendered
+     from the Python bridge JSON, so there is one source of truth. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/clay_background">
+
+    <!-- List pane -->
+    <LinearLayout
+        android:id="@+id/sites_list_pane"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/clay_card"
+            android:padding="12dp">
+
+            <EditText
+                android:id="@+id/sites_filter"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="@string/sites_filter_hint"
+                android:inputType="text"
+                android:maxLines="1"
+                android:autofillHints=""
+                android:textColor="@color/clay_text" />
+
+            <CheckBox
+                android:id="@+id/sites_local_only"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/clay_text"
+                android:text="@string/sites_local_only" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:id="@+id/sites_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingBottom="10dp"
+                    android:textColor="@color/clay_text_light"
+                    android:textSize="13sp"
+                    android:text="@string/sites_note" />
+
+                <LinearLayout
+                    android:id="@+id/sites_list"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+
+    <!-- Detail pane (hidden until a site is opened) -->
+    <LinearLayout
+        android:id="@+id/site_detail_pane"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:background="@drawable/clay_card"
+            android:padding="12dp"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/site_back"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textAllCaps="false"
+                android:textColor="@color/clay_secondary_dark"
+                android:text="@string/back" />
+
+            <TextView
+                android:id="@+id/site_detail_title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:paddingStart="8dp"
+                android:textColor="@color/clay_text"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:id="@+id/site_detail_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingBottom="10dp"
+                    android:textColor="@color/clay_text_light"
+                    android:textSize="13sp" />
+
+                <LinearLayout
+                    android:id="@+id/site_detail_body"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+</FrameLayout>

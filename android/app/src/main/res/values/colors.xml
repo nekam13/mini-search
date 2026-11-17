@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#1F6FEB</color>
-    <!-- Matches the Clay CSS page background (#F5F5F5) so the window behind
-         the WebView and the page itself are the same colour (no white flash). -->
+    <!-- Matches the Clay page background (#F5F5F5) so the window and the
+         content are the same colour (no white flash on start). -->
     <color name="window_background">#F5F5F5</color>
 
     <!-- Clay design tokens, mirrored from static/css/clay.css so the native
-         screens look like the WebView pages. Keep these in sync with the CSS
+         screens look like the web pages. Keep these in sync with the CSS
          :root block; the CSS remains the reference. -->
     <color name="clay_primary">#4CAF50</color>
     <color name="clay_primary_dark">#388E3C</color>

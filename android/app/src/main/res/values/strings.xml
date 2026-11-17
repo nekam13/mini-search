@@ -1,18 +1,18 @@
 <resources>
     <string name="app_name">Mini Search</string>
     <string name="tab_home">Domů</string>
-    <string name="tab_search">Vyhledávač</string>
+    <string name="tab_search">Hledat</string>
     <string name="tab_sources">Zdroje</string>
-    <string name="tab_admin">Správa</string>
+    <string name="tab_web">Weby</string>
     <string name="tab_settings">Nastavení</string>
-    <string name="action_stop">Zastavit</string>
+
+    <string name="action_stop">Zastavit server</string>
+    <string name="action_start">Spustit server</string>
+    <string name="action_restart">Restartovat server</string>
     <string name="action_retry">Zkusit znovu</string>
     <string name="action_import_dump">Import dumpu</string>
-    <string name="action_restart">Restartovat server</string>
-    <string name="action_start">Spustit server</string>
-    <string name="action_open_web">Otevřít webové rozhraní</string>
     <string name="dump_copying">Kopíruji dump do úložiště aplikace…</string>
-    <string name="dump_copied">Dump zkopírován do úložiště aplikace, import běží na pozadí.</string>
+    <string name="dump_copied">Dump zkopírován, import běží na pozadí.</string>
     <string name="dump_import_error">Import dumpu se nezdařil: %1$s</string>
     <string name="dump_need_running">Nejdřív spusťte server.</string>
 
@@ -21,39 +21,58 @@
     <string name="service_text">Mini Search indexuje na pozadí. Běh spotřebovává baterii.</string>
 
     <string name="state_starting">Spouštím server…</string>
-    <string name="state_running">Server běží (%1$s)</string>
+    <string name="state_running">Server běží</string>
     <string name="state_stopping">Zastavuji server…</string>
     <string name="state_stopped">Server je zastaven.</string>
     <string name="state_error">Server se nepodařilo spustit: %1$s</string>
 
-    <string name="lan_share_toggle">Sdílet v síti</string>
-    <string name="lan_share_hint">Zapněte, pokud chcete vyhledávač otevřít i z jiného zařízení ve stejné Wi-Fi síti (např. z PC). Administrace zůstává jen v tomto zařízení.</string>
+    <!-- Native home screen -->
+    <string name="home_status_title">Stav serveru</string>
+    <string name="home_status_detail">Vyhledávací jádro: %1$s</string>
+    <string name="home_actions_title">Ovládání serveru</string>
+    <string name="home_stats_title">Index</string>
+    <string name="home_stat_sites">Weby</string>
+    <string name="home_stat_pages">Stránky</string>
+    <string name="home_stat_pending">Ve frontě</string>
+    <string name="home_stat_errors">Chyby</string>
+    <string name="home_stat_sources">Zdroje</string>
+    <string name="home_quick_title">Rychlé akce</string>
+    <string name="home_recrawl_all">Re-crawl všech webů</string>
+    <string name="home_pause_all">Pozastavit vše</string>
+    <string name="home_resume_all">Obnovit vše</string>
+    <string name="home_lan_title">Sdílení v síti</string>
+    <string name="lan_share_toggle">Sdílet vyhledávání v místní síti</string>
     <string name="lan_share_url">Otevřete na PC: %1$s</string>
     <string name="lan_share_needs_running">Sdílení v síti lze přepnout, až když server běží.</string>
     <string name="lan_share_no_address">Adresu v síti se nepodařilo zjistit. Zkontrolujte, že jste připojeni k Wi-Fi.</string>
-
-    <!-- Native home screen -->
-    <string name="home_heading">Mini Search</string>
-    <string name="home_subtitle">Lokální vyhledávač běžící přímo v tomto zařízení.</string>
-    <string name="home_status_title">Stav serveru</string>
-    <string name="home_status_detail">Backend: %1$s</string>
-    <string name="home_actions_title">Akce</string>
-    <string name="home_battery_note">Server běží na pozadí jako foreground služba. Nepřetržitý provoz spotřebovává baterii a data; pokud vyhledávač nepotřebujete, zastavte jej tlačítkem Zastavit. Systém může proces při nedostatku paměti ukončit i tak – po návratu do aplikace se server znovu připraví.</string>
-    <string name="home_lan_title">Sdílení ve veřejné síti</string>
-    <string name="home_lan_note">Vyhledávání (a novinky v indexu) se zpřístupní na adrese níže pro ostatní zařízení ve stejné síti. Zdroje se přidávají v aplikaci, administrace zůstává dostupná jen v tomto zařízení.</string>
-    <string name="home_web_note">Webové rozhraní běží na 127.0.0.1 a je dostupné jen v tomto zařízení.</string>
     <string name="home_copy">Kopírovat adresu</string>
     <string name="home_copied">Adresa zkopírována do schránky.</string>
 
+    <!-- Native search screen -->
+    <string name="search_hint">Hledat v indexu…</string>
+    <string name="search_button">Hledat</string>
+    <string name="search_empty_prompt">Zadejte dotaz a prohledejte lokálně indexované stránky.</string>
+    <string name="search_no_results">Pro „%1$s“ se nic nenašlo.</string>
+    <string name="search_result_count">%1$d %2$s pro „%3$s“</string>
+    <string name="search_news_title">Naposledy indexované</string>
+    <string name="search_need_running">Nejdřív spusťte server.</string>
+    <string name="search_error">Hledání se nezdařilo: %1$s</string>
+    <string name="search_open_failed">Odkaz se nepodařilo otevřít.</string>
+    <string name="filter_all">Vše</string>
+    <string name="filter_articles">Články</string>
+    <string name="filter_podcasts">Podcasty</string>
+    <string name="filter_audio">Audio</string>
+    <string name="filter_price">S cenou</string>
+
     <!-- Native settings screen -->
     <string name="settings_title">Nastavení</string>
-    <string name="settings_note">Hodnoty se ukládají do databáze aplikace a řídí se jediným zdrojem pravdy (SETTINGS_SPEC). Položky označené „restart“ se projeví po restartu serveru, který aplikace provede automaticky po uložení.</string>
-    <string name="settings_save">Uložit nastavení</string>
+    <string name="settings_note">Hodnoty se ukládají do databáze aplikace (jediný zdroj pravdy). Položky označené „restart“ se projeví po restartu serveru, který aplikace provede automaticky po uložení.</string>
+    <string name="settings_save">Uložit</string>
     <string name="settings_reset">Obnovit výchozí</string>
     <string name="settings_saved">Nastavení uloženo.</string>
     <string name="settings_saved_restart">Nastavení uloženo, server se restartuje…</string>
-    <string name="settings_reset_done">Nastavení obnoveno na výchozí hodnoty, server se restartuje…</string>
-    <string name="settings_reset_confirm">Obnovit všechna nastavení na výchozí hodnoty z prostředí?</string>
+    <string name="settings_reset_done">Obnoveno na výchozí hodnoty, server se restartuje…</string>
+    <string name="settings_reset_confirm">Obnovit všechna nastavení na výchozí hodnoty?</string>
     <string name="settings_error">Nastavení se nepodařilo uložit: %1$s</string>
     <string name="settings_restart_badge">restart</string>
     <string name="settings_env_hint">Proměnná prostředí: %1$s</string>
@@ -65,8 +84,8 @@
 
     <!-- Native sources screen -->
     <string name="sources_title">Zdroje</string>
-    <string name="sources_note">Přidávejte a spravujte zdroje přímo v aplikaci. Typ zdroje se rozpozná automaticky z adresy a indexace začne na pozadí.</string>
-    <string name="sources_url_hint">https://example.com nebo example.com/feed</string>
+    <string name="sources_note">Přidejte adresu webu, stránky, sitemapy, RSS nebo Wikipedie. Typ se rozpozná automaticky a indexace začne na pozadí.</string>
+    <string name="sources_url_hint">example.com nebo example.com/feed</string>
     <string name="sources_type_label">Typ zdroje</string>
     <string name="sources_add">Přidat a indexovat</string>
     <string name="sources_empty">Zatím žádné zdroje. Přidejte první adresu výše.</string>
@@ -84,5 +103,41 @@
     <string name="sources_type_sitemap">sitemap</string>
     <string name="sources_type_rss">RSS/Atom feed</string>
     <string name="sources_type_wiki">Wikipedie</string>
-    <string name="sources_last_checked">Naposledy zkontrolováno: %1$s</string>
+    <string name="sources_last_checked">Naposledy: %1$s</string>
+
+    <!-- Native sites screen -->
+    <string name="sites_title">Weby</string>
+    <string name="sites_note">Přehled indexovaných webů. Klepnutím otevřete detail, kde web upravíte, spustíte re-crawl nebo smažete.</string>
+    <string name="sites_empty">Zatím žádné weby. Přidejte zdroj na obrazovce Zdroje.</string>
+    <string name="sites_load_error">Weby se nepodařilo načíst: %1$s</string>
+    <string name="sites_filter_hint">Filtrovat podle adresy…</string>
+    <string name="sites_local_only">Jen místní weby</string>
+    <string name="sites_status_active">Aktivní</string>
+    <string name="sites_status_paused">Pozastaveno</string>
+    <string name="sites_status_blocked">Blokováno</string>
+    <string name="sites_local_badge">místní</string>
+    <string name="sites_indexed">Indexováno</string>
+    <string name="sites_pending">Ve frontě</string>
+    <string name="sites_errors">Chyby</string>
+    <string name="sites_sources">Zdroje</string>
+    <string name="sites_detail_sources">Zdroje webu</string>
+    <string name="sites_detail_pages">Naposledy indexované stránky</string>
+    <string name="sites_detail_errors">Chyby při crawlování</string>
+    <string name="sites_detail_none">Žádné záznamy.</string>
+    <string name="sites_detail_error">Detail se nepodařilo načíst: %1$s</string>
+    <string name="sites_recrawl">Re-crawl webu</string>
+    <string name="sites_delete">Smazat web</string>
+    <string name="sites_delete_confirm">Smazat web „%1$s“ i všechny jeho indexované stránky?</string>
+    <string name="sites_edit">Upravit</string>
+    <string name="sites_edit_max_pages">Max. stránek</string>
+    <string name="sites_edit_status">Stav</string>
+    <string name="sites_edit_aliases">Aliasy (oddělené čárkou)</string>
+    <string name="sites_edit_priority">Priorita ve vyhledávání</string>
+    <string name="sites_edit_is_local">Místní web (vyšší priorita, obchází robots.txt)</string>
+    <string name="sites_saved">Web uložen.</string>
+    <string name="sites_save_error">Web se nepodařilo uložit: %1$s</string>
+    <string name="sites_last_crawled">Poslední crawl: %1$s</string>
+    <string name="sites_max_pages_value">Max. stránek: %1$d</string>
+    <string name="sites_priority_value">Priorita: %1$s×</string>
+    <string name="back">Zpět</string>
 </resources>

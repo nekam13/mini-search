@@ -14,21 +14,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * On-device UI tests for the native Clay shell (Home/Search/Admin/Settings) and
- * for the JS-dialog handling that the admin forms depend on.
+ * On-device UI tests for the native-only Clay shell.
  *
- * The dialog tests drive the exact [MainActivity.buildJsDialog] the
- * ``WebChromeClient`` calls. They deliberately do **not** attach a DevTools/CDP
- * client: an attached client intercepts ``window.confirm()``/``window.alert()``
- * itself, so ``onJsConfirm`` is never invoked and the app's dialog never shows.
- * Testing through the real method (no CDP) is what actually proves the dialog
- * path, which a CDP-driven ``Runtime.evaluate`` cannot.
+ * The app has no WebView: all five tabs (Domů / Hledat / Zdroje / Weby /
+ * Nastavení) are real Android views, and the search/sites/settings screens are
+ * rendered from the Python bridge. These tests assert the native screens switch
+ * correctly and that the confirm dialog used for destructive actions reports the
+ * right outcome.
  *
- * The dialog's buttons are clicked directly on the main thread rather than via
+ * The dialog buttons are clicked directly on the main thread rather than via
  * Espresso's view matching: the no-KVM emulator is slow enough that Espresso's
  * RESUMED-stage waits flake, while a direct ``performClick`` on the real
- * ``AlertDialog`` button exercises exactly the same ``onConfirm``/``onCancel``
- * callbacks the WebView would.
+ * ``AlertDialog`` button exercises exactly the same callback the screens use.
  */
 @RunWith(AndroidJUnit4::class)
 class MainActivityUiTest {
@@ -47,129 +44,103 @@ class MainActivityUiTest {
             scenario.onActivity { activity ->
                 // The five Clay tabs must exist and be labelled in Czech.
                 for (id in listOf(R.id.tab_home, R.id.tab_search, R.id.tab_sources,
-                                  R.id.tab_admin, R.id.tab_settings)) {
+                                  R.id.tab_web, R.id.tab_settings)) {
                     val tab = activity.findViewById<Button>(id)
                     assertNotNull("tab $id missing", tab)
                     assertTrue("tab $id has no label", tab.text.isNotBlank())
                 }
-                // Home is the landing screen: its status line is visible.
+                // Home is the landing screen.
                 val home = activity.findViewById<View>(R.id.home_view)
                 assertTrue("home_view should be visible on launch",
                     home.visibility == View.VISIBLE)
 
-                // The native sources screen replaces the admin panel for adding
-                // sources: selecting it shows the native view, not the WebView.
-                val sources = activity.findViewById<View>(R.id.sources_view)
-                activity.findViewById<Button>(R.id.tab_sources).performClick()
-                assertTrue("sources_view should show for the sources tab",
-                    sources.visibility == View.VISIBLE)
-                assertTrue("home_view should hide for the sources tab",
-                    home.visibility == View.GONE)
-                val webHidden = activity.findViewById<View>(R.id.web_container)
-                assertTrue("web_container should stay hidden for the sources tab",
-                    webHidden.visibility == View.GONE)
-
-                // Selecting the Admin tab hides Home and shows the web container.
-                activity.findViewById<Button>(R.id.tab_admin).performClick()
-                val web = activity.findViewById<View>(R.id.web_container)
-                assertTrue("web_container should show for the admin tab",
-                    web.visibility == View.VISIBLE)
-                assertTrue("home_view should hide for the admin tab",
-                    home.visibility == View.GONE)
-                assertTrue("sources_view should hide for the admin tab",
-                    sources.visibility == View.GONE)
+                // Every tab shows its own native screen and hides the others.
+                val panes = mapOf(
+                    R.id.tab_home to R.id.home_view,
+                    R.id.tab_search to R.id.search_view,
+                    R.id.tab_sources to R.id.sources_view,
+                    R.id.tab_web to R.id.sites_view,
+                    R.id.tab_settings to R.id.settings_view)
+                for ((tabId, paneId) in panes) {
+                    activity.findViewById<Button>(tabId).performClick()
+                    for ((_, otherId) in panes) {
+                        val expected = if (otherId == paneId) View.VISIBLE else View.GONE
+                        assertTrue("tab $tabId: pane $otherId visibility",
+                            activity.findViewById<View>(otherId).visibility == expected)
+                    }
+                }
             }
         }
+    }
+
+    @Test
+    fun thereIsNoWebViewAnywhere() {
+        launch().use { scenario ->
+            scenario.onActivity { activity ->
+                // The app must not embed a browser: a WebView class in the view
+                // tree would mean the public/admin pages leaked back in.
+                val root = activity.findViewById<View>(android.R.id.content)
+                assertTrue("no WebView may exist in the app",
+                    !containsWebView(root))
+            }
+        }
+    }
+
+    private fun containsWebView(view: View): Boolean {
+        if (view is android.webkit.WebView) return true
+        if (view is android.view.ViewGroup) {
+            for (i in 0 until view.childCount) {
+                if (containsWebView(view.getChildAt(i))) return true
+            }
+        }
+        return false
     }
 
     @Test
     fun confirmDialogShowsAndReportsConfirm() {
         launch().use { scenario ->
             val confirmed = AtomicBoolean(false)
-            val cancelled = AtomicBoolean(false)
             val dialog = AtomicReference<AlertDialog?>(null)
 
             scenario.onActivity { activity ->
-                dialog.set(activity.buildJsDialog(
-                    message = "Smazat web?",
-                    confirm = true,
-                    onConfirm = { confirmed.set(true) },
-                    onCancel = { cancelled.set(true) },
-                ))
+                dialog.set(activity.buildConfirmDialog("Smazat web?") { confirmed.set(true) })
             }
 
-            scenario.onActivity { activity ->
+            scenario.onActivity { _ ->
                 val d = dialog.get()
                 assertNotNull("dialog was not created", d)
                 assertTrue("dialog should be showing", d!!.isShowing)
-                // The Czech message and both buttons are present.
                 assertTrue("confirm message missing",
                     d.findViewById<android.widget.TextView>(android.R.id.message)
                         ?.text?.toString()?.contains("Smazat web?") == true)
-                val ok = d.getButton(AlertDialog.BUTTON_POSITIVE)
-                assertNotNull("OK button missing", ok)
                 assertNotNull("Cancel button missing",
                     d.getButton(AlertDialog.BUTTON_NEGATIVE))
-                ok.performClick()
+                d.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
             }
             idle()
 
-            assertTrue("OK must report confirm()", confirmed.get())
-            assertTrue("cancel must not fire on OK", !cancelled.get())
+            assertTrue("OK must report confirm", confirmed.get())
         }
     }
 
     @Test
-    fun cancelButtonReportsCancel() {
+    fun cancelButtonDoesNotConfirm() {
         launch().use { scenario ->
             val confirmed = AtomicBoolean(false)
-            val cancelled = AtomicBoolean(false)
             val dialog = AtomicReference<AlertDialog?>(null)
 
             scenario.onActivity { activity ->
-                dialog.set(activity.buildJsDialog(
-                    message = "Opravdu?",
-                    confirm = true,
-                    onConfirm = { confirmed.set(true) },
-                    onCancel = { cancelled.set(true) },
-                ))
+                dialog.set(activity.buildConfirmDialog("Opravdu?") { confirmed.set(true) })
             }
 
-            scenario.onActivity { activity ->
+            scenario.onActivity { _ ->
                 val d = dialog.get()
                 assertNotNull("dialog was not created", d)
                 d!!.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
             }
             idle()
 
-            assertTrue("Cancel must report cancel()", cancelled.get())
-            assertTrue("confirm must not fire on Cancel", !confirmed.get())
-        }
-    }
-
-    @Test
-    fun alertDialogHasOnlyOkButton() {
-        launch().use { scenario ->
-            val confirmed = AtomicBoolean(false)
-            val dialog = AtomicReference<AlertDialog?>(null)
-            scenario.onActivity { activity ->
-                dialog.set(activity.buildJsDialog(
-                    message = "Hotovo",
-                    confirm = false,
-                    onConfirm = { confirmed.set(true) },
-                ))
-            }
-            scenario.onActivity { activity ->
-                val d = dialog.get()
-                assertNotNull("dialog was not created", d)
-                // An alert offers only OK: no visible cancel button.
-                val negative = d!!.getButton(AlertDialog.BUTTON_NEGATIVE)
-                assertTrue("alert must not offer a visible cancel button",
-                    negative == null || negative.visibility != View.VISIBLE)
-                d.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
-            }
-            idle()
-            assertTrue("alert OK must fire", confirmed.get())
+            assertTrue("Cancel must not fire confirm", !confirmed.get())
         }
     }
 }
