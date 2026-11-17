@@ -88,7 +88,7 @@ cd android
 | Varianta | Model | Velikost | Poznámka |
 |---|---|---|---|
 | plná | reálný MiniLM (118 MB) | ~136,6 MiB | sémantické hledání, **nad limitem GitHubu (100 MB)** |
-| hashovací | žádný (`-PskipEmbeddingModel`) | ~62,5 MiB | menší, jen FTS5 + hashovací fallback; vhodná ke commitu |
+| hashovací | žádný (`-PskipEmbeddingModel`) | ~62,6 MiB | menší, jen FTS5 + hashovací fallback; vhodná ke commitu |
 
 Obě varianty jsou v repozitáři **přes Git LFS** (`mini-search-7.9-debug.apk`,
 `mini-search-7.9-nomodel-debug.apk`), protože i malá má přes 50 MB. GitHub má
@@ -127,7 +127,7 @@ SDK nastavte do `android/local.properties` (`sdk.dir=...`).
 
 Instrumentační sada má dvě části: `ServerSmokeTest` (spouští reálný Chaquopy
 backend a kontroluje `/health`, `/`, `/admin`, stop/restart, LAN sdílení) a
-`MainActivityUiTest` (čtyři nativní záložky a dialogy `confirm()`/`alert()`).
+`MainActivityUiTest` (pět nativních záložek a dialogy `confirm()`/`alert()`).
 
 ## Konfigurace
 
@@ -149,7 +149,7 @@ nikdy nespouští `git pull` ani `pip install`. Data, logy a pomocné soubory
 `applicationId` je `cz.minisearch.app`. `versionCode` se zvýšil z 4 na 5
 (`versionName` 7.8 → 7.9). Předchozí APK (7.8) byl podepsaný **jiným** debug
 klíčem, než jaký je v tomto prostředí (7.9 je podepsaný klíčem s otiskem
-`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`), takže
+`f35c6cbe1b5e7d60143f33b9d79f9990421b140d6f62090b0238a71fb3a50ce9`), takže
 běžná aktualizace přes původní instalaci **nemusí být možná** (Android odmítne
 APK s jiným podpisem). Odinstalace staré verze by smazala data a **není**
 náhradou migrace; databázi nikdy nemažte. Release se podepisuje jen dodatečným

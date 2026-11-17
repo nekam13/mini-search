@@ -6,30 +6,31 @@ provedeným krokům; nic není odhad ani ukázka.
 
 - Repozitář: `https://github.com/nekam13/mini-search`
 - Pracovní větev: `android-app-completion`
-- Zdrojový commit obou APK: **`b961309`** (`Document the x86_64 emulator build
-  and the UI test split`) — obě APK byla v rámci tohoto cyklu znovu sestavena
-  z těchto zdrojů (`--rerun-tasks`, 48/48 úloh) a znovu otestována.
-  APK soubory jsou v repu odevzdané commitem `6451f0a`
-  (`Cross-platform packaging…`), který jinak mění jen desktopové balíčky a
-  dokumentaci — samotné zdroje Android aplikace jsou v něm shodné s `b961309`.
+- Zdrojový commit obou APK: **`c52e7e3`** (`Fix AI/vector search regression;
+  move source management into the app`) — obě APK byla v rámci tohoto cyklu
+  znovu sestavena z těchto zdrojů a znovu otestována (backendové sady, JVM
+  testy tokenizeru a ONNX).
 - Výchozí větev `beta-optimized` byla ověřena na commitu `f39092a`; větev
   `android-app-completion` vychází z referenčního commitu zadání
   (`bf629cc`) a obsahuje dokončení Android aplikace.
 
 > **Aktuální verze 7.9 (nativní UI).** Od 7.8 přibylo **nativní české UI**
-> (obrazovky Domů / Hledat / Správa / Nastavení) místo jediného WebView:
-> Domů ovládá server (start/stop/restart, LAN sdílení, import dumpu), Nastavení
-> vykresluje `SETTINGS_SPEC` z backendu. Zůstává možnost sdílet **veřejnou
-> vyhledávací stránku** v LAN (`network.lan_share`, výchozně vypnuto);
-> administrace zůstává pouze na loopbacku. `versionCode` je `5`, `versionName`
-> `7.9`. Podrobnosti v § 2 (sekce „Nativní UI") a § 6.
+> (obrazovky Domů / Hledat / Zdroje / Správa / Nastavení) místo jediného
+> WebView: Domů ovládá server (start/stop/restart, LAN sdílení, import dumpu),
+> Zdroje přidávají a spravují zdroje nativně (a přidávání zdrojů zmizelo
+> z veřejné stránky), Nastavení vykresluje `SETTINGS_SPEC` z backendu. Zůstává
+> možnost sdílet **veřejnou vyhledávací stránku** v LAN (`network.lan_share`,
+> výchozně vypnuto); administrace zůstává pouze na loopbacku. `versionCode` je
+> `5`, `versionName` `7.9`. Navíc opraveno sémantické (vektorové) hledání
+> (viz § 2). Podrobnosti v § 2 (sekce „Nativní UI" a „Oprava sémantického
+> hledání") a § 6.
 
 ## 1. Odevzdané soubory
 
 | Soubor | Varianta | Velikost | SHA-256 |
 |---|---|---|---|
-| `mini-search-7.9-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 214 586 B (~136,6 MiB) | `ad39dbaeb78c7064fdca7091983452e722fdf9760044d2b802e4284f6758c8ab` |
-| `mini-search-7.9-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 579 917 B (~62,5 MiB) | `e2eccaf49e51c4045616fad77f607bd0683211c84f61575b4d0e1ec8c9071f31` |
+| `mini-search-7.9-debug.apk` | plná s modelem MiniLM (ONNX), **v repu přes Git LFS** | 143 257 951 B (~136,6 MiB) | `8acd61fbfccc661849a79a7ac70f3c236b21cc796e67307fa20f4469d0ef13cd` |
+| `mini-search-7.9-nomodel-debug.apk` | bez modelu (hashovací fallback), **v repu přes Git LFS** | 65 622 490 B (~62,6 MiB) | `7a5a820143e4d87e496933438aaae207fdf34e649b2b092b4f6d4000ddd9596f` |
 
 > Poznámka k opakovatelnosti: SHA-256 se mezi jednotlivými buildy **liší**, i
 > když je obsah shodný — ZIP záznamy nesou časové značky a `classes*.dex` nese
@@ -41,7 +42,7 @@ provedeným krokům; nic není odhad ani ukázka.
 Metadata obou variant (shodná): `applicationId = cz.minisearch.app`,
 `versionCode = 5`, `versionName = 7.9`, `minSdk = 30`, `targetSdk = 34`,
 nativní ABI `arm64-v8a`. Debug podpis (certifikát SHA-256)
-`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`.
+`f35c6cbe1b5e7d60143f33b9d79f9990421b140d6f62090b0238a71fb3a50ce9`.
 
 Obě varianty jsou v repu **přes Git LFS** (i malá má přes 50 MB): GitHub má
 tvrdý limit 100 MB na soubor v běžném gitu, takže 143MB APK je uložené jako
@@ -62,8 +63,10 @@ sestavené z aktuálního zdrojového commitu, nikoli převzaté z dřívějška
 
 ### Nativní UI (nová funkce 7.9)
 
-Místo jediného WebView má aplikace **nativní české UI** se čtyřmi záložkami
-(Horní lišta s přepínačem záložek, v duchu společného Clay designu):
+Místo jediného WebView má aplikace **nativní české UI** s pěti záložkami
+(Horní lišta s přepínačem záložek, v duchu společného Clay designu; lišta je
+horizontálně posuvná, aby se pět záložek a akce „Import dumpu" vešly i na úzký
+telefon):
 
 - **Domů** (`view_home.xml`) – nativní ovládání serveru: stav
   (`STOPPED`/`STARTING`/`RUNNING`/`STOPPING`/`ERROR`), backend (jaký embedding
@@ -73,6 +76,16 @@ Místo jediného WebView má aplikace **nativní české UI** se čtyřmi zálo�
 - **Hledat** (`web_container`) – veřejná stránka `/` v uzamčeném WebView;
   WebView se vytváří líně, až když záložku poprvé otevřete (aby `onCreate`
   nezdržel start foreground služby).
+- **Zdroje** (`view_sources.xml`) – **nativní správa zdrojů**, součást aplikace,
+  ne webová stránka: přidání zdroje (typ se rozpozná automaticky z adresy),
+  seznam zdrojů a u každého re-crawl a smazání (s potvrzením). Volá Python přes
+  `android_entry.sources_json()` / `add_source_json()` / `delete_source_json()`
+  / `recrawl_source_json()`, které používají `get_all_sources()`,
+  `add_source()`, `delete_source()` a `recrawl_async()`, takže `site_sources`
+  zůstává jediným zdrojem pravdy a indexace se spouští na pozadí. Přidávání
+  zdrojů bylo zároveň **odstraněno z veřejné vyhledávací stránky** (route
+  `/add`, `submit_public_source()` i formulář „Přidat zdroj" byly smazány;
+  veřejná stránka má v navigaci jen odkaz na vyhledávání).
 - **Správa** – panel `/admin` ve stejném WebView. `confirm()`/`alert()`
   z admin formulářů vykresluje `WebChromeClient` jako nativní dialog; ověřeno
   instrumentačním testem `MainActivityUiTest` (dialog se zobrazí s českou
@@ -82,6 +95,32 @@ Místo jediného WebView má aplikace **nativní české UI** se čtyřmi zálo�
   vykreslí je; ukládání, obnovení výchozích hodnot a restart, když to změna
   vyžaduje. **V Kotlinu není druhá konfigurace** – jediným zdrojem pravdy
   zůstává `SETTINGS_SPEC` v `app_combined.py`.
+
+### Oprava sémantického (vektorového) hledání
+
+Po změně okolo `embedding_space` přestalo sémantické hledání vracet výsledky
+(hledání tiše spadlo na FTS5). Příčina byla dvojí:
+
+- **Migrace** orazítkovala vektory zapsané před vznikem sloupce prostorem
+  „hash". Instalace, která pak jela reálný model, viděla všechny vektory jako
+  cizí prostor a `vector_search` je ignoroval.
+- **`get_model()`** si jedno selhání načtení pamatoval navždy, takže když se
+  na Androidu ONNX bridge poprvé ještě nenačetl, zůstal hashovací fallback
+  zaseknutý po celý proces.
+
+Oprava:
+
+- `get_model()` si selhání pamatuje jen po `MODEL_RETRY_COOLDOWN` a model zkusí
+  znovu (na Androidu tak model může naskočit později).
+- `startup_embedding_recovery()` přepočítá omezenou dávku zastaralých vektorů;
+  spouští se při startu serveru a přes `maybe_start_embedding_recovery()` i na
+  horké cestě `vector_search` (před early-returnem prázdného indexu, což je
+  přesně selhávající případ).
+- Recovery běží **jen pro reálný model** (`_active_backend_is_real()`), nikdy
+  pro hashovací fallback, takže chvilkově nedostupný model nemůže přepsat
+  dobré vektory hashovými.
+- Nový test `tests/test_ai_recovery.py` (součást 20 backendových sad) to celé
+  pokrývá.
 
 Zachováno a doplněno u životního cyklu:
 
@@ -179,10 +218,10 @@ Zachované vlastnosti z předchozí dodávky:
 
 ## 3. Výsledky testů (skutečně spuštěné)
 
-### Backendové testy (všech 19 skriptů)
+### Backendové testy (všech 20 skriptů)
 
 Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exit 0)
-(znovu ověřeno v tomto cyklu na commitu `b961309`):
+(znovu ověřeno v tomto cyklu na commitu `c52e7e3`):
 
 | Skript | PASS |
 |---|---|
@@ -205,6 +244,7 @@ Spuštěno `python3 tests/<skript>.py` pro každý skript; všechny prošly (exi
 | `test_android_compat.py` | 5 |
 | `test_lan_share.py` | 31 |
 | `test_desktop_launcher.py` | 19 (desktop start/readiness/stop/restart) |
+| `test_ai_recovery.py` | 14 (obnova vektorového prostoru, retry modelu) |
 
 Testy životního cyklu (`test_lifecycle.py`) pokrývají start → `RUNNING` až po
 `/health`, opakovaný start jako no-op bez druhého serveru/scheduleru/workerů,
@@ -233,17 +273,29 @@ LAN adresu.
 
 `./gradlew :app:testDebugUnitTest` – `SpmTokenizerTest` (6 testů) a
 `EmbeddingBridgeTest` (1 test), **7 testů, 0 selhání, 0 přeskočeno** (znovu
-ověřeno v tomto cyklu na commitu `b961309`). Ověřují
+ověřeno v tomto cyklu na commitu `c52e7e3`). Ověřují
 shodu tokenizeru s referencí a embedding výstupu (mean pooling, L2 normalizace)
 proti referenčním vektorům `sentence-transformers` na českých textech.
 
-### Android instrumentační testy (skutečně spuštěné na emulátoru)
+### Android instrumentační testy (dřívější cyklus; v tomto nešly spustit)
 
 `./gradlew :app:connectedDebugAndroidTest` (ekvivalentně `adb shell am instrument
 -w cz.minisearch.app.test/androidx.test.runner.AndroidJUnitRunner`) na emulátoru
-`msx(AVD) - 14`: **12 testů, 0 selhání** (znovu spuštěno v tomto cyklu na
-nově sestaveném `arm64-v8a` APK z commitu `b961309`; tvoří je `ServerSmokeTest`
-(8) a `MainActivityUiTest` (4)).
+`msx(AVD) - 14`: **12 testů, 0 selhání** (spuštěno v **dřívějším** cyklu na
+tehdy sestaveném `arm64-v8a` APK; tvoří je `ServerSmokeTest` (8) a
+`MainActivityUiTest` (4)).
+
+> **V tomto cyklu se instrumentační testy spustit nepodařilo** – prostředí
+> nemá `/dev/kvm` (žádná virtualizace), takže emulátor nelze provozovat a sada
+> `connectedDebugAndroidTest` se nespustí. Nové APK proto bylo ověřeno
+> **staticky a na JVM**: zabudovaný model má očekávaný SHA-256, `app.imy` nese
+> `app_combined.pyc` s novými symboly (`startup_embedding_recovery`,
+> `maybe_start_embedding_recovery`, `MODEL_RETRY_COOLDOWN`), `android_entry.pyc`
+> nese most pro zdroje (`sources_json`, `add_source_json`,
+> `delete_source_json`, `recrawl_source_json`), `classes3.dex` nese nativní UI
+> zdrojů (`renderSources`, `loadSources`, `deleteSource`, `recrawlSource`) a
+> prochází všech 20 backendových sad a 7 JVM testů. Znovuspuštění
+> instrumentační sady na emulátoru s KVM zůstává doporučeným dalším krokem.
 
 `ServerSmokeTest.kt` spouští skutečný Chaquopy backend a ověřuje:
 
@@ -262,9 +314,9 @@ nově sestaveném `arm64-v8a` APK z commitu `b961309`; tvoří je `ServerSmokeTe
 
 `MainActivityUiTest.kt` (nové) ověřuje nativní UI a dialogy:
 
-- `nativeTabsArePresentAndSwitchScreens` – čtyři záložky (Domů/Hledat/Správa/
-  Nastavení) existují s českými popisky a přepnutí na Správu schová Domů a
-  zobrazí webový kontejner.
+- `nativeTabsArePresentAndSwitchScreens` – pět záložek (Domů/Hledat/Zdroje/
+  Správa/Nastavení) existuje s českými popisky a přepnutí na Správu schová Domů
+  a zobrazí webový kontejner.
 - `confirmDialogShowsAndReportsConfirm`, `cancelButtonReportsCancel`,
   `alertDialogHasOnlyOkButton` – `MainActivity.buildJsDialog(...)` (přesně to,
   co volá `WebChromeClient.onJsConfirm`/`onJsAlert`) zobrazí dialog s českou
@@ -354,9 +406,10 @@ oprav a bez absolutních cest v repu.
 - V malé variantě model **není**, tokenizer ano.
 - `templates/` a `static/` jsou zabalené v `app.imy` (`templates/search.html`,
   `templates/base_clay.html`, `static/css/clay.css`, `static/js/search.js`).
-- 19 backendových sad, 7 JVM testů a 12 instrumentačních testů prochází.
+- 20 backendových sad a 7 JVM testů prochází (instrumentační sada byla
+  spuštěna v dřívějším cyklu, viz § 3).
 - **Nativní UI na odevzdaném `arm64-v8a` APK.** `MainActivityUiTest` ověřil na
-  zařízení, že existují čtyři záložky s českými popisky a že přepnutí na Správu
+  zařízení, že existují záložky s českými popisky a že přepnutí na Správu
   schová Domů a zobrazí webový kontejner; dialogy `confirm()`/`alert()`
   (co volá `WebChromeClient`) se zobrazí s českou zprávou a OK/Zrušit vrací
   správnou hodnotu. V logu (`ServerController`) je vidět skutečný přechod do
@@ -447,7 +500,7 @@ oprav a bez absolutních cest v repu.
 `applicationId` zůstal `cz.minisearch.app` a `versionCode` se zvýšil z 4 na 5
 (`versionName` 7.8 → 7.9). Debug APK je podepsané automatickým debug klíčem
 (otisk certifikátu SHA-256:
-`adf89e2efd7af8862ba9ee1889aad9dc1c88063de2ce64a98d3dfee529df4800`).
+`f35c6cbe1b5e7d60143f33b9d79f9990421b140d6f62090b0238a71fb3a50ce9`).
 **Předchozí 7.8 APK bylo podepsané jiným debug klíčem**
 (`271e48cb…`) než toto prostředí, proto běžná aktualizace přes původní instalaci
 nemusí být možná (Android odmítne APK s jiným podpisem). Odinstalace staré verze
